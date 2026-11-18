@@ -1,8 +1,8 @@
-"""The policy file: who may reach this agent, and under what limits (SPEC §3, §9).
+"""The policy file: who may reach this agent, and under what limits (SPEC §9).
 
-Contract: ``load`` is strict. An unknown key is fatal, because a typo that silently disables a rule
-looks exactly like a rule that works — the agent keeps running and stops refusing anyone. A crash at
-startup is the cheaper failure.
+Contract: ``load`` is strict. An unknown key or limit name is fatal, because a typo that silently
+disables a rule looks exactly like a rule that works. ``direct`` delivery is only legal off a public
+hub (§9), so it carries an explicit deployment marker rather than being inferred.
 """
 
 from __future__ import annotations
@@ -14,11 +14,17 @@ from typing import Any
 
 from .identity import IdentityError, validate_agent_id
 
-KNOWN_KEYS = {"agent_id", "contact_policy", "allow", "block", "limits"}
-KNOWN_LIMITS = {"contact_requests_per_day", "messages_per_hour"}
-#: "open" is deliberately absent: §9 says a public hub refuses it, and a private agent that wants
-#: direct delivery says so in its allow list instead of disabling the handshake for everyone.
-CONTACT_POLICIES = {"request", "closed"}
+KNOWN_KEYS = {"agent_id", "contact_policy", "deployment", "allow", "block", "limits", "probation"}
+#: §9 names four numbers: 100 messages/hour, 20/hour from one sender, and the probation pair
+#: (20 contact requests and 50 messages a day). All four are policy, not protocol constants.
+KNOWN_LIMITS = {
+    "messages_per_hour",
+    "per_sender_per_hour",
+    "messages_per_day",
+    "contact_requests_per_day",
+}
+CONTACT_POLICIES = {"closed", "direct"}
+DEPLOYMENTS = {"public", "private", "local"}
 
 
 class PolicyError(ValueError):
@@ -29,12 +35,15 @@ class PolicyError(ValueError):
 class Policy:
     agent_id: str
     contact_policy: str
+    deployment: str
     allow: frozenset[str]
     block: frozenset[str]
     limits: dict[str, int]
+    probation: bool = False
 
-    def may_send(self, peer: str) -> bool:
-        return peer in self.allow and peer not in self.block
+    @property
+    def direct_delivery(self) -> bool:
+        return self.contact_policy == "direct"
 
 
 def _identifiers(value: Any, field: str) -> frozenset[str]:
@@ -72,7 +81,17 @@ def parse(document: Any) -> Policy:
 
     contact_policy = document["contact_policy"]
     if contact_policy not in CONTACT_POLICIES:
-        raise PolicyError(f"contact_policy must be one of {sorted(CONTACT_POLICIES)}, got {contact_policy!r}")
+        raise PolicyError(
+            f"contact_policy must be one of {sorted(CONTACT_POLICIES)}, got {contact_policy!r}"
+        )
+
+    deployment = document.get("deployment", "public")
+    if deployment not in DEPLOYMENTS:
+        raise PolicyError(f"deployment must be one of {sorted(DEPLOYMENTS)}, got {deployment!r}")
+    if contact_policy == "direct" and deployment == "public":
+        # §9: there is no open mode on a public hub. Saying "direct" on a public deployment is the
+        # configuration error that would turn a hub into an open relay.
+        raise PolicyError("contact_policy 'direct' is not allowed on a public deployment")
 
     limits_raw = document.get("limits", {})
     if not isinstance(limits_raw, dict):
@@ -84,12 +103,18 @@ def parse(document: Any) -> Policy:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise PolicyError(f"limit {name} must be a non-negative integer")
 
+    probation = document.get("probation", False)
+    if not isinstance(probation, bool):
+        raise PolicyError("probation must be a boolean")
+
     return Policy(
         agent_id=agent_id,
         contact_policy=contact_policy,
+        deployment=deployment,
         allow=_identifiers(document.get("allow", []), "allow"),
         block=_identifiers(document.get("block", []), "block"),
         limits=dict(limits_raw),
+        probation=probation,
     )
 
 

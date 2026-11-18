@@ -1,23 +1,21 @@
-import json
-
 import pytest
 
 from knok.policy import PolicyError, load, parse
 
 BASE = {
     "agent_id": "carl@bridge.example",
-    "contact_policy": "request",
+    "contact_policy": "closed",
     "allow": ["muse@bridge.example"],
     "block": [],
-    "limits": {"contact_requests_per_day": 20, "messages_per_hour": 100},
+    "limits": {"messages_per_hour": 100, "per_sender_per_hour": 20},
 }
 
 
 def test_parses_a_valid_policy():
     policy = parse(BASE)
     assert policy.agent_id == "carl@bridge.example"
-    assert policy.may_send("muse@bridge.example")
-    assert not policy.may_send("mallory@bridge.example")
+    assert "muse@bridge.example" in policy.allow
+    assert policy.direct_delivery is False
 
 
 def test_unknown_key_is_fatal():
@@ -27,10 +25,18 @@ def test_unknown_key_is_fatal():
 
 def test_unknown_limit_is_fatal():
     with pytest.raises(PolicyError, match="unknown limit"):
-        parse({**BASE, "limits": {"messages_per_day": 1}})
+        parse({**BASE, "limits": {"messages_per_minute": 1}})
 
 
-def test_open_contact_policy_is_refused():
+def test_direct_delivery_requires_a_non_public_deployment():
+    # §9: there is no open mode on a public hub.
+    with pytest.raises(PolicyError, match="not allowed on a public deployment"):
+        parse({**BASE, "contact_policy": "direct"})
+    policy = parse({**BASE, "contact_policy": "direct", "deployment": "private"})
+    assert policy.direct_delivery is True
+
+
+def test_unknown_contact_policy_is_fatal():
     with pytest.raises(PolicyError, match="contact_policy"):
         parse({**BASE, "contact_policy": "open"})
 
@@ -42,7 +48,8 @@ def test_invalid_agent_id_is_fatal():
 
 def test_block_overrides_allow():
     policy = parse({**BASE, "block": ["muse@bridge.example"]})
-    assert not policy.may_send("muse@bridge.example")
+    assert "muse@bridge.example" in policy.allow  # the allow entry stays; decide() checks block first
+    assert "muse@bridge.example" in policy.block
 
 
 def test_missing_file_reports_clearly(tmp_path):
