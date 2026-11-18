@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from .canonical import CanonicalisationError, canonical_bytes
+from .canonical import MAX_INT, CanonicalisationError, canonical_bytes
 from .identity import Identity, IdentityError, validate_agent_id, verify_signature
 from .message import MessageValidationError, validate_message
 
@@ -59,6 +59,9 @@ def validate(envelope: Any, now: datetime | None = None) -> str | None:
     seq = envelope["seq"]
     if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
         return "seq must be a non-negative integer"
+    if seq > MAX_INT:
+        # Explicit rather than left to canonicalisation, so the reason names the field.
+        return f"seq must not exceed {MAX_INT}"
 
     try:
         validate_message(envelope["message"])

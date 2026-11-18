@@ -167,7 +167,7 @@ def test_expires_before_sent_is_rejected(identity, envelope_factory):
 
 
 def test_seq_outside_safe_range_is_rejected(identity, envelope_factory):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="seq must not exceed"):
         sign(envelope_factory(seq=2**60), identity)
 
 
