@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4 — 2026-11-18
+
+Three decisions that slice 2 forced into the open, each surfaced by code that could not implement
+the spec as written.
+
+- **Form 2 carries `messageId` in clear.** Slice 2 refuses sealed envelopes because the id was
+  sealed with the body, so nothing could dedupe or order them. A random identifier reveals nothing;
+  sealing it made every delivery guarantee in §6 conditional on the message not being sealed.
+  (issue #12)
+- **A dead letter is inspectable, never re-offered.** Re-offering restarts the five-attempt ladder
+  and its `seq` re-blocks the whole stream under per-context FIFO, so one poison message would block
+  every message behind it forever.
+- **Context TTL is 72 hours, equal to the message TTL.** A gap may only be closed once the missing
+  message can no longer arrive: shorter and the gap notice is a lie, longer and held messages expire
+  before they are ever released.
+
 ## Slice 2 — durable queue (issue #7, unreleased)
 
 `knok.queue.Queue`: SQLite (WAL, `synchronous=FULL`), one connection under
