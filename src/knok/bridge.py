@@ -354,10 +354,14 @@ class Bridge:
             envelope = self.queue.get()
             if envelope is None:
                 break
-            if envelope.get("kind") in {"gap", "expired", "dead"}:
+            kind = envelope.get("kind")
+            if kind in {"gap", "late", "expired", "dead"}:
                 self._record_notice(envelope)
-                # A stored frame would otherwise be re-offered after every backoff forever.
-                if isinstance(envelope.get("messageId"), str):
+                # A stored frame would otherwise be re-offered after every backoff forever —
+                # but only frames whose message is gone may be acked. A ``late`` notice carries
+                # the messageId of a message that is *still queued behind it*: acking the notice
+                # would delete the very message the notice exists to explain.
+                if kind in {"expired", "dead"} and isinstance(envelope.get("messageId"), str):
                     try:
                         self.queue.ack(envelope["messageId"])
                     except Exception:

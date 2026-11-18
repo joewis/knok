@@ -157,7 +157,15 @@ def test_dead_letter_after_five_attempts(queue, envelope_factory):
     for attempt in range(5):
         assert queue.get(now) is not None, f"attempt {attempt + 1} not offered"
         now += timedelta(seconds=BACKOFF_SECONDS[attempt] + 1)
-    assert queue.get(now) is None  # fifth backoff elapsed: dead, not re-offered
+    # Fifth backoff elapsed: dead, not re-offered — but the sender is told, once.
+    frame = queue.get(now)
+    assert frame["kind"] == "dead"
+    assert frame["messageId"] == "m-1"
+    assert frame["contextId"] == "c-1"
+    assert frame["attempts"] == 5
+    assert frame["deadedAt"]
+    assert "message" not in frame  # a transport frame, not a Message
+    assert queue.get(now) is None  # told once, not on every poll
     dead = queue.dead_letter()
     assert len(dead) == 1
     assert dead[0]["messageId"] == "m-1"
@@ -311,3 +319,73 @@ def test_get_returns_envelope_to_unchanged(queue, envelope_factory):
     got = queue.get(T0)
     assert got["to"] == [OWNER]  # get() never rewrites the recipient list
     assert got["from"] == "carl@bridge.example"
+
+
+def test_late_arrival_after_release_is_delivered_with_a_late_notice(
+    tmp_path, envelope_factory
+):
+    """The gap release skips a seq; the message bearing it must still arrive (issue #19)."""
+    with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
+        for seq in (0, 2):
+            q.put(
+                _env(envelope_factory, seq=seq, message={"messageId": f"m-{seq}"}), T0
+            )
+        assert q.get(T0)["seq"] == 0
+        q.ack("m-0", T0)
+        gap = q.get(_at(61))
+        assert gap["kind"] == "gap" and gap["missing"] == [1]
+        assert q.get(_at(61))["seq"] == 2  # the held message, released in order
+
+        # The skipped seq turns up after the release. Dropping it would destroy a
+        # live message because a timer passed.
+        assert q.put(
+            _env(envelope_factory, seq=1, message={"messageId": "m-1"}), _at(62)
+        ) == "late"
+
+        late = q.get(_at(62))
+        assert late["kind"] == "late"
+        assert late["messageId"] == "m-1"
+        assert late["seq"] == 1
+        assert "message" not in late
+
+        got = q.get(_at(62))
+        assert got["seq"] == 1  # out of order, and delivered anyway
+        assert got["message"]["messageId"] == "m-1"
+        assert q.ack("m-1", _at(62)) is True
+        assert q.get(_at(62)) is None
+
+
+def test_a_late_arrival_is_not_reported_as_a_duplicate(queue, envelope_factory):
+    """A delivered seq is still a duplicate; only a released gap makes an arrival late."""
+    queue.put(_env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0)
+    assert queue.get(T0)["seq"] == 0
+    queue.ack("m-0", T0)
+    # Never skipped by a release: this is a re-send, not a late arrival.
+    assert queue.put(
+        _env(envelope_factory, seq=0, message={"messageId": "m-again"}), T0
+    ) == "duplicate"
+    assert queue.get(T0) is None
+
+
+def test_seen_is_pruned_after_retention_and_live_messages_are_kept(
+    tmp_path, envelope_factory
+):
+    """Dedupe memory must not grow forever, but must never forget a live message (issue #13)."""
+    far = "2027-01-30T05:00:00Z"  # inside the 30-day bound used by the retention window
+    with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
+        q.put(_env(envelope_factory, seq=0, message={"messageId": "m-gone"},
+                   expiresAt=far), T0)
+        q.ack("m-gone", T0)  # delivered: only ``seen`` remembers it now
+        q.put(_env(envelope_factory, seq=1, message={"messageId": "m-live"},
+                   expiresAt=far), T0)  # still live in the queue
+
+        later = T0 + timedelta(days=31)
+        assert q.expire(later) == []  # nothing expired; the prune runs anyway
+
+        # The old id is forgotten, so a fresh message may reuse it...
+        assert q.put(_env(envelope_factory, seq=5, message={"messageId": "m-gone"},
+                          expiresAt=far), later) == "accepted"
+        # ...while a live message's id is still defended, and re-putting it is a
+        # clean duplicate rather than a primary-key collision.
+        assert q.put(_env(envelope_factory, seq=6, message={"messageId": "m-live"},
+                          expiresAt=far), later) == "duplicate"

@@ -324,3 +324,46 @@ def test_a_drop_whose_record_cannot_be_written_is_not_acked(deployment, monkeypa
         assert muse.client.fetch()["messages"] == []
     finally:
         muse.state.registry[bobby_identity.agent_id] = saved
+
+
+def test_a_late_notice_does_not_ack_away_the_message_it_names(tmp_path):
+    """A late frame carries the id of a message still queued behind it (issue #19)."""
+    from types import SimpleNamespace
+
+    from knok.bridge import Bridge
+
+    frame = {"kind": "late", "messageId": "m-1", "contextId": "c-1", "seq": 1}
+    message = {
+        "envelopeVersion": 1,
+        "seq": 1,
+        "message": {"kind": "message", "messageId": "m-1", "contextId": "c-1",
+                    "role": "agent", "parts": [{"kind": "text", "text": "late"}]},
+        "from": "carl@bridge.example",
+        "to": ["muse@bridge.example"],
+        "sentAt": "2026-11-18T05:00:00Z",
+        "expiresAt": "2026-11-21T05:00:00Z",
+        "turn": {"expectsReply": False, "closesThread": False},
+    }
+
+    class FakeQueue:
+        def __init__(self):
+            self.pending = [frame, message]
+            self.acked: list[str] = []
+
+        def get(self, now=None):
+            return self.pending.pop(0) if self.pending else None
+
+        def ack(self, message_id, now=None):
+            self.acked.append(message_id)
+            return True
+
+    bridge = object.__new__(Bridge)
+    bridge.state = SimpleNamespace(directory=tmp_path)
+    bridge.queue = FakeQueue()
+
+    # The inbox cannot be written: the message must survive, and nothing may be acked.
+    (tmp_path / "inbox.jsonl").mkdir()
+
+    assert bridge.drain() == 0
+    assert bridge.queue.acked == [], "the late notice must not ack the message away"
+    assert "m-1" in (tmp_path / "notices.jsonl").read_text()
