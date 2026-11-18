@@ -17,7 +17,8 @@ from pathlib import Path
 import pytest
 
 from knok.identity import IdentityError
-from knok.queue import BACKOFF_SECONDS, Queue, QueueLockedError
+from knok.queue import (BACKOFF_SECONDS, NOTICE_BACKOFF_SECONDS, Queue,
+                        QueueLockedError)
 
 T0 = datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc)
 OWNER = "muse@bridge.example"  # the peer id the fixture envelopes are addressed to
@@ -157,7 +158,15 @@ def test_dead_letter_after_five_attempts(queue, envelope_factory):
     for attempt in range(5):
         assert queue.get(now) is not None, f"attempt {attempt + 1} not offered"
         now += timedelta(seconds=BACKOFF_SECONDS[attempt] + 1)
-    assert queue.get(now) is None  # fifth backoff elapsed: dead, not re-offered
+    # Fifth backoff elapsed: dead, not re-offered — but the sender is told, once.
+    frame = queue.get(now)
+    assert frame["kind"] == "dead"
+    assert frame["messageId"] == "m-1"
+    assert frame["contextId"] == "c-1"
+    assert frame["attempts"] == 5
+    assert frame["deadedAt"]
+    assert "message" not in frame  # a transport frame, not a Message
+    assert queue.get(now) is None  # told once, not on every poll
     dead = queue.dead_letter()
     assert len(dead) == 1
     assert dead[0]["messageId"] == "m-1"
@@ -311,3 +320,113 @@ def test_get_returns_envelope_to_unchanged(queue, envelope_factory):
     got = queue.get(T0)
     assert got["to"] == [OWNER]  # get() never rewrites the recipient list
     assert got["from"] == "carl@bridge.example"
+
+
+def test_late_arrival_after_release_is_delivered_with_a_late_notice(
+    tmp_path, envelope_factory
+):
+    """The gap release skips a seq; the message bearing it must still arrive (issue #19)."""
+    with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
+        for seq in (0, 2):
+            q.put(
+                _env(envelope_factory, seq=seq, message={"messageId": f"m-{seq}"}), T0
+            )
+        assert q.get(T0)["seq"] == 0
+        q.ack("m-0", T0)
+        gap = q.get(_at(61))
+        assert gap["kind"] == "gap" and gap["missing"] == [1]
+        assert q.get(_at(61))["seq"] == 2  # the held message, released in order
+
+        # The skipped seq turns up after the release. Dropping it would destroy a
+        # live message because a timer passed.
+        assert q.put(
+            _env(envelope_factory, seq=1, message={"messageId": "m-1"}), _at(62)
+        ) == "late"
+
+        late = q.get(_at(62))
+        assert late["kind"] == "late"
+        assert late["messageId"] == "m-1"
+        assert late["seq"] == 1
+        assert "message" not in late
+
+        got = q.get(_at(62))
+        assert got["seq"] == 1  # out of order, and delivered anyway
+        assert got["message"]["messageId"] == "m-1"
+        assert q.ack("m-1", _at(62)) is True
+        assert q.get(_at(62)) is None
+
+
+def test_a_late_arrival_is_not_reported_as_a_duplicate(queue, envelope_factory):
+    """A delivered seq is still a duplicate; only a released gap makes an arrival late."""
+    queue.put(_env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0)
+    assert queue.get(T0)["seq"] == 0
+    queue.ack("m-0", T0)
+    # Never skipped by a release: this is a re-send, not a late arrival.
+    assert queue.put(
+        _env(envelope_factory, seq=0, message={"messageId": "m-again"}), T0
+    ) == "duplicate"
+    assert queue.get(T0) is None
+
+
+def test_seen_is_pruned_after_retention_and_live_messages_are_kept(
+    tmp_path, envelope_factory
+):
+    """Dedupe memory must not grow forever, but must never forget a live message (issue #13)."""
+    far = "2027-01-30T05:00:00Z"  # inside the 30-day bound used by the retention window
+    with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
+        q.put(_env(envelope_factory, seq=0, message={"messageId": "m-gone"},
+                   expiresAt=far), T0)
+        q.ack("m-gone", T0)  # delivered: only ``seen`` remembers it now
+        q.put(_env(envelope_factory, seq=1, message={"messageId": "m-live"},
+                   expiresAt=far), T0)  # still live in the queue
+
+        later = T0 + timedelta(days=31)
+        assert q.expire(later) == []  # nothing expired; the prune runs anyway
+
+        # The old id is forgotten, so a fresh message may reuse it...
+        assert q.put(_env(envelope_factory, seq=5, message={"messageId": "m-gone"},
+                          expiresAt=far), later) == "accepted"
+        # ...while a live message's id is still defended, and re-putting it is a
+        # clean duplicate rather than a primary-key collision.
+        assert q.put(_env(envelope_factory, seq=6, message={"messageId": "m-live"},
+                          expiresAt=far), later) == "duplicate"
+
+
+def test_a_notice_is_re_offered_until_the_bridge_confirms_it(tmp_path, envelope_factory):
+    """A notice marked delivered before it is written is lost with the process (review of #30)."""
+    with Queue(tmp_path / "q.sqlite", OWNER) as q:
+        q.put(_env(envelope_factory), T0)
+        now = T0
+        for attempt in range(5):
+            q.get(now)
+            now += timedelta(seconds=BACKOFF_SECONDS[attempt] + 1)
+
+        first = q.get(now)
+        assert first["kind"] == "dead"
+        notice_id = first["_noticeId"]
+        assert isinstance(notice_id, int)
+
+        # Not re-offered inside the backoff: one drain loop must not spin on it.
+        assert q.get(now) is None
+        assert q.get(now + timedelta(seconds=59)) is None
+
+        # The bridge crashed before writing it: it comes back, with the same id.
+        second = q.get(now + timedelta(seconds=NOTICE_BACKOFF_SECONDS + 1))
+        assert second["kind"] == "dead"
+        assert second["_noticeId"] == notice_id
+
+        assert q.confirm_notice(notice_id) is True
+        assert q.get(now + timedelta(seconds=300)) is None  # confirmed: never again
+        assert q.confirm_notice(notice_id) is False  # already delivered
+
+
+def test_confirmed_notices_do_not_block_later_ones(tmp_path, envelope_factory):
+    with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
+        for seq in (0, 2):
+            q.put(_env(envelope_factory, seq=seq, message={"messageId": f"m-{seq}"}), T0)
+        q.get(T0)
+        q.ack("m-0", T0)
+        gap = q.get(_at(61))
+        assert gap["kind"] == "gap"
+        assert q.confirm_notice(gap["_noticeId"]) is True
+        assert q.get(_at(61))["seq"] == 2  # the released message follows the confirmed notice

@@ -48,9 +48,17 @@ from .canonical import CanonicalisationError, canonical_bytes
 from .contacts import REFUSED
 from .envelope import sent_at as envelope_sent_at, verify_envelope
 from .gate import Gate
-from .identity import Identity, b64url_decode, public_key_from_b64, verify_signature
+from .identity import (Identity, b64url_decode, generate, public_key_from_b64,
+                       verify_signature)
 from .queue import Queue
 from .registry import fingerprint_of_raw
+
+#: A throwaway identity for the refusal path only (issue #24). Nothing verifies
+#: against it and nothing is signed with it; it exists so a miss costs what a hit
+#: costs. Generated once per process, never persisted, never in a registry.
+_SHADOW = generate("shadow", "shadow.invalid")
+_SHADOW_KEY = _SHADOW.public_key
+_SHADOW_SIG = _SHADOW.sign(b"shadow")
 
 #: §9 content cap: 64 KiB per message, no file transfer.
 MAX_ENVELOPE_BYTES = 64 * 1024
@@ -210,16 +218,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if urllib.parse.urlparse(self.path).path != "/v1/health":
             self._send(404, b'{"error":"not found"}')
             return
-        bridge: Bridge = self.server.bridge  # type: ignore[attr-defined]
-        body = json.dumps(
-            {
-                "status": "ok",
-                "agent_id": bridge.agent_id,
-                "queue_depth": bridge.queue.depth(),
-            },
-            sort_keys=True,
-        ).encode("ascii")
-        self._send(200, body)
+        # Liveness only (§10, issue #25). The agent id and the queue depth are a
+        # scanner's ideal signal — which hosts are live, which are idle, and
+        # whether mail is piling up — and "it is only loopback" is the assumption
+        # that stops being true first. Diagnostics belong behind the operator's
+        # own tools, not on an unauthenticated GET.
+        self._send(200, b'{"status":"ok"}')
 
     def do_POST(self) -> None:  # noqa: N802 - http.server names the method
         if urllib.parse.urlparse(self.path).path != "/v1/envelope":
@@ -346,7 +350,12 @@ class Bridge:
             return None
         card = self.cards.get(sender)
         if card is None:
-            return None  # no registered card for this sender: not a sender
+            # Not a sender — but the refusal must not be *faster* than acceptance,
+            # or the wall clock answers "does this name exist?" (§9, issue #24).
+            # Spend the same two Ed25519 verifications a known sender would and
+            # throw the result away; the answer is still exactly the same refusal.
+            self._shadow_verify(envelope)
+            return None
         # Asked of the registry at the instant the message was signed, not at receipt (decision
         # 0002). With a plain dict the instant is ignored — every key is valid forever — but the
         # call site is the live path a Registry plugs into, so the model is not dead code.
@@ -378,6 +387,21 @@ class Bridge:
             envelope["seq"],
             message["contextId"],
         )
+
+    def _shadow_verify(self, envelope: Any) -> None:
+        """Do the two signature checks a known sender's path costs, and discard them.
+
+        ``verify_card`` then ``verify_envelope`` is one Ed25519 verification each.
+        On a miss we run the same two against a throwaway key over the same bytes:
+        the signature always fails, which is the point — the cost, not the answer,
+        is what has to match.
+        """
+        try:
+            payload = canonical_bytes(envelope) if isinstance(envelope, dict) else b""
+        except Exception:
+            payload = b""
+        verify_signature(_SHADOW_KEY, payload, _SHADOW_SIG)
+        verify_signature(_SHADOW_KEY, b"card:" + payload, _SHADOW_SIG)
 
     # -- sending ---------------------------------------------------------
 

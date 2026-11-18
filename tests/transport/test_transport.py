@@ -67,19 +67,16 @@ def test_round_trip_real_http(pair):
     assert pair.muse.queue.depth() == 0
 
 
-def test_health_reports_queue_depth(pair):
+def test_health_is_liveness_only(pair):
+    """§10/issue #25: an unauthenticated GET must not name the agent or its mail."""
     status, body = _get(pair.muse.url, "/v1/health")
     assert status == 200
-    assert json.loads(body) == {
-        "status": "ok",
-        "agent_id": pair.muse_id.agent_id,
-        "queue_depth": 0,
-    }
+    assert json.loads(body) == {"status": "ok"}
     pair.carl.bridge.send(
         pair.muse.url, build_envelope(pair.carl_id, pair.muse_id.agent_id)
     )
     _, body = _get(pair.muse.url, "/v1/health")
-    assert json.loads(body)["queue_depth"] == 1
+    assert json.loads(body) == {"status": "ok"}, "queue depth must not leak either"
 
 
 def test_over_cap_refused_and_not_queued(pair):
@@ -239,3 +236,41 @@ def test_a_message_is_verified_against_the_key_at_its_own_sent_time(pair):
         sent_at="2026-11-18T07:00:00Z", expires_at="2026-11-21T05:00:00Z",
     )
     assert pair.muse.bridge.deliver(signed_later) is None
+
+
+def test_an_unknown_sender_costs_the_same_crypto_as_a_known_one(pair, monkeypatch):
+    """§9/issue #24: the wall clock must not answer "does this name exist?"."""
+    import knok.agentcard as agentcard_module
+    import knok.envelope as envelope_module
+    import knok.transport as transport_module
+
+    calls: list[str] = []
+
+    def counted(module, name):
+        real = getattr(module, name)
+
+        def wrapper(*args, **kwargs):
+            calls.append(module.__name__)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, wrapper)
+
+    # Every module that can perform a signature check on this path, so the count is
+    # of real Ed25519 operations and not of one namespace's share of them.
+    counted(agentcard_module, "verify_signature")
+    counted(envelope_module, "verify_signature")
+    counted(transport_module, "verify_signature")
+
+    known = build_envelope(pair.carl_id, pair.muse_id.agent_id)
+    assert pair.muse.bridge.deliver(known) is not None
+    known_calls = len(calls)
+
+    calls.clear()
+    stranger = build_envelope(pair.carl_id, pair.muse_id.agent_id)
+    stranger["from"] = "stranger@bridge.example"
+    assert pair.muse.bridge.deliver(stranger) is None  # same refusal as any other
+    stranger_calls = len(calls)
+
+    assert known_calls == stranger_calls, (
+        f"known sender did {known_calls} signature checks, unknown did {stranger_calls}"
+    )
