@@ -8,7 +8,9 @@ the request must not be able to be the spam.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,6 +48,21 @@ def _parse(text: str) -> datetime:
     return datetime.fromisoformat(text)
 
 
+def _locked(method):
+    """Run a method with this store's lock held (RLock: nesting is fine).
+
+    The transport serves on its own thread, so every method touching the
+    connection must be safe to call from there — same pattern as Queue.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class Contacts:
     """Persistent contact state and request history."""
 
@@ -53,7 +70,10 @@ class Contacts:
                  contact_request_daily_limit: int | None = None):
         self.rates = rates
         self.contact_request_daily_limit = contact_request_daily_limit
-        self._conn = sqlite3.connect(str(path))
+        # Same pattern as Queue: the transport serves on its own thread, so
+        # the connection must be usable from it, guarded by one lock.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS contacts (peer TEXT PRIMARY KEY, state TEXT NOT NULL,"
             " updated TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,"
@@ -75,6 +95,7 @@ class Contacts:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    @_locked
     def _row(self, peer: str) -> tuple[str, datetime, int, datetime | None] | None:
         row = self._conn.execute(
             "SELECT state, updated, requests, last_request FROM contacts WHERE peer = ?", (peer,)
@@ -83,13 +104,17 @@ class Contacts:
             return None
         return (row[0], _parse(row[1]), row[2], _parse(row[3]) if row[3] else None)
 
+    @_locked
     def state(self, peer: str, now: datetime | None = None) -> str:
         """Current state, applying the 7-day expiry of a request.
 
         The expiry is written down rather than recomputed on every read: a recomputed expiry would
         resurrect a stale request on the next call.
         """
-        moment = now or datetime.now(timezone.utc)
+        return self._state_locked(peer, now or datetime.now(timezone.utc))
+
+    def _state_locked(self, peer: str, moment: datetime) -> str:
+        """State lookup with the lock already held (``state`` wraps this)."""
         row = self._row(peer)
         if row is None:
             return "none"
@@ -99,6 +124,7 @@ class Contacts:
             return "expired"
         return state
 
+    @_locked
     def requests_since(self, peer: str, moment: datetime) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) FROM contact_requests WHERE peer = ? AND at > ?",
@@ -106,6 +132,7 @@ class Contacts:
         ).fetchone()
         return row[0]
 
+    @_locked
     def _set(self, peer: str, state: str, now: datetime, bump: bool = False) -> None:
         if bump:
             self._conn.execute(
@@ -124,6 +151,7 @@ class Contacts:
             )
         self._conn.commit()
 
+    @_locked
     def request(self, peer: str, text: str = "", now: datetime | None = None) -> str:
         """Record an inbound contact request.
 
@@ -162,17 +190,20 @@ class Contacts:
             self.rates.hit("requests", "all", moment, timedelta(days=1))
         return "requested"
 
+    @_locked
     def accept(self, peer: str, now: datetime | None = None) -> None:
         if self.state(peer, now) != "requested":
             raise ContactError(f"{peer} has no live request to accept")
         self._set(peer, "accepted", now or datetime.now(timezone.utc))
 
+    @_locked
     def refuse(self, peer: str, now: datetime | None = None) -> None:
         """Refuse a live request. Refusal is terminal, and applies only to a request (§9)."""
         if self.state(peer, now) != "requested":
             raise ContactError(f"{peer} has no live request to refuse")
         self._set(peer, "refused", now or datetime.now(timezone.utc))
 
+    @_locked
     def revoke(self, peer: str, now: datetime | None = None) -> None:
         """Withdraw an accepted contact. Local action: the peer is told nothing, and the row is
         removed so the relationship returns to `none` rather than to a terminal refusal."""
@@ -181,10 +212,12 @@ class Contacts:
         self._conn.execute("DELETE FROM contacts WHERE peer = ?", (peer,))
         self._conn.commit()
 
+    @_locked
     def accepted(self) -> set[str]:
         rows = self._conn.execute("SELECT peer FROM contacts WHERE state = 'accepted'").fetchall()
         return {row[0] for row in rows}
 
+    @_locked
     def expire(self, now: datetime | None = None) -> int:
         """Mark stale requests as expired. Returns how many changed."""
         moment = now or datetime.now(timezone.utc)

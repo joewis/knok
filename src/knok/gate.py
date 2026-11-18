@@ -11,6 +11,7 @@ The gate runs **after decryption**. A sealed (form 2) envelope has no ``message`
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +35,10 @@ class Threads:
     """
 
     def __init__(self, path: str | Path):
-        self._conn = sqlite3.connect(str(path))
+        # Same pattern as Queue: the transport serves on its own thread, so
+        # the connection must be usable from it, guarded by one lock.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS threads (context TEXT PRIMARY KEY, expects INTEGER NOT NULL,"
             " closed INTEGER NOT NULL, updated TEXT NOT NULL)"
@@ -51,35 +55,37 @@ class Threads:
         self.close()
 
     def note_sent(self, context: str, expects_reply: bool, closes: bool, now: datetime) -> None:
-        row = self._conn.execute(
-            "SELECT expects FROM threads WHERE context = ?", (context,)
-        ).fetchone()
-        expects = (row[0] if row else 0) + (1 if expects_reply else 0)
-        self._conn.execute(
-            "INSERT INTO threads (context, expects, closed, updated) VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(context) DO UPDATE SET expects = excluded.expects,"
-            " closed = excluded.closed, updated = excluded.updated",
-            (context, expects, int(closes), now.isoformat()),
-        )
-        self._conn.commit()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT expects FROM threads WHERE context = ?", (context,)
+            ).fetchone()
+            expects = (row[0] if row else 0) + (1 if expects_reply else 0)
+            self._conn.execute(
+                "INSERT INTO threads (context, expects, closed, updated) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(context) DO UPDATE SET expects = excluded.expects,"
+                " closed = excluded.closed, updated = excluded.updated",
+                (context, expects, int(closes), now.isoformat()),
+            )
+            self._conn.commit()
 
     def note_received(self, context: str, now: datetime) -> Decision:
-        row = self._conn.execute(
-            "SELECT expects, closed FROM threads WHERE context = ?", (context,)
-        ).fetchone()
-        if row is None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT expects, closed FROM threads WHERE context = ?", (context,)
+            ).fetchone()
+            if row is None:
+                return Decision(True)
+            expects, closed = row[0], bool(row[1])
+            if closed or expects <= 0:
+                # A reply to a message that asked for none, or to a closed thread, is a protocol error.
+                # Dropping it is what stops two agents answering each other forever (§6, §2 goal 4).
+                return Decision(False, REFUSED)
+            self._conn.execute(
+                "UPDATE threads SET expects = expects - 1, updated = ? WHERE context = ?",
+                (now.isoformat(), context),
+            )
+            self._conn.commit()
             return Decision(True)
-        expects, closed = row[0], bool(row[1])
-        if closed or expects <= 0:
-            # A reply to a message that asked for none, or to a closed thread, is a protocol error.
-            # Dropping it is what stops two agents answering each other forever (§6, §2 goal 4).
-            return Decision(False, REFUSED)
-        self._conn.execute(
-            "UPDATE threads SET expects = expects - 1, updated = ? WHERE context = ?",
-            (now.isoformat(), context),
-        )
-        self._conn.commit()
-        return Decision(True)
 
 
 class Gate:

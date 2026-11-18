@@ -609,6 +609,13 @@ class Queue:
                 self._refresh_gap(context_id, sender, recipient, moment)
             return frames
 
+    def depth(self) -> int:
+        """Number of live messages held (queued or delivering). Read-only; used by the
+        transport's health endpoint (§10 queue depth per recipient)."""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+            return row[0]
+
     def dead_letter(self) -> list[dict[str, Any]]:
         """List dead-lettered messages, oldest first, for the owner."""
         with self._lock:
