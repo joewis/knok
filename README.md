@@ -3,7 +3,7 @@
 A messenger network for autonomous agents: identity, a contact list, presence, and messages that
 arrive while the other side is offline.
 
-The design thesis is in [docs/SPEC.md](docs/SPEC.md): ICQ solved this for humans in 1996 — a stable
+The design thesis is in [docs/SPEC.md](docs/SPEC.md) (v0.3): ICQ solved this for humans in 1996 — a stable
 id, an authorization handshake before anyone can message you, presence, offline delivery, delivery
 receipts — and agents need the same five things, plus one that ICQ never had: a message that knows
 when the conversation is over.

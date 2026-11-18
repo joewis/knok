@@ -1,7 +1,11 @@
 # Working on this
 
-Two authors: **Carl** (`carl@elitedesk`, Hermes agent with this checkout) and **Muse** (`muse@muse-vm`,
-the agent on the Muse VM). Both have write access to this repository, and neither pushes to `main`.
+Two authors: **Carl** (Hermes agent with this checkout) and **Muse** (the agent on the Muse VM). Their
+local ids are `carl@elitedesk` and `muse@muse-vm`; every id written in this repo and in the spec takes
+the public form `name@hub-domain` (`carl@bridge.example`), because §4 forbids `name@host` and an
+example is what people copy.
+
+Neither author pushes to `main` (§ Rules).
 
 ## The loop
 
@@ -24,7 +28,16 @@ with `Co-authored-by: Muse <muse@muse-vm>`. Nothing else about the workflow chan
 
 ## Credentials
 
-Muse authenticates with a **deploy key scoped to this repository**, write access, no account-wide
+**Muse's write access is unverified.** As of this commit the repository shows one collaborator
+(`joewis`) and no deploy keys, so the workflow above is the intended one, not a working one. It is
+verified by exactly this test, and only then described as held:
+
+1. the key exists on the VM at mode 0600, owned by the user that runs the agent;
+2. `git push origin muse/access-check` succeeds from that checkout;
+3. that branch appears on GitHub and its commits are attributed as expected;
+4. the branch is deleted and the key's fingerprint is recorded in this file.
+
+Intended credential: a **deploy key scoped to this repository**, write access, no account-wide
 permissions, revocable from one settings page. A personal access token is not used: a PAT carries
 scopes beyond this repo and expires on a calendar nobody is watching.
 
@@ -37,12 +50,16 @@ scopes beyond this repo and expires on a calendar nobody is watching.
 
 ## Rules
 
-- **Never push to `main`.** The rule is enforced by the two authors, not by GitHub: branch
-  protection is not available on a private repository on a free account (it arrives when the repo
-  goes public, which is where this is headed). Until then the protection is a habit, so the habit has
-  to be explicit — check `git branch --show-current` before a push, and never `git push` from a
-  detached state.
-- **One decision per commit.** A commit that changes topology *and* the envelope is two commits.
+- **Never push to `main`.** Branch protection is unavailable on a private repository on a free
+  account, so `main` is protected by a **pre-push hook** installed in every checkout:
+  `tools/hooks/pre-push` refuses any push whose remote ref is `refs/heads/main` unless
+  `ALLOW_MAIN_PUSH=1` is set for a deliberate, announced exception. Install it with
+  `ln -sf ../../tools/hooks/pre-push .git/hooks/pre-push`. A hook is not a habit: it fails closed.
+  A direct push that still lands is reverted and recorded as a process failure.
+- **One decision per commit.** A commit that changes topology *and* the envelope is two commits —
+  except a **spec version release**, which is one commit labelled as such (`spec: v0.3 — …`) because
+  the sections were rewritten together and splitting them would leave the repo in states that
+  contradict themselves.
 - **The spec is the artifact.** Code follows the spec; when code proves the spec wrong, the spec
   changes in the same PR.
 - **No secret ever enters the repo.** Keys, tokens, hostnames that resolve to private addresses, and

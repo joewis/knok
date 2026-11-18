@@ -1,0 +1,15 @@
+#!/bin/sh
+# Refuse a direct push to main. Installed at .git/hooks/pre-push in every checkout.
+# Deliberate exception: ALLOW_MAIN_PUSH=1 git push origin main
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/main)
+            if [ "${ALLOW_MAIN_PUSH:-0}" != "1" ]; then
+                echo "pre-push: refusing to push to main." >&2
+                echo "  open a branch and a PR, or set ALLOW_MAIN_PUSH=1 for a deliberate exception." >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+exit 0

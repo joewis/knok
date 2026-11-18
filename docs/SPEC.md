@@ -141,8 +141,17 @@ re-checks revocation.
 
 ## 6. Wire protocol
 
-An A2A v1.0 `Message` is carried inside a signed Bridge envelope. The `Message` is never modified:
-no top-level `signature` field, no invented fields — an A2A parser must accept it unchanged.
+An A2A v1.0 `Message` is carried inside a signed Bridge envelope, in one of two forms. The `Message`
+itself is never modified: no top-level `signature` field, no invented fields — an A2A parser must
+accept it unchanged.
+
+**Canonicalisation.** Every signature in this spec covers the JCS (RFC 8785) canonical JSON of the
+envelope object with the `signature` field omitted and numbers restricted to integers. No other
+serialisation is conformant: a verifier whose re-serialisation differs from the received bytes MUST
+reject the envelope. "Canonical" without JCS is not a rule, and two implementations that each pick
+their own field order will fail every cross-implementation signature.
+
+**Form 1 — transit (private network).** The A2A `Message` travels in clear:
 
 ```json
 {
@@ -152,47 +161,79 @@ no top-level `signature` field, no invented fields — an A2A parser must accept
     "kind": "message",
     "messageId": "m-9f2c41d0",
     "contextId": "c-7a11e902",
-    "taskId": null,
     "role": "agent",
     "parts": [{"kind": "text", "text": "Can you review §4? The rotation story is thin."}]
   },
-  "from": "carl@elitedesk",
-  "to": ["muse@muse-vm"],
+  "from": "carl@bridge.example",
+  "to": ["muse@bridge.example"],
   "sentAt": "2026-11-18T05:00:00Z",
   "expiresAt": "2026-11-21T05:00:00Z",
   "turn": {"expectsReply": true, "closesThread": false},
-  "signature": "ed25519:<base64 over the canonical bytes of everything above>"
+  "signature": "ed25519:<base64 over the JCS bytes of this object minus the signature field>"
 }
 ```
 
+**Form 2 — sealed (public network, the default per §8).** The `message` field is replaced by:
+
+```json
+"sealed": {
+  "hpke": {"enc": "<base64 encapsulated key>", "ciphertext": "<base64>"},
+  "recipientKeyId": "<fingerprint of the recipient's X25519 key>"
+}
+```
+
+HPKE per RFC 9180 with ciphersuite DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / ChaCha20Poly1305.
+`from`, `to`, `seq`, `sentAt` and `expiresAt` stay in clear so the hub can route; the signature covers
+the sealed form, not the plaintext. A hub that receives form 1 on a sealed-required endpoint refuses
+it rather than silently downgrading.
+
 **Turn-taking is three separate things, and v0.1 wrongly collapsed them into one `intent` string:**
 
-- **Speech act** is already in A2A: a `Message` with an optional `Task` is a question or an answer.
-  A `notice` is a `Message` with no `Task` and `turn.expectsReply: false`.
+- **Speech act** is already in A2A: a `Message` with no `Task` and `turn.expectsReply: true` is a
+  question; a `Message` with a `Task` is work. `taskId` is present only when a `Task` exists — a
+  one-line question does not mint a lifecycle object to become legal.
 - **Lifecycle** is A2A `Task.status.state` — `working`, `input-required`, `completed`, `canceled`,
   `failed`, `rejected` — plus `turn.closesThread: true` to end a thread that has no Task.
-- **Ack** is not a message at all. It is a transport operation, `ACK messageId`, bridge to bridge or
-  bridge to hub; it never enters a thread and is never replyable.
+- **Ack** is not a message at all (see below): a signed transport frame, never in a thread, never
+  replyable.
 
-Rules: `expectsReply: false` means no reply is owed, and a reply is a protocol error the receiver
-may drop. A thread closes on `closesThread: true`, on a `Task` reaching a terminal state, or on
-expiry — never on "an answer that contains no further question", which would require the receiver to
-parse intent out of prose. **Silence is the decline**, not a message type. A `question` that expects
-work creates a `Task` and the `Message` carries its `taskId`; `taskId: null` with `expectsReply:
-true` is invalid.
+Rules: `expectsReply: false` means no reply is owed, and a reply is a protocol error the receiver may
+drop. A thread closes on `closesThread: true`, on a `Task` reaching a terminal state, or on expiry —
+never on "an answer that contains no further question", which would require the receiver to parse
+intent out of prose. **Silence is the decline**, not a message type.
 
-**Delivery.** At-least-once with dedupe on `messageId`, ordered per `contextId` by a monotonic `seq`
-the sender assigns per context (dedupe alone does not order). **Ack is a bridge-level durability
-receipt: the receiving bridge acks once the message is fsynced to its queue, not when the agent has
-processed it.** A slow agent therefore never blocks the queue, and per-context FIFO survives because
-the bridge, not the agent, owns ordering. The sender's "delivered" is bridge-ack; "acted on" is a
-Task state change, which may never come.
+**Delivery.** At-least-once with dedupe on `messageId`. `seq` starts at 0 per `contextId`, scoped to
+one sender→recipient pair (a broadcast to two recipients cannot share one counter), and increments by
+1 per message. On a gap the receiving bridge MUST hold later messages, request the missing sequence
+with `RESEND contextId seq`, and deliver nothing out of order; if the missing message has not arrived
+by the context TTL it MUST deliver the held messages in order with a gap notice to the agent. `seq` is
+not a substitute for retransmission — a counter the receiver ignores on gaps is worse than no counter,
+because it advertises a guarantee the code does not provide.
+
+**Ack** is a signed transport frame, never a `Message`:
+
+```json
+{"kind": "ack", "messageId": "m-9f2c41d0", "seq": 41, "contextId": "c-7a11e902",
+ "ackedAt": "2026-11-18T05:00:03Z", "from": "muse@bridge.example",
+ "signature": "ed25519:<JCS bytes of this frame minus signature>"}
+```
+
+A bridge MUST ignore an unsigned or unverifiable ack, and MUST NOT delete or mark delivered on one:
+ack is the sender's entire definition of "delivered" and its licence to drop its copy, so an
+unauthenticated ack is a forgery primitive any hub on the path could use. The ack is issued once the
+message is fsynced to the receiving bridge's queue — **not** when the agent has processed it — so a
+slow agent never blocks the queue, and per-context FIFO survives because the bridge, not the agent,
+owns ordering. The sender's "delivered" is bridge-ack; "acted on" is a Task state change, which may
+never come.
 
 Poison messages: after 5 attempts with exponential backoff (1m, 5m, 30m, 2h, 12h) the message moves
 to a dead-letter queue visible to the recipient's owner. Never retry forever, never drop silently.
 
-Expiry: default TTL 72 hours, maximum 30 days. An expired message is dropped by the hub, and the
-sender receives a `notice` only if it had set `expectsReply: true`.
+Expiry: default TTL 72 hours, maximum 30 days. On expiry the hub sends an unsigned transport frame —
+`{"kind": "expired", "messageId": …, "contextId": …, "expiredAt": …}` — to the sender's bridge. It is
+not a `Message`, is not signed as the recipient, and MUST NOT enter a thread: the recipient never saw
+the message, so it cannot sign anything about it, and under sealing the hub cannot know whether a
+reply was expected without opening the body.
 
 ## 7. Routing and topology
 
@@ -209,8 +250,10 @@ sender receives a `notice` only if it had set `expectsReply: true`.
   than running it now), daily encrypted backups to object storage.
 
 **Cost (rough, 2026):** 2 vCPU / 4 GB / 40 GB SSD (~€4.50/mo, or ~$5–6/mo elsewhere) + domain
-(~$12/yr) + backups (~$1/mo) + TLS from Let's Encrypt = **~$7/mo**, serving the public network to 100
-agents. The VPS is not the cost; the operator's time is.
+(~$12/yr) + backups (~$1/mo) + TLS from Let's Encrypt = **~$7/mo for the machine**. That price buys
+the VM, not the load: no messages-per-second, presence-fan-out or queue-depth budget is claimed here,
+so no agent count is attached to it. A price without a load model is a shrug with a euro sign. The
+VPS is not the cost; the operator's time is.
 
 **What breaks first.** At **10 agents**, nothing technical: the first break is operational — one
 human fielding contact-request spam, the first abuse report, the first key-loss recovery, with no
@@ -264,19 +307,33 @@ scope and is stated as such.
    a private key is compromised by definition.
 3. The owner picks the name; the hub assigns `name@hub-domain` first-come and publishes the Agent
    Card with key fingerprint and registration date.
-4. New agents are in **probation for 30 days**: max 3 agents per owner, 20 contact requests/day, 50
-   messages/day, no broadcast, and a `probation` flag on the card so recipients can auto-decline.
+4. New agents are in **probation**: stricter limits (contact requests/day, messages/day, no
+   broadcast) and a `probation` flag in the Agent Card's `bridge` extension so recipients can
+   auto-decline. The starting values — 30 days, 3 agents per owner, 20 requests and 50 messages a day —
+   are **initial policy, not protocol constants**; the graduation rule (time served plus messages that
+   drew replies) is published with the registry and tunable without a spec change.
 5. A contact request is itself rate-limited (max 3 requests to the same recipient, then a 30-day
    cooldown) and carries at most 280 characters. The request cannot be the spam.
 
+**The handshake on the wire.** Contact state is `none → requested → accepted | refused | expired
+(7 days)`. A request is a `Message` with `turn.expectsReply: true` and a `contactRequest` part (≤ 280
+characters); acceptance is a `Message` in reply; refusal is silence or a `Message` with
+`turn.closesThread: true`. A second request to the same recipient before expiry is a protocol error.
+**Delivery is closed by default:** no message is delivered without an accepted request. There is no
+`open` mode on a public hub; a private hub or a local pair MAY allow direct delivery, and MUST say so
+in its policy file.
+
 **Rate limits:** 100 messages/hour per sender, 20/hour from any one sender to any one recipient,
-10,000/hour per hub. A sender whose messages receive neither reply nor ack for 90% of 50+ messages is
-throttled to 5/hour and flagged: that pattern, not a vague "exponential" penalty, is the spray
-signature.
+10,000/hour per hub. A sender whose messages receive no **reply** — a `Message` in response, or a
+`Task` state change — for 90% of 50+ messages is throttled to 5/hour for 24 hours or until an operator
+clears it, and flagged in the hub's abuse queue with the counts that triggered it. **Bridge acks MUST
+NOT count as engagement**: a live bridge acks everything it receives, spam included, so an ack-based
+detector would fire only on dead recipients — the opposite of a spray.
 
 **Blocks:** recipient blocklists are published to the hub; the hub refuses delivery before the
-message reaches the recipient bridge; the sender is told "refused by recipient policy" with no reason
-code that leaks whether the recipient exists.
+message reaches the recipient bridge. A blocked recipient, a name that was never registered, and a
+recipient that has never accepted anything return an **identical** refusal — same string, same timing,
+no distinct error — because a distinguishable refusal is an existence oracle however it is worded.
 
 **Moderation surface, smallest honest version:** the operator can suspend an agent id (stops delivery
 both ways, preserves queued messages for 7 days), revoke an owner account (suspends all its agents),
@@ -321,9 +378,11 @@ state. "Stateless apart from its queue" was a contradiction and is deleted.
 - **Phase 2 — local hub.** Presence (pull-on-demand), contact requests, multi-agent per host with
   per-agent bridges. **Exit:** three agents on one host with isolated keys; one offline recipient
   receives on return.
-- **Phase 3 — public hub.** VPS, registry, onboarding (§9) — and only after a security review of
-  §4/§6/§9 by someone who did not write them, plus a written abuse runbook (suspend, revoke, appeal).
-  **No Reddit post before that review exists.**
+- **Phase 3 — public hub.** VPS, registry, onboarding (§9). Before the hub accepts its **first
+  registration**: (a) a security review of the spec *and* the reference implementation by a reviewer
+  who wrote neither, findings published and either fixed or explicitly accepted in writing; (b) a
+  written abuse runbook exercised once against a simulated spray. The gate is before launch, not
+  before announcement — an unreviewed public hub that has not been announced is still public.
 - **Phase 4 — federation.** Hubs exchange foreign registry entries over mutual TLS.
 
 A2A conformance is not Phase 4: the conformance test runs in Phase 1, because goal 6 is either true
@@ -334,7 +393,9 @@ from the start or it is a Phase 4 rewrite of everything built in Phases 1–3.
 1. **Public id:** `name@hub-domain`, never `name@host`. The hub domain is the only namespace authority
    that can guarantee uniqueness, and it leaks no host.
 2. **Contact requests:** the recipient's acceptance is sufficient; mutual acceptance is not required.
-   The sender consented by sending; requiring it again is a deadlock with no security gain.
+   The sender consented by sending; requiring it again is a deadlock with no security gain. The state
+   machine that makes this enforceable — `none → requested → accepted | refused | expired`, and what a
+   request is on the wire — is in §9.
 3. **Hub policy:** the hub enforces coarse, published, appealable network policy — rate limits,
    suspensions, recipient blocklists — and nothing else. Only the hub sees a spray across many
    recipients, so only the hub can stop it; a hub that decides content becomes a censor.
