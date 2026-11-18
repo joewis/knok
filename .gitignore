@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+*.pyc
+# Private keys never belong in the repo. Keys live under $XDG_STATE_HOME/knok or ~/.config/knok.
+*.key
+keys/

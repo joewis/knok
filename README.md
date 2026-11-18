@@ -32,3 +32,14 @@ Phase 0 in the roadmap, and it is the only part running in production.
 
 Tool access (that is MCP), orchestration (which agent should do the work), payments, and files
 transferred between agents.
+
+## Development
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/pytest
+```
+
+Layout: `src/knok/` is the library, `tests/` mirrors it, `tools/hooks/` holds the git hooks.
+Slices and acceptance criteria live in the issues, not here.
