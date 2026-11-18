@@ -50,6 +50,7 @@ from .envelope import verify_envelope
 from .gate import Gate
 from .identity import Identity, b64url_decode, public_key_from_b64, verify_signature
 from .queue import Queue
+from .registry import fingerprint_of_raw
 
 #: §9 content cap: 64 KiB per message, no file transfer.
 MAX_ENVELOPE_BYTES = 64 * 1024
@@ -104,6 +105,10 @@ def make_agent_card(identity: Identity, hub: str, url: str) -> dict[str, Any]:
         "bridge": {
             "publicKey": identity.public_b64(),
             "encryptionKey": "x25519:" + base64.b64encode(raw).decode("ascii"),
+            # The id names the key's record (decision 0002); the card carries the key itself for
+            # convenience, but a verifier that needs to know whether the key is still current asks
+            # the registry about this id, not about the bytes next to it.
+            "encryptionKeyId": fingerprint_of_raw(raw),
             "sealedRequired": False,
             "contactPolicy": "closed",
             "hub": hub,

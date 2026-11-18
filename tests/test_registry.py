@@ -146,3 +146,20 @@ def test_the_encryption_key_is_a_record_of_its_own():
     # The signing key never moved, so the card never had to be reissued.
     assert registry.status(identity.fingerprint, NOW) == "valid"
     assert len(registry.for_agent(identity.agent_id, "x25519")) == 2
+
+
+def test_a_card_names_its_encryption_key_record():
+    """SPEC §5: the card carries encryptionKeyId, and it is a fingerprint, not the key."""
+    from knok.registry import fingerprint_of_raw
+    from knok.identity import b64url_decode
+
+    identity, _ = _record()
+    card = make_agent_card(identity, "bridge.example", "http://127.0.0.1:8080")
+    import json
+    body = json.loads(b64url_decode(card["payload"]))
+    bridge = body["bridge"]
+    assert bridge["encryptionKeyId"].startswith("SHA256:")
+    raw = bridge["encryptionKey"].removeprefix("x25519:")
+    import base64
+    assert bridge["encryptionKeyId"] == fingerprint_of_raw(base64.b64decode(raw))
+    assert bridge["encryptionKeyId"] != bridge["publicKey"]

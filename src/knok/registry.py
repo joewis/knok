@@ -15,17 +15,31 @@ The legacy dict remains supported by :func:`knok.agentcard.verify_card` and
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
-__all__ = ["KeyRecord", "Registry", "KEY_TYPES", "VALID", "UNKNOWN"]
+from .identity import b64url
+
+__all__ = ["KeyRecord", "Registry", "KEY_TYPES", "VALID", "UNKNOWN", "fingerprint_of_raw"]
 
 #: `ed25519` signs; `x25519` seals (§4/§6 form 2).
 KEY_TYPES = ("ed25519", "x25519")
 
 VALID = "valid"
 UNKNOWN = "unknown"
+
+
+def fingerprint_of_raw(public_key: bytes) -> str:
+    """``SHA256:<base64url>`` over a raw public key, for key types with no DER encoding.
+
+    Ed25519 fingerprints hash the DER SubjectPublicKeyInfo (:func:`knok.identity.fingerprint`);
+    X25519 keys are carried raw in the card, so their fingerprint hashes those 32 bytes. Both are
+    named by the same scheme, and neither is used to verify anything — the fingerprint identifies a
+    record, the record carries the key.
+    """
+    return "SHA256:" + b64url(hashlib.sha256(public_key).digest())
 
 
 def _parse(value: Any) -> datetime | None:
