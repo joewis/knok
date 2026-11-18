@@ -201,8 +201,10 @@ every guarantee in this section conditional on the message not being sealed.
 What `messageId` reveals, stated honestly: nothing about the body, but it is **stable**, so a hub can
 link a message to its retransmissions and `RESEND`s. It is not a privacy field.
 
-Generation is therefore a MUST, not a convenience: **at least 128 bits from a CSPRNG, unique per
-sender across all its messages**. A sequential or timestamp-derived id is otherwise conformant and
+Generation is therefore a MUST, not a convenience: **at least 128 bits from a CSPRNG, unique across
+every message of every sender**. Per-sender uniqueness is enough for a receiver's `seen` table, but the
+id also travels in unsigned hub frames, acks and dead-letter stores shared across senders, so global
+uniqueness costs nothing and removes the question. A sequential or timestamp-derived id is otherwise conformant and
 leaks volume and ordering, and the receiving queue's `seen` table is keyed on `messageId` alone — a
 sender that reuses one has its later message silently dropped as a duplicate.
 
@@ -211,6 +213,18 @@ the sealed body, so nothing before decryption can say which stream a `seq` belon
 therefore stores and forwards opaque blobs: it does not order, it does not hold messages behind a gap,
 and `RESEND` runs bridge to bridge, not through the hub. A hub asked to order sealed traffic would
 have to read it.
+
+`RESEND` is therefore a **transport frame between bridges**, not a `Message`:
+
+```json
+{"kind": "resend", "contextId": "c-1", "from": "muse@bridge.example",
+ "to": ["carl@bridge.example"], "missing": [7, 8], "sentAt": "2026-11-18T05:00:00Z"}
+```
+
+`contextId` is in clear *here* and only here: both ends of this frame are the two parties to the
+conversation and both already know it. It is never sent to the hub. The reply to a `RESEND` is the
+original envelope again, unchanged — same `messageId`, same signature — which is why dedupe must key
+on `messageId` rather than on receipt count.
 
 **The signature covers the whole envelope**, including `messageId` and `seq` — not the `sealed` field
 alone. If it covered only `sealed`, a hub could swap `messageId` for one already seen and the receiver
@@ -293,7 +307,10 @@ guarantee the missing message has expired by the time the gap is released. The r
 
 - held messages are released with a gap notice at the context TTL;
 - **a late arrival after the release is delivered with a second, "late" notice — never dropped
-  silently.** It is out of order, and the receiver says so.
+  silently.** It is out of order, and the receiver says so;
+- a `seq` that never arrives leaves a permanent hole. After the gap notice the receiver treats that
+  `seq` as dead, which is not the same as "will arrive": a later `RESEND` for it is answered with
+  silence plus the same `dead` frame defined for poison messages.
 
 Silent dropping was the defect: the previous wording let a receiver discard a live message because a
 timer had passed, and record it as a duplicate.
