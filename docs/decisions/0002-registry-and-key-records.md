@@ -60,6 +60,16 @@ it holds a dict.
 The legacy form is kept because the alternative is a flag day that blocks the hub work on a registry
 service; it is not kept because it is correct.
 
+## What is not implemented yet
+
+- **Records are not signed.** They are data structures with a validity window; a hub that publishes
+  them, and a signature over them, is Phase 3. Until then the registry is trusted because of who
+  handed it over, which is exactly what the dict implied.
+- **No registry is published or fetched over the wire.** The transport takes a `Registry` and asks
+  it at the message's `sentAt`, so the model is live on a real path; nothing distributes records yet.
+- **Cards name the encryption key; nothing yet checks that the id resolves.** A verifier holding
+  records can resolve it; a verifier holding only a card cannot, and does not pretend to.
+
 ## Consequences
 
 - A card is verifiable at any historical time, not only "now" — which is what makes an audit trail

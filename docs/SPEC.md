@@ -95,10 +95,14 @@ private-network display name.
   `root`, `system`, `hub`, `bridge` are reserved.
 - **Keys:** one Ed25519 signing key per agent, generated on the agent's own machine. The X25519
   encryption key is bound to the same identity by a **key record** — `{agentId, keyType, publicKey,
-  fingerprint, notBefore, notAfter}` — signed by the agent's signing key and named by the Agent Card
-  as `encryptionKeyId`. The record is separate from the card so the encryption key can be rotated
-  without reissuing the card, and so a revocation can point at an object that outlives one card
-  issuance (decision 0002, issues #15 and #23).
+  fingerprint, notBefore, notAfter}` — named by the Agent Card as `encryptionKeyId`, whose id the
+  card's signature therefore covers. The record is separate from the card so the encryption key can
+  be rotated without reissuing the card, and so a revocation can point at an object that outlives
+  one card issuance (decision 0002, issues #15 and #23).
+
+  **Records are not yet signed objects.** The hub will sign them when it publishes a registry
+  (Phase 3); until then a verifier trusts the party that handed it the records, exactly as it
+  trusted the dict before them. That is a gap, and this paragraph is where it is recorded.
 
   Every key is described by such a record, and the registry is a set of them rather than a map from
   name to bytes. Verification asks what a key meant **at a time** — the `sentAt` of the message, not

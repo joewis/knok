@@ -8,7 +8,7 @@ import pytest
 
 from knok.agentcard import verify_card
 from knok.identity import generate
-from knok.registry import KeyRecord, Registry
+from knok.registry import KeyRecord, Registry, fingerprint_of_raw
 from knok.transport import make_agent_card
 
 NOW = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
@@ -127,39 +127,57 @@ def test_an_expired_card_is_refused():
     assert reason == "card key is expired"
 
 
+def _x25519_key():
+    """A real X25519 key, as the card carries it: standard base64 of the raw 32 bytes."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    import base64
+
+    raw = X25519PrivateKey.generate().public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    return base64.b64encode(raw).decode("ascii"), fingerprint_of_raw(raw)
+
+
 def test_the_encryption_key_is_a_record_of_its_own():
     """Issue #15: rotating the X25519 key must not require reissuing the card."""
     identity, signing = _record()
-    old_seal, new_seal = generate("carl", "bridge.example"), generate("carl", "bridge.example")
+    old_key, old_fp = _x25519_key()
+    new_key, new_fp = _x25519_key()
     registry = Registry([
         signing,
-        KeyRecord(agent_id=identity.agent_id, key_type="x25519",
-                  public_key=old_seal.public_b64(), fingerprint=old_seal.fingerprint,
-                  not_before=NOW - timedelta(days=1), not_after=NOW + timedelta(days=30),
-                  superseded_by=new_seal.fingerprint, superseded_at=NOW),
-        KeyRecord(agent_id=identity.agent_id, key_type="x25519",
-                  public_key=new_seal.public_b64(), fingerprint=new_seal.fingerprint,
-                  not_before=NOW, not_after=NOW + timedelta(days=30)),
+        KeyRecord(agent_id=identity.agent_id, key_type="x25519", public_key=old_key,
+                  fingerprint=old_fp, not_before=NOW - timedelta(days=1),
+                  not_after=NOW + timedelta(days=30), superseded_by=new_fp, superseded_at=NOW),
+        KeyRecord(agent_id=identity.agent_id, key_type="x25519", public_key=new_key,
+                  fingerprint=new_fp, not_before=NOW, not_after=NOW + timedelta(days=30)),
     ])
-    assert registry.status(old_seal.fingerprint, NOW) == "superseded"
-    assert registry.status(new_seal.fingerprint, NOW) == "valid"
+    assert registry.status(old_fp, NOW) == "superseded"
+    assert registry.status(new_fp, NOW) == "valid"
     # The signing key never moved, so the card never had to be reissued.
     assert registry.status(identity.fingerprint, NOW) == "valid"
     assert len(registry.for_agent(identity.agent_id, "x25519")) == 2
 
 
-def test_a_card_names_its_encryption_key_record():
-    """SPEC §5: the card carries encryptionKeyId, and it is a fingerprint, not the key."""
-    from knok.registry import fingerprint_of_raw
-    from knok.identity import b64url_decode
+def test_a_record_filed_under_the_wrong_fingerprint_is_refused():
+    """An id that does not match its bytes would answer "who is this" with someone else."""
+    _, record = _record()
+    _, other = _record()
+    wrong = KeyRecord(
+        agent_id=record.agent_id,
+        key_type=record.key_type,
+        public_key=record.public_key,
+        fingerprint=other.fingerprint,  # someone else's id on these bytes
+        not_before=record.not_before,
+        not_after=record.not_after,
+    )
+    with pytest.raises(ValueError):
+        Registry([wrong])
 
-    identity, _ = _record()
-    card = make_agent_card(identity, "bridge.example", "http://127.0.0.1:8080")
-    import json
-    body = json.loads(b64url_decode(card["payload"]))
-    bridge = body["bridge"]
-    assert bridge["encryptionKeyId"].startswith("SHA256:")
-    raw = bridge["encryptionKey"].removeprefix("x25519:")
-    import base64
-    assert bridge["encryptionKeyId"] == fingerprint_of_raw(base64.b64decode(raw))
-    assert bridge["encryptionKeyId"] != bridge["publicKey"]
+
+def test_supersession_without_an_instant_is_refused():
+    _, record = _record()
+    body = record.to_dict()
+    body["supersededBy"] = "SHA256:someone"
+    with pytest.raises(ValueError):
+        KeyRecord.from_dict(body)

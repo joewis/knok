@@ -15,20 +15,27 @@ The legacy dict remains supported by :func:`knok.agentcard.verify_card` and
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
-from .identity import b64url
+from .identity import b64url, fingerprint, public_key_from_b64
 
-__all__ = ["KeyRecord", "Registry", "KEY_TYPES", "VALID", "UNKNOWN", "fingerprint_of_raw"]
+__all__ = ["KeyRecord", "Registry", "KEY_TYPES", "VALID", "UNKNOWN", "fingerprint_of_raw",
+           "fingerprint_matches", "fingerprint_of_b64"]
 
 #: `ed25519` signs; `x25519` seals (§4/§6 form 2).
 KEY_TYPES = ("ed25519", "x25519")
 
 VALID = "valid"
 UNKNOWN = "unknown"
+
+
+def fingerprint_of_b64(public_key_b64: str) -> str:
+    """Fingerprint an Ed25519 key carried as base64, the form the registry stores."""
+    return fingerprint(public_key_from_b64(public_key_b64))
 
 
 def fingerprint_of_raw(public_key: bytes) -> str:
@@ -40,6 +47,28 @@ def fingerprint_of_raw(public_key: bytes) -> str:
     record, the record carries the key.
     """
     return "SHA256:" + b64url(hashlib.sha256(public_key).digest())
+
+
+def _key_bytes(public_key: str) -> bytes:
+    """Decode a stored public key, tolerating an ``x25519:`` prefix and missing padding."""
+    text = public_key.split(":", 1)[1] if public_key.startswith("x25519:") else public_key
+    text = text.strip()
+    text += "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text.encode("ascii"))
+
+
+def fingerprint_matches(record: "KeyRecord") -> bool:
+    """Whether the record's fingerprint really is the fingerprint of its key.
+
+    A record that files a key under someone else's id is worse than no record: it makes the id the
+    answer to "who is this" while the bytes belong to somebody else.
+    """
+    try:
+        if record.key_type == "ed25519":
+            return fingerprint_of_b64(record.public_key) == record.fingerprint
+        return fingerprint_of_raw(_key_bytes(record.public_key)) == record.fingerprint
+    except Exception:
+        return False
 
 
 def _parse(value: Any) -> datetime | None:
@@ -143,6 +172,10 @@ class KeyRecord:
 
         superseded_by = body.get("supersededBy")
         reason = body.get("reason")
+        if isinstance(superseded_by, str) and body.get("supersededAt") is None:
+            # "Replaced by X" without a time cannot be applied: the record would either never
+            # report supersession or report it from its own start, both of which are wrong.
+            raise ValueError("key record with supersededBy must also carry supersededAt")
 
         return cls(
             agent_id=agent_id,
@@ -167,6 +200,10 @@ class Registry:
             self.add(record)
 
     def add(self, record: KeyRecord) -> None:
+        if not fingerprint_matches(record):
+            raise ValueError(
+                f"key record fingerprint {record.fingerprint} does not match its public key"
+            )
         existing = self._by_fingerprint.get(record.fingerprint)
         if existing is not None and existing != record:
             # A record is a log entry: a second distinct record for one fingerprint is a mistake
