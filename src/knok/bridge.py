@@ -332,16 +332,22 @@ class Bridge:
             log.error("could not record a dropped item %s; leaving it at the hub: %s", key, exc)
             return False
 
-    def _record_notice(self, frame: dict[str, Any]) -> None:
-        """Keep notices where a human can see them; they are not messages and never enter a thread."""
+    def _record_notice(self, frame: dict[str, Any]) -> bool:
+        """Keep notices where a human can see them; they are not messages and never enter a thread.
+
+        Returns whether the frame is on disk. The caller confirms the notice with the queue only
+        on ``True``, so a failed write leaves the queue free to offer it again.
+        """
         path = self.state.directory / "notices.jsonl"
         try:
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(frame, sort_keys=True) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            return True
         except OSError as exc:
             log.warning("could not record notice: %s", exc)
+            return False
 
     def drain(self, limit: int = 50) -> int:
         """Hand queued messages to the application, then ack them out of the queue.
@@ -356,16 +362,16 @@ class Bridge:
                 break
             kind = envelope.get("kind")
             if kind in {"gap", "late", "expired", "dead"}:
-                self._record_notice(envelope)
-                # A stored frame would otherwise be re-offered after every backoff forever —
-                # but only frames whose message is gone may be acked. A ``late`` notice carries
-                # the messageId of a message that is *still queued behind it*: acking the notice
-                # would delete the very message the notice exists to explain.
-                if kind in {"expired", "dead"} and isinstance(envelope.get("messageId"), str):
-                    try:
-                        self.queue.ack(envelope["messageId"])
-                    except Exception:
-                        pass
+                # Record first, confirm second. A notice marked delivered before the frame is on
+                # disk is lost to a crash in between, and the sender is never told its message
+                # died — the failure this whole path exists to prevent. If the write fails, the
+                # notice stays unconfirmed and is re-offered after its backoff.
+                if self._record_notice(envelope):
+                    notice_id = envelope.get("_noticeId")
+                    if isinstance(notice_id, int):
+                        self.queue.confirm_notice(notice_id)
+                else:
+                    log.error("could not record a %s notice; leaving it to be re-offered", kind)
                 continue
             try:
                 self._append_inbox(envelope)

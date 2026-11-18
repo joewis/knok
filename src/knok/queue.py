@@ -87,6 +87,10 @@ DEFAULT_CONTEXT_TTL = timedelta(hours=72)
 #: How long a ``messageId`` stays in ``seen`` (§6 allows ``expiresAt`` up to 30 days out, so a
 #: duplicate may legitimately arrive that late). Pruning is bounded by this and the context TTL.
 SEEN_RETENTION = timedelta(days=30)
+#: How long a notice taken by the bridge but not confirmed waits before being offered again. The
+#: bridge confirms only after the frame is fsynced into its own log, so a crash in between must
+#: not lose it — and the retry must be long enough not to spin inside one drain loop.
+NOTICE_BACKOFF_SECONDS = 60
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -119,11 +123,15 @@ CREATE TABLE IF NOT EXISTS streams (
     PRIMARY KEY (context_id, sender, recipient)
 );
 CREATE TABLE IF NOT EXISTS notices (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL,
-    payload     TEXT NOT NULL,
-    created_at  REAL NOT NULL,
-    delivered   INTEGER NOT NULL DEFAULT 0
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    -- pending -> taken -> delivered. "taken" is handed to the bridge but not yet on disk
+    -- anywhere else; it is re-offered after NOTICE_BACKOFF_SECONDS so a crash or a failed
+    -- write cannot swallow the frame the sender depends on.
+    state        TEXT NOT NULL CHECK (state IN ('pending', 'taken', 'delivered')),
+    available_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS skipped (
     context_id  TEXT NOT NULL,
@@ -312,56 +320,84 @@ class Queue:
             " WHERE state = 'delivering' AND available_at <= ?",
             (moment,),
         ).fetchall()
-        for message_id, context_id, envelope_json, attempts in rows:
-            if attempts >= MAX_ATTEMPTS:
-                self._conn.execute(
-                    "INSERT INTO dead_letters"
-                    " (message_id, context_id, envelope_json, attempts, dead_at, reason)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (message_id, context_id, envelope_json, attempts, moment,
-                     f"undelivered after {attempts} attempts"),
-                )
-                self._queue_notice({
-                    "kind": "dead",
-                    "messageId": message_id,
-                    "contextId": context_id,
-                    "attempts": attempts,
-                    "deadedAt": _iso(now),
-                }, now)
-                self._conn.execute(
-                    "DELETE FROM messages WHERE message_id = ?", (message_id,)
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE messages SET state = 'queued' WHERE message_id = ?",
-                    (message_id,),
-                )
+        if not rows:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for message_id, context_id, envelope_json, attempts in rows:
+                if attempts >= MAX_ATTEMPTS:
+                    self._conn.execute(
+                        "INSERT INTO dead_letters"
+                        " (message_id, context_id, envelope_json, attempts, dead_at, reason)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (message_id, context_id, envelope_json, attempts, moment,
+                         f"undelivered after {attempts} attempts"),
+                    )
+                    self._queue_notice({
+                        "kind": "dead",
+                        "messageId": message_id,
+                        "contextId": context_id,
+                        "attempts": attempts,
+                        "deadedAt": _iso(now),
+                    }, now)
+                    self._conn.execute(
+                        "DELETE FROM messages WHERE message_id = ?", (message_id,)
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE messages SET state = 'queued' WHERE message_id = ?",
+                        (message_id,),
+                    )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
 
     # -- notices, late arrivals, retention -------------------------------
 
     def _queue_notice(self, notice: dict[str, Any], moment: datetime) -> None:
         """Record a transport frame the bridge must send. Caller holds the lock."""
         self._conn.execute(
-            "INSERT INTO notices (kind, payload, created_at) VALUES (?, ?, ?)",
-            (notice["kind"], json.dumps(notice, sort_keys=True), _ts(moment)),
+            "INSERT INTO notices (kind, payload, created_at, state, available_at)"
+            " VALUES (?, ?, ?, 'pending', ?)",
+            (notice["kind"], json.dumps(notice, sort_keys=True), _ts(moment), _ts(moment)),
         )
 
     def _take_notice(self, moment: datetime) -> dict[str, Any] | None:
-        """Return the oldest undelivered notice, marking it delivered.
+        """Hand out the oldest notice that is due, and mark it taken.
 
-        Delivered exactly once: a ``dead`` frame that repeated on every ``get``
-        would tell the sender its message died forever. Caller holds the lock.
+        Taken is not delivered. The bridge confirms with :meth:`confirm_notice`
+        only once the frame is fsynced into its own log; until then the notice is
+        re-offered after ``NOTICE_BACKOFF_SECONDS``. Marking it delivered here
+        would lose it to any crash between the handout and the write — and the
+        sender would never learn its message died, which is the point of the
+        frame. Caller holds the lock.
         """
         row = self._conn.execute(
-            "SELECT id, payload FROM notices WHERE delivered = 0 ORDER BY id LIMIT 1"
+            "SELECT id, payload FROM notices WHERE state != 'delivered'"
+            " AND available_at <= ? ORDER BY id LIMIT 1",
+            (_ts(moment),),
         ).fetchone()
         if row is None:
             return None
         notice_id, payload = row
         self._conn.execute(
-            "UPDATE notices SET delivered = 1 WHERE id = ?", (notice_id,)
+            "UPDATE notices SET state = 'taken', available_at = ? WHERE id = ?",
+            (_ts(moment) + NOTICE_BACKOFF_SECONDS, notice_id),
         )
-        return json.loads(payload)
+        notice = json.loads(payload)
+        notice["_noticeId"] = notice_id
+        return notice
+
+    def confirm_notice(self, notice_id: int, now: datetime | None = None) -> bool:
+        """Mark a taken notice delivered. Call after the frame is durable somewhere else."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE notices SET state = 'delivered'"
+                " WHERE id = ? AND state != 'delivered'",
+                (notice_id,),
+            )
+            return cursor.rowcount == 1
 
     def _was_skipped(self, context_id: str, sender: str, recipient: str, seq: int) -> bool:
         """Whether a gap release skipped this ``seq``, making an arrival late."""
@@ -390,7 +426,13 @@ class Queue:
             (cutoff,),
         )
         self._conn.execute(
-            "DELETE FROM notices WHERE delivered = 1 AND created_at < ?", (cutoff,)
+            "DELETE FROM notices WHERE state = 'delivered' AND created_at < ?", (cutoff,)
+        )
+        # ``skipped`` is the same growth class as ``seen``, one table over: a row is only
+        # useful while a late arrival for that seq could still be accepted, which the same
+        # retention window bounds.
+        self._conn.execute(
+            "DELETE FROM skipped WHERE released_at < ?", (cutoff,)
         )
         return cursor.rowcount
 
@@ -514,12 +556,11 @@ class Queue:
         moment = now or datetime.now(timezone.utc)
         with self._lock:
             self._sweep(moment)
-            notice = self._release_expired_gap(moment)
-            if notice is not None:
-                return notice
-            # A pending notice goes out before more mail: the receiver must be
-            # told a gap was released, or that a message it will never see died,
-            # before it reads the messages that followed.
+            # Releasing an expired gap queues its notice rather than returning it, so a crash
+            # after the release cannot lose the only signal that messages were skipped.
+            self._release_expired_gap(moment)
+            # A pending notice goes out before more mail: the receiver must be told a gap was
+            # released, or that a message it will never see died, before the messages after it.
             pending = self._take_notice(moment)
             if pending is not None:
                 return pending
@@ -555,14 +596,16 @@ class Queue:
                 raise
             return json.loads(envelope_json)
 
-    def _release_expired_gap(self, moment: datetime) -> dict[str, Any] | None:
+    def _release_expired_gap(self, moment: datetime) -> bool:
         """Release one stream whose gap outlived the context TTL, in order.
 
-        Returns the gap notice to hand to the agent, or ``None``. The
-        stream's ``next_seq`` jumps to the first held message, so the held
-        messages become deliverable in order on subsequent ``get`` calls,
-        and a late arrival of a skipped ``seq`` is then dropped as a
-        duplicate — the gap is closed, not left open forever.
+        Returns whether anything was released. The stream's ``next_seq`` jumps
+        to the first held message, so the held messages become deliverable in
+        order on subsequent ``get`` calls. The skipped seqs are recorded in
+        ``skipped``, so a message bearing one that arrives later is delivered as
+        a *late* arrival with its own notice rather than dropped as a duplicate
+        (issue #19). The gap notice is queued, not returned: it must survive a
+        crash between the release and the bridge writing it out.
         """
         deadline = _ts(moment) - self.context_ttl.total_seconds()
         row = self._conn.execute(
@@ -580,7 +623,7 @@ class Queue:
             (deadline,),
         ).fetchone()
         if row is None:
-            return None
+            return False
         context_id, sender, recipient, next_seq, first_held = row
         missing = [
             seq for seq in range(next_seq, first_held)
@@ -612,14 +655,15 @@ class Queue:
         except BaseException:
             self._conn.execute("ROLLBACK")
             raise
-        return {
+        self._queue_notice({
             "kind": "gap",
             "contextId": context_id,
             "from": sender,
             "to": recipient,
             "missing": missing,
             "releasedAt": _iso(moment),
-        }
+        }, moment)
+        return True
 
     def ack(self, message_id: str, now: datetime | None = None) -> bool:
         """Mark a message delivered. Returns ``False`` when unknown.

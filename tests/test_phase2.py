@@ -367,3 +367,46 @@ def test_a_late_notice_does_not_ack_away_the_message_it_names(tmp_path):
     assert bridge.drain() == 0
     assert bridge.queue.acked == [], "the late notice must not ack the message away"
     assert "m-1" in (tmp_path / "notices.jsonl").read_text()
+
+
+def _drain_bridge(tmp_path, frames):
+    from types import SimpleNamespace
+    from knok.bridge import Bridge
+
+    class FakeQueue:
+        def __init__(self):
+            self.pending = list(frames)
+            self.confirmed: list[int] = []
+
+        def get(self, now=None):
+            return self.pending.pop(0) if self.pending else None
+
+        def confirm_notice(self, notice_id, now=None):
+            self.confirmed.append(notice_id)
+            return True
+
+    bridge = object.__new__(Bridge)
+    bridge.state = SimpleNamespace(directory=tmp_path)
+    bridge.queue = FakeQueue()
+    return bridge
+
+
+def test_a_notice_is_confirmed_only_after_it_is_on_disk(tmp_path):
+    from knok.bridge import Bridge  # noqa: F401 - imported for the helper's use
+
+    frame = {"kind": "dead", "messageId": "m-1", "contextId": "c-1",
+             "attempts": 5, "deadedAt": "2026-11-18T05:00:00Z", "_noticeId": 9}
+    bridge = _drain_bridge(tmp_path, [frame, None])
+    assert bridge.drain() == 0
+    assert bridge.queue.confirmed == [9]
+    assert "deadedAt" in (tmp_path / "notices.jsonl").read_text()
+
+
+def test_an_unwritable_notice_is_not_confirmed(tmp_path):
+    """If the frame cannot be written, the queue must keep offering it."""
+    frame = {"kind": "dead", "messageId": "m-1", "contextId": "c-1",
+             "attempts": 5, "deadedAt": "2026-11-18T05:00:00Z", "_noticeId": 9}
+    bridge = _drain_bridge(tmp_path, [frame, None])
+    (tmp_path / "notices.jsonl").mkdir()  # every write raises
+    assert bridge.drain() == 0
+    assert bridge.queue.confirmed == []
