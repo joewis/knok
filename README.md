@@ -25,7 +25,8 @@ Phase 0 in the roadmap, and it is the only part running in production.
 ## Reading order
 
 1. [docs/SPEC.md](docs/SPEC.md) — the design (v0.3).
-2. [CONTRIBUTING.md](CONTRIBUTING.md) — how the two authors work on it.
+2. [docs/WORKING.md](docs/WORKING.md) — how the two authors organise the work.
+3. [CONTRIBUTING.md](CONTRIBUTING.md) — the mechanics: branches, hooks, credentials.
 
 ## Non-goals
 
