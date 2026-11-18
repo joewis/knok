@@ -119,3 +119,16 @@ def test_rate_limit_is_enforced(tmp_path):
     assert gate.decide(envelope(context="c-3"), T0).allowed is False
     # The next hour starts clean.
     assert gate.decide(envelope(context="c-4"), T0.replace(hour=6)).allowed is True
+
+
+def test_a_refused_envelope_does_not_burn_the_rate_budget(tmp_path):
+    # Muse's probe: two malformed envelopes used to exhaust the shared window and lock out a good
+    # one. Validation now runs before _within_limits.
+    doc = {**CLOSED, "limits": {"messages_per_hour": 2}}
+    gate, _ = build(tmp_path, doc, rates=True)
+    bad = {"from": SENDER, "message": {"kind": "message"}}  # no contextId
+    assert gate.decide(bad, T0).allowed is False
+    assert gate.decide(bad, T0).allowed is False
+    assert gate.decide(envelope(context="c-1"), T0).allowed is True
+    assert gate.decide(envelope(context="c-2"), T0).allowed is True
+    assert gate.decide(envelope(context="c-3"), T0).allowed is False

@@ -12,6 +12,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .rates import Rates
+
 REQUEST_TTL = timedelta(days=7)
 COOLDOWN = timedelta(days=30)
 MAX_REQUESTS = 3
@@ -47,12 +49,20 @@ def _parse(text: str) -> datetime:
 class Contacts:
     """Persistent contact state and request history."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, rates: Rates | None = None,
+                 contact_request_daily_limit: int | None = None):
+        self.rates = rates
+        self.contact_request_daily_limit = contact_request_daily_limit
         self._conn = sqlite3.connect(str(path))
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS contacts (peer TEXT PRIMARY KEY, state TEXT NOT NULL,"
             " updated TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,"
             " last_request TEXT)"
+        )
+        #: The cooldown is a rolling window, so the individual attempt times are what matter; a
+        #: lifetime counter with one anchor date throttles a peer forever after three requests.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS contact_requests (peer TEXT NOT NULL, at TEXT NOT NULL)"
         )
         self._conn.commit()
 
@@ -88,6 +98,13 @@ class Contacts:
             self._set(peer, "expired", moment)
             return "expired"
         return state
+
+    def requests_since(self, peer: str, moment: datetime) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM contact_requests WHERE peer = ? AND at > ?",
+            (peer, _ts(moment - COOLDOWN)),
+        ).fetchone()
+        return row[0]
 
     def _set(self, peer: str, state: str, now: datetime, bump: bool = False) -> None:
         if bump:
@@ -127,13 +144,22 @@ class Contacts:
         if current == "refused":
             raise ContactError(f"{peer} refused; a refusal is terminal")
 
-        row = self._row(peer)
-        if row is not None:
-            requests, last = row[2], row[3]
-            if requests >= MAX_REQUESTS and last is not None and moment - last < COOLDOWN:
-                raise Cooldown(f"{peer} is inside the 30-day cooldown")
+        if self.requests_since(peer, moment) >= MAX_REQUESTS:
+            raise Cooldown(f"{peer} is inside the 30-day cooldown")
+
+        # The daily limit is inbound overall (§9's probation number), not per peer: the per-peer
+        # throttle is the three-requests/30-days rule above.
+        if self.rates is not None and self.contact_request_daily_limit is not None:
+            if self.rates.count("requests", "all", moment, timedelta(days=1)) >= self.contact_request_daily_limit:
+                raise Cooldown(f"{peer}: the daily contact-request limit is spent")
 
         self._set(peer, "requested", moment, bump=True)
+        self._conn.execute(
+            "INSERT INTO contact_requests (peer, at) VALUES (?, ?)", (peer, _ts(moment))
+        )
+        self._conn.commit()
+        if self.rates is not None:
+            self.rates.hit("requests", "all", moment, timedelta(days=1))
         return "requested"
 
     def accept(self, peer: str, now: datetime | None = None) -> None:
@@ -142,9 +168,18 @@ class Contacts:
         self._set(peer, "accepted", now or datetime.now(timezone.utc))
 
     def refuse(self, peer: str, now: datetime | None = None) -> None:
-        if self.state(peer, now) not in {"requested", "accepted"}:
-            raise ContactError(f"{peer} is not a contact")
+        """Refuse a live request. Refusal is terminal, and applies only to a request (§9)."""
+        if self.state(peer, now) != "requested":
+            raise ContactError(f"{peer} has no live request to refuse")
         self._set(peer, "refused", now or datetime.now(timezone.utc))
+
+    def revoke(self, peer: str, now: datetime | None = None) -> None:
+        """Withdraw an accepted contact. Local action: the peer is told nothing, and the row is
+        removed so the relationship returns to `none` rather than to a terminal refusal."""
+        if self.state(peer, now) != "accepted":
+            raise ContactError(f"{peer} is not an accepted contact")
+        self._conn.execute("DELETE FROM contacts WHERE peer = ?", (peer,))
+        self._conn.commit()
 
     def accepted(self) -> set[str]:
         rows = self._conn.execute("SELECT peer FROM contacts WHERE state = 'accepted'").fetchall()

@@ -12,6 +12,7 @@ from knok.contacts import (
     Cooldown,
     DuplicateRequest,
 )
+from knok.rates import Rates
 
 T0 = datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc)
 PEER = "muse@bridge.example"
@@ -82,11 +83,12 @@ def test_accept_without_request_is_an_error(contacts):
         contacts.accept(PEER, T0)
 
 
-def test_refuse_removes_from_accepted(contacts):
+def test_accepted_contact_is_withdrawn_by_revoke_not_refusal(contacts):
+    # §9's diagram has no accepted -> refused edge; withdrawing an accepted contact is a local act.
     contacts.request(PEER, "", T0)
     contacts.accept(PEER, T0)
-    contacts.refuse(PEER, T0)
-    assert contacts.state(PEER, T0) == "refused"
+    contacts.revoke(PEER, T0)
+    assert contacts.state(PEER, T0) == "none"
     assert contacts.accepted() == set()
 
 
@@ -104,3 +106,40 @@ def test_expire_marks_stale_requests(tmp_path):
         store.request(PEER, "", T0)
         assert store.expire(T0 + REQUEST_TTL) == 1
         assert store.state(PEER, T0 + REQUEST_TTL) == "expired"
+
+
+def test_cooldown_is_a_rolling_window_not_a_lifetime_quota(contacts):
+    # Three requests spread over months must not throttle a peer forever: only attempts inside the
+    # 30-day window count against it.
+    contacts.request(PEER, "", T0)
+    contacts.request(PEER, "", T0 + timedelta(days=40))
+    contacts.request(PEER, "", T0 + timedelta(days=80))
+    assert contacts.request(PEER, "", T0 + timedelta(days=88)) == "requested"
+
+
+def test_refuse_requires_a_live_request(contacts):
+    contacts.request(PEER, "", T0)
+    contacts.accept(PEER, T0)
+    with pytest.raises(ContactError, match="no live request"):
+        contacts.refuse(PEER, T0)
+
+
+def test_revoke_removes_an_accepted_contact(contacts):
+    contacts.request(PEER, "", T0)
+    contacts.accept(PEER, T0)
+    contacts.revoke(PEER, T0)
+    assert contacts.state(PEER, T0) == "none"
+    assert contacts.accepted() == set()
+    # ...and the peer may start again, unlike a refusal.
+    assert contacts.request(PEER, "", T0) == "requested"
+
+
+def test_daily_request_limit_is_enforced(tmp_path):
+    rates = Rates(tmp_path / "rates.db")
+    with Contacts(tmp_path / "c.db", rates=rates, contact_request_daily_limit=2) as store:
+        store.request(PEER, "", T0)
+        other = "bobby@bridge.example"
+        store.request(other, "", T0)
+        with pytest.raises(Cooldown, match="daily"):
+            store.request("yiko@bridge.example", "", T0)
+    rates.close()
