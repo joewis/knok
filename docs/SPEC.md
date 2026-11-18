@@ -109,8 +109,19 @@ private-network display name.
   the instant of receipt — so a key revoked this morning still validates yesterday's signature and
   refuses today's. A revoked, expired or superseded key is refused with that reason; a key absent
   from the registry is `unknown`, which is a different answer.
+
+  **`sentAt` is asserted by the sender, and that bounds what revocation can do.** A holder of a
+  revoked key can backdate `sentAt` past the revocation, set a future `expiresAt`, sign, and be
+  accepted; nothing in v1 compares `sentAt` against the receiver's clock, and the hub's five-minute
+  freshness bound (§7) is applied to the request, not to the envelope. Sent-time verification is
+  therefore protection for a message you already hold — an audit of what was valid when it was
+  received — not proof about a deposit made now. A receiver that needs the latter applies its own
+  freshness window before trusting `sentAt`, and a hub that offers one must say so in its
+  description rather than leave it to the spec.
 - **Publication:** the public key is registered with the hub, which pins it and serves it over TLS.
-  Peers verify the **hub's signature on the registry entry**. There is no trust-on-first-use: first
+  Peers verify the **hub's signature on the registry entry** — in Phase 3, when the registry is
+  published. Today a registry is handed over out of band and trusted because of the channel that
+  carried it, which is the same trust the dict asked for. There is no trust-on-first-use: first
   contact over an unauthenticated channel is exactly the moment a MITM strikes.
 - **Rotation:** a rotation record is signed by the old key **and** countersigned by the hub
   registry, carrying `notBefore`/`notAfter`; peers accept it only inside that window. A revoked key

@@ -426,3 +426,49 @@ def test_unknown_path_is_shared_403(ns):
     signed = signed_headers(ns.muse_id, "POST", "/v1/nope", b"{}")
     status, body, _ = raw_request(ns.url, "POST", "/v1/nope", signed, b"{}")
     assert (status, body) == (REFUSAL_STATUS, REFUSAL_BODY)
+
+
+def test_a_message_signed_before_a_revocation_is_still_accepted(ns):
+    """#23 at the hub: the deposit asks the sender's key what it meant at `sentAt`.
+
+    The card is verified as of the message's instant, not as of the deposit. A key revoked half an
+    hour ago signed a message an hour ago; refusing it here would make the hub disagree with every
+    bridge that verified the same message at the same instant.
+    """
+    from datetime import timedelta
+
+    from knok.registry import KeyRecord, Registry
+
+    from hub_helpers import iso, now_dt
+
+    moment = now_dt()
+    carl = ns.carl_id
+
+    def record(identity, revoked_at=None):
+        return KeyRecord(
+            agent_id=identity.agent_id,
+            key_type="ed25519",
+            public_key=identity.public_b64(),
+            fingerprint=identity.fingerprint,
+            not_before=moment - timedelta(days=1),
+            not_after=moment + timedelta(days=1),
+            revoked_at=revoked_at,
+        )
+
+    # Every registered agent needs a record: the recipient's card is checked too.
+    ns.hub.registry = Registry([
+        record(carl, revoked_at=moment - timedelta(minutes=30)),
+        record(ns.muse_id),
+        record(ns.mallory_id),
+    ])
+
+    before = build_envelope(carl, ns.muse_id.agent_id, context_id="c-before",
+                            sent_at=iso(moment - timedelta(hours=1)))
+    status, _body, _ = deposit(ns.url, before)
+    assert status == 202
+
+    after = build_envelope(carl, ns.muse_id.agent_id, context_id="c-after",
+                           sent_at=iso(moment - timedelta(minutes=10)))
+    status, body, _ = deposit(ns.url, after)
+    assert status == 403
+    assert body == REFUSAL_JSON
