@@ -202,9 +202,10 @@ What `messageId` reveals, stated honestly: nothing about the body, but it is **s
 link a message to its retransmissions and `RESEND`s. It is not a privacy field.
 
 Generation is therefore a MUST, not a convenience: **at least 128 bits from a CSPRNG, unique across
-every message of every sender**. Per-sender uniqueness is enough for a receiver's `seen` table, but the
-id also travels in unsigned hub frames, acks and dead-letter stores shared across senders, so global
-uniqueness costs nothing and removes the question. A sequential or timestamp-derived id is otherwise conformant and
+every message of every sender**. A sequential or timestamp-derived id is not conformant — it meets the
+"unique" half and fails the entropy half, and the two are not alternatives. Per-sender uniqueness is
+enough for a receiver's `seen` table, but the id also travels in unsigned hub frames, acks and
+dead-letter stores shared across senders, so global uniqueness costs nothing and removes the question. A sequential or timestamp-derived id is otherwise conformant and
 leaks volume and ordering, and the receiving queue's `seen` table is keyed on `messageId` alone — a
 sender that reuses one has its later message silently dropped as a duplicate.
 
@@ -214,17 +215,21 @@ therefore stores and forwards opaque blobs: it does not order, it does not hold 
 and `RESEND` runs bridge to bridge, not through the hub. A hub asked to order sealed traffic would
 have to read it.
 
-`RESEND` is therefore a **transport frame between bridges**, not a `Message`:
+`RESEND` is a **control `Message` in the ordinary envelope**, not a side channel. It carries a
+`resend` part naming the missing sequences in its own `contextId`:
 
 ```json
-{"kind": "resend", "contextId": "c-1", "from": "muse@bridge.example",
- "to": ["carl@bridge.example"], "missing": [7, 8], "sentAt": "2026-11-18T05:00:00Z"}
+{"kind": "message", "messageId": "m-2b71e0aa", "contextId": "c-1", "role": "agent",
+ "parts": [{"kind": "resend", "missing": [7, 8]}]}
 ```
 
-`contextId` is in clear *here* and only here: both ends of this frame are the two parties to the
-conversation and both already know it. It is never sent to the hub. The reply to a `RESEND` is the
-original envelope again, unchanged — same `messageId`, same signature — which is why dedupe must key
-on `messageId` rather than on receipt count.
+It is signed, sealed and routed exactly like any other message, because on a public hub the two
+bridges have no channel that bypasses the hub — §7 defines direct transport only for local and
+private deployments. `contextId` therefore stays inside the sealed body and the hub sees no more
+than it sees for any other message.
+
+The reply to a `RESEND` is the original envelope again, unchanged — same `messageId`, same
+signature — which is why dedupe must key on `messageId` rather than on receipt count.
 
 **The signature covers the whole envelope**, including `messageId` and `seq` — not the `sealed` field
 alone. If it covered only `sealed`, a hub could swap `messageId` for one already seen and the receiver
@@ -309,8 +314,8 @@ guarantee the missing message has expired by the time the gap is released. The r
 - **a late arrival after the release is delivered with a second, "late" notice — never dropped
   silently.** It is out of order, and the receiver says so;
 - a `seq` that never arrives leaves a permanent hole. After the gap notice the receiver treats that
-  `seq` as dead, which is not the same as "will arrive": a later `RESEND` for it is answered with
-  silence plus the same `dead` frame defined for poison messages.
+  `seq` as dead, which is not the same as "will arrive". A `RESEND` naming a dead `seq` is answered
+  with the `dead` frame defined for poison messages and no message body.
 
 Silent dropping was the defect: the previous wording let a receiver discard a live message because a
 timer had passed, and record it as a duplicate.
