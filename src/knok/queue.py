@@ -651,18 +651,21 @@ class Queue:
                     " VALUES (?, ?, ?, ?, ?)",
                     (context_id, sender, recipient, seq, _ts(moment)),
                 )
+            # The notice belongs inside this transaction, not after it: a crash between the
+            # release and a separate insert would leave the streams advanced and ``skipped``
+            # populated with nothing to tell the receiver that seqs were passed over.
+            self._queue_notice({
+                "kind": "gap",
+                "contextId": context_id,
+                "from": sender,
+                "to": recipient,
+                "missing": missing,
+                "releasedAt": _iso(moment),
+            }, moment)
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")
             raise
-        self._queue_notice({
-            "kind": "gap",
-            "contextId": context_id,
-            "from": sender,
-            "to": recipient,
-            "missing": missing,
-            "releasedAt": _iso(moment),
-        }, moment)
         return True
 
     def ack(self, message_id: str, now: datetime | None = None) -> bool:
