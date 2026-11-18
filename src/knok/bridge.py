@@ -239,7 +239,11 @@ class Bridge:
                 # Bounded and now exhausted: acknowledge it away so the mailbox can advance, and
                 # leave a record. Re-offering it a sixth time only starves everything behind it.
                 log.error("dropping an unhandleable item after %d attempts: %s", attempts, key)
-                self._record_drop(item, key)
+                if not self._record_drop(item, key):
+                    # The record is the only evidence this message ever existed. Without it the ack
+                    # would erase the message and leave nothing behind, so the drop waits instead.
+                    counts["unhandled"] += 1
+                    continue
                 del self._attempts[key]
                 counts["dropped"] += 1
                 handled.append(key)
@@ -308,7 +312,13 @@ class Bridge:
         self._record_notice(frame)
         return "notices", message_id if isinstance(message_id, str) else None
 
-    def _record_drop(self, item: Any, key: str) -> None:
+    def _record_drop(self, item: Any, key: str) -> bool:
+        """Write the drop record. False when it could not be written, so the caller does not ack.
+
+        A dropped message is gone from the hub on the strength of this line being on disk. If the
+        write fails, acking would destroy the only copy and leave no trace — the one outcome this
+        whole path exists to avoid — so the caller leaves the item unacked and tries again.
+        """
         path = self.state.directory / "dropped.jsonl"
         record = {"key": key, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   "item": item}
@@ -317,8 +327,10 @@ class Bridge:
                 handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            return True
         except OSError as exc:
-            log.error("could not record a dropped item %s: %s", key, exc)
+            log.error("could not record a dropped item %s; leaving it at the hub: %s", key, exc)
+            return False
 
     def _record_notice(self, frame: dict[str, Any]) -> None:
         """Keep notices where a human can see them; they are not messages and never enter a thread."""

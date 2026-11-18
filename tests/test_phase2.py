@@ -270,3 +270,57 @@ def test_reprovisioning_syncs_the_allow_list_for_a_new_agent(tmp_path):
     provision(tmp_path, hub_domain=DOMAIN, agents=["carl", "muse", "bobby"])
     allow = json.loads(carl_policy.read_text())["allow"]
     assert f"bobby@{DOMAIN}" in allow, "a new agent must be admitted without hand-editing policies"
+
+
+def test_a_drop_whose_record_cannot_be_written_is_not_acked(deployment, monkeypatch):
+    """The record is the only evidence the message existed; without it, do not erase the original."""
+    from knok.bridge import MAX_HANDLE_ATTEMPTS
+    from knok.hubclient import HubClient
+    from knok.provision import load_key
+
+    hub, bridges, root = deployment
+    muse = bridges["muse"]
+    bobby_identity = load_key(f"bobby@{DOMAIN}", root / "agents" / "bobby" / "identity.key")
+
+    moment = now()
+    unsigned = {
+        "envelopeVersion": 1,
+        "seq": 0,
+        "message": {
+            "kind": "message",
+            "messageId": "m-unrecordable",
+            "contextId": "c-blind-2",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "drop me if you can"}],
+        },
+        "from": bobby_identity.agent_id,
+        "to": [muse.identity.agent_id],
+        "sentAt": iso(moment - timedelta(seconds=1)),
+        "expiresAt": iso(moment + timedelta(hours=1)),
+        "turn": {"expectsReply": False, "closesThread": False},
+    }
+    HubClient(hub.url, bobby_identity).deposit(sign(unsigned, bobby_identity))
+
+    saved = muse.state.registry.pop(bobby_identity.agent_id)
+
+    def refuse(path, *args, **kwargs):
+        raise OSError("disk is read-only")
+
+    try:
+        for _ in range(MAX_HANDLE_ATTEMPTS - 1):
+            counts = muse.poll_once()
+            assert counts["queued"] == 0
+        assert muse.client.fetch()["messages"], "four failures must not clear the mailbox"
+
+        monkeypatch.setattr("builtins.open", refuse, raising=False)
+        counts = muse.poll_once()
+        monkeypatch.undo()
+        assert counts["dropped"] == 0
+        assert muse.client.fetch()["messages"], "a failed record must not clear the mailbox"
+
+        # With the disk back, the next poll records the drop and clears it.
+        counts = muse.poll_once()
+        assert counts["dropped"] == 1
+        assert muse.client.fetch()["messages"] == []
+    finally:
+        muse.state.registry[bobby_identity.agent_id] = saved
