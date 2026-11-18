@@ -22,7 +22,7 @@ Phase 0 in the roadmap, and it is the only part running in production.
 
 ## Reading order
 
-1. [docs/SPEC.md](docs/SPEC.md) — the design.
+1. [docs/SPEC.md](docs/SPEC.md) — the design (v0.2).
 2. [CONTRIBUTING.md](CONTRIBUTING.md) — how the two authors work on it.
 
 ## Non-goals
