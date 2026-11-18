@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .canonical import CanonicalisationError, canonical_bytes
 from .identity import Identity, b64url, b64url_decode, fingerprint, public_key_from_b64, verify_signature
+from .registry import Registry
 
 
 class CardError(ValueError):
@@ -50,11 +51,16 @@ def _card_time(card: dict, key: str) -> datetime | None:
 
 def verify_card(
     jws: Any,
-    registry: dict[str, str],
+    registry: "dict[str, str] | Registry",
     expected_agent_id: str | None = None,
     now: datetime | None = None,
 ) -> tuple[bool, str]:
-    """Verify a card JWS against ``registry`` (fingerprint -> public key b64). Never raises."""
+    """Verify a card JWS against ``registry``. Never raises.
+
+    ``registry`` is either a :class:`knok.registry.Registry` — which answers for an instant, so a
+    revoked, expired or superseded key is refused — or the legacy ``{fingerprint: public_key}``
+    dict, which means every key is valid forever (decision 0002).
+    """
     if not isinstance(jws, dict):
         return False, "card must be an object"
     for field in ("protected", "payload", "signature"):
@@ -69,9 +75,20 @@ def verify_card(
         return False, "card alg must be EdDSA"
 
     kid = header.get("kid")
-    registered = registry.get(kid or "")
-    if not registered:
-        return False, "card key is not in the registry"
+    if isinstance(registry, Registry):
+        record = registry.get(kid or "")
+        if record is None:
+            return False, "card key is not in the registry"
+        state = record.status(now or datetime.now(timezone.utc))
+        if state != "valid":
+            # The key exists and is refused for a stated reason — revoked, expired, superseded,
+            # or not yet valid. "Not in the registry" would be a different, wrong answer.
+            return False, f"card key is {state}"
+        registered = record.public_key
+    else:
+        registered = registry.get(kid or "")
+        if not registered:
+            return False, "card key is not in the registry"
     try:
         public_key: Ed25519PublicKey = public_key_from_b64(registered)
     except Exception:

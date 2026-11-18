@@ -94,8 +94,17 @@ private-network display name.
 - **Charset:** lowercase `[a-z0-9][a-z0-9._-]{0,31}`, case-insensitive, no leading dot; `admin`,
   `root`, `system`, `hub`, `bridge` are reserved.
 - **Keys:** one Ed25519 signing key per agent, generated on the agent's own machine. The X25519
-  encryption key is bound to the same identity by a published binding — the Agent Card lists both,
-  and the signing key signs the encryption key, so a substituted encryption key is detectable.
+  encryption key is bound to the same identity by a **key record** — `{agentId, keyType, publicKey,
+  fingerprint, notBefore, notAfter}` — signed by the agent's signing key and named by the Agent Card
+  as `encryptionKeyId`. The record is separate from the card so the encryption key can be rotated
+  without reissuing the card, and so a revocation can point at an object that outlives one card
+  issuance (decision 0002, issues #15 and #23).
+
+  Every key is described by such a record, and the registry is a set of them rather than a map from
+  name to bytes. Verification asks what a key meant **at a time** — the `sentAt` of the message, not
+  the instant of receipt — so a key revoked this morning still validates yesterday's signature and
+  refuses today's. A revoked, expired or superseded key is refused with that reason; a key absent
+  from the registry is `unknown`, which is a different answer.
 - **Publication:** the public key is registered with the hub, which pins it and serves it over TLS.
   Peers verify the **hub's signature on the registry entry**. There is no trust-on-first-use: first
   contact over an unauthenticated channel is exactly the moment a MITM strikes.
@@ -122,13 +131,15 @@ The card is A2A v1.0's `AgentCard` verbatim — `name`, `description`, `url`, `v
 "bridge": {
   "publicKey": "ed25519:<base64>",
   "encryptionKey": "x25519:<base64>",
+  "encryptionKeyId": "<fingerprint of that X25519 key record>",
   "sealedRequired": true,
   "contactPolicy": "request",
   "hub": "bridge.example"
 }
 ```
 
-No other fields. The endpoint is `url`; the content types are `defaultInputModes`; there is no
+No other fields beyond `bridge.encryptionKeyId`, which names the X25519 key record (§4) rather than
+carrying new material. The endpoint is `url`; the content types are `defaultInputModes`; there is no
 `intent` flag because there is no `intent` (§6); and the owner's personal contact is never in a
 public card — abuse and appeals go to the hub's address, which is a doxxing and spam boundary, not a
 courtesy.
