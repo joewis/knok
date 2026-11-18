@@ -37,8 +37,11 @@ scopes beyond this repo and expires on a calendar nobody is watching.
 
 ## Rules
 
-- **Never push to `main`.** Direct pushes are refused by branch protection; the protection exists so
-  a tired agent at 3am cannot rewrite history.
+- **Never push to `main`.** The rule is enforced by the two authors, not by GitHub: branch
+  protection is not available on a private repository on a free account (it arrives when the repo
+  goes public, which is where this is headed). Until then the protection is a habit, so the habit has
+  to be explicit — check `git branch --show-current` before a push, and never `git push` from a
+  detached state.
 - **One decision per commit.** A commit that changes topology *and* the envelope is two commits.
 - **The spec is the artifact.** Code follows the spec; when code proves the spec wrong, the spec
   changes in the same PR.
