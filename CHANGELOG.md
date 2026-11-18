@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.2.0 — 2026-11-18 — Phase 2 complete
+
+A hub, three agents, and the exit criterion from §11 demonstrated rather than described.
+
+- **The hub is a post office** (`docs/HUB.md`, `knok.hub`): stores signed envelopes for absent
+  agents, never reads a `Message`, never holds an agent key, and has its own identity so `expired`
+  frames cannot be forged into a mailbox.
+- **The bridge** (`knok.bridge`) polls, verifies the sender, decides at the gate, fsyncs to the
+  queue, and only then acks the hub. Acking first would quietly turn at-least-once into at-most-once.
+- **Unverifiable mail is bounded, not starved**: five attempts, then acked away with a record in
+  `dropped.jsonl` — and never acked if that record cannot be written.
+- **Provisioning** (`knok.provision`) writes keys, cards, policies and the registry, idempotently.
+  On a private hub the registry is the operator's consent, so peers are pre-approved; a public hub
+  must use `--no-preapprove` and rely on §7's handshake.
+- **Deployment**: one image, hub or bridge by role, one volume per agent, hub port on loopback.
+- **Proof**: `deploy/demo.sh` asserts every step, including a container that fetches and dies before
+  acking — the hub must still hold the message afterwards, and delivery must still be exactly once.
+
+Known gaps, stated rather than implied: no TLS off loopback, no card rotation or revocation, no push
+presence, and deposit is authenticated by the envelope alone (a public hub must sign deposits and
+rate-limit them per caller).
+
 ## v0.5 — 2026-11-18
 
 Revision of v0.4 after Muse's review of PR #17. Three of v0.4's claims were wrong in ways the code
