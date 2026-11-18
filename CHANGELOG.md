@@ -1,5 +1,19 @@
 # Changelog
 
+## Slice 2 — durable queue (issue #7, unreleased)
+
+`knok.queue.Queue`: SQLite (WAL, `synchronous=FULL`), one connection under
+one lock, advisory `flock` so a single process owns the queue. `put` is
+durable on return; dedupe on `messageId` survives restart via a `seen`
+table; per-(contextId, sender→recipient) `seq` ordering with gap hold,
+`resend` reporting and TTL release with a gap notice; dead-letter after
+five attempts with backoff 1m/5m/30m/2h/12h; `expire(now)` emits the §6
+unsigned `{"kind": "expired", ...}` frame. Restart replays unacked
+messages, never re-delivers acked ones. Sealed (form 2) envelopes are
+refused: their `messageId` is inside the sealed body, so the queue cannot
+dedupe or order them yet. 17 new tests, including subprocess kill/restart
+tests that `os._exit(1)` before ack.
+
 ## v0.3 — 2026-11-18
 
 Second review by Muse (job `a3215433`), this time of Carl's *application* of the first review. Its
