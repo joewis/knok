@@ -45,10 +45,11 @@ make that promise survive a crash:
 
 What this deliberately does **not** do: verify envelope signatures (the
 envelope layer does that before ``put`` — the queue stores what it is
-given); accept sealed (form 2) envelopes — their ``messageId`` is inside
-the sealed body, so the queue cannot dedupe or order them yet, and it
-refuses them loudly instead of guessing; deliver to the agent (delivery
-is the bridge's job — ``get`` hands the bridge the next envelope).
+given); accept sealed (form 2) envelopes — their ``messageId`` is in clear,
+but their ``contextId`` is inside ``sealed``, so the queue cannot compute
+the stream key or order them before decryption, and it refuses them loudly
+instead of guessing; deliver to the agent (delivery is the bridge's job —
+``get`` hands the bridge the next envelope).
 """
 
 from __future__ import annotations
@@ -301,16 +302,18 @@ class Queue:
         acked, expired or dead — is accepted and dropped, never delivered
         twice. A ``seq`` below the last delivered for its stream is dropped
         the same way. Raises ``ValueError`` on a malformed or already
-        expired envelope, on a sealed (form 2) envelope, whose
-        ``messageId`` the queue cannot see, on an envelope not addressed
-        to this queue's owner, and on a multi-recipient envelope — the hub
-        does fan-out, this queue does not.
+        expired envelope, on a sealed (form 2) envelope, whose ``contextId``
+        is inside ``sealed`` so the stream key cannot be computed before
+        decryption, on an envelope not addressed to this queue's owner, and
+        on a multi-recipient envelope — the hub does fan-out, this queue
+        does not.
         """
         moment = now or datetime.now(timezone.utc)
         if not isinstance(env, dict) or "message" not in env:
             raise ValueError(
                 "queue accepts form 1 envelopes only: a sealed (form 2) envelope"
-                " carries no messageId in clear, so it cannot be deduped or ordered"
+                " carries its contextId inside sealed, so it cannot be ordered"
+                " before decryption"
             )
         reason = _envelope.validate(env, moment)
         if reason:
