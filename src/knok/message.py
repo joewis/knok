@@ -1,12 +1,15 @@
 """Strict validation of an A2A v1.0 ``Message`` (spec §6, Form 1).
 
 The ``Message`` itself is never modified by the bridge: no top-level
-``signature`` field, no invented fields. This validator enforces exactly the
-shape slice 0 exchanges — ``kind``, ``messageId``, ``contextId``, ``role``,
-``parts`` of ``{kind: "text", text: ...}`` — plus the optional A2A-defined
-``taskId`` (present only when a ``Task`` exists). Anything else is rejected,
-so a Knok-specific extension smuggled into the ``Message`` fails loudly
-instead of being silently tolerated.
+``signature`` field, no invented fields. This validator enforces the A2A v1.0
+``Message`` shape — ``kind``, ``messageId``, ``contextId``, ``role``,
+``parts`` of ``{kind: "text", text: ...}`` — plus every other field A2A
+defines on ``Message`` and ``Part`` (``metadata``, ``extensions``,
+``referenceTaskIds`` on the ``Message``; ``metadata``, ``filename``,
+``mediaType`` on a ``Part``). The rule is "no field that A2A does not
+define": a real, unmodified A2A agent that sends ``metadata`` must pass,
+while a Knok-specific extension smuggled into the ``Message`` (e.g. a
+``signature``) fails loudly instead of being silently tolerated.
 
 This module is stdlib-only on purpose: the conformance client in
 ``tests/conformance/a2a_client.py`` carries its own copy of the same rules so
@@ -21,10 +24,16 @@ from typing import Any
 
 __all__ = ["MessageValidationError", "validate_message"]
 
-#: The only keys a slice-0 ``Message`` may carry. ``taskId`` is A2A-defined
-#: and admitted only because §6 requires it when a ``Task`` exists.
-_MESSAGE_KEYS = frozenset({"kind", "messageId", "contextId", "role", "parts", "taskId"})
-_PART_KEYS = frozenset({"kind", "text"})
+#: Every key A2A v1.0 defines on ``Message``. ``taskId`` is present only
+#: when a ``Task`` exists; ``metadata`` is an object, ``extensions`` an array
+#: of URIs, ``referenceTaskIds`` an array of strings.
+_MESSAGE_KEYS = frozenset(
+    {"kind", "messageId", "contextId", "role", "parts", "taskId",
+     "metadata", "extensions", "referenceTaskIds"}
+)
+#: Every key A2A v1.0 defines on a ``Part`` (TextPart and friends).
+#: ``metadata`` is an object, ``filename`` and ``mediaType`` are strings.
+_PART_KEYS = frozenset({"kind", "text", "metadata", "filename", "mediaType"})
 _ROLES = frozenset({"user", "agent"})
 
 
@@ -33,11 +42,13 @@ class MessageValidationError(ValueError):
 
 
 def validate_message(obj: Any) -> dict:
-    """Validate ``obj`` as a strict A2A v1.0 ``Message`` and return a copy.
+    """Validate ``obj`` as an A2A v1.0 ``Message`` and return a copy.
 
-    Raises ``MessageValidationError`` on the first violation. The returned
-    dict is a deep copy of the input, so callers can never mutate the
-    received object through it.
+    The rule is "no field that A2A does not define": every A2A-defined field
+    is accepted (with its A2A type), anything else raises
+    ``MessageValidationError`` on the first violation. The returned dict is
+    a deep copy of the input, so callers can never mutate the received
+    object through it.
     """
     if not isinstance(obj, dict):
         raise MessageValidationError(f"Message must be a JSON object, got {type(obj).__name__}")
@@ -57,6 +68,19 @@ def validate_message(obj: Any) -> dict:
     if obj.get("role") not in _ROLES:
         raise MessageValidationError(f"Message role must be 'user' or 'agent', got {obj.get('role')!r}")
 
+    if "metadata" in obj and not isinstance(obj["metadata"], dict):
+        raise MessageValidationError("Message metadata must be an object")
+    if "extensions" in obj and (
+        not isinstance(obj["extensions"], list)
+        or not all(isinstance(e, str) for e in obj["extensions"])
+    ):
+        raise MessageValidationError("Message extensions must be an array of strings")
+    if "referenceTaskIds" in obj and (
+        not isinstance(obj["referenceTaskIds"], list)
+        or not all(isinstance(t, str) for t in obj["referenceTaskIds"])
+    ):
+        raise MessageValidationError("Message referenceTaskIds must be an array of strings")
+
     parts = obj.get("parts")
     if not isinstance(parts, list) or not parts:
         raise MessageValidationError("Message parts must be a non-empty list")
@@ -74,5 +98,10 @@ def validate_message(obj: Any) -> dict:
             )
         if not isinstance(part.get("text"), str):
             raise MessageValidationError(f"parts[{i}].text must be a string")
+        if "metadata" in part and not isinstance(part["metadata"], dict):
+            raise MessageValidationError(f"parts[{i}].metadata must be an object")
+        for field in ("filename", "mediaType"):
+            if field in part and not isinstance(part[field], str):
+                raise MessageValidationError(f"parts[{i}].{field} must be a string")
 
     return copy.deepcopy(obj)

@@ -47,7 +47,8 @@ bridge on an ephemeral port and stops it afterwards.
 * **No policy or handshake.** That is slice 3.
 * **Text parts only.** The strict parser rejects non-text parts; other
   part kinds are admitted when a slice needs them.
-* The validator admits only the five fields the acceptance names plus the
-  optional A2A-defined `taskId`. A2A-legal extras such as `metadata` are
-  rejected for now and admitted when a slice needs them — strictness is
-  the point of this harness.
+* The validator admits every field A2A v1.0 defines on `Message` and
+  `Part` (`metadata`, `extensions`, `referenceTaskIds`, `filename`,
+  `mediaType`, plus `taskId`) — the rule is "no field A2A does not
+  define", so a real A2A agent sending `metadata` passes, while a
+  `signature` or any invented field is still rejected.

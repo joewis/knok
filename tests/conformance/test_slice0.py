@@ -109,6 +109,38 @@ def test_strict_parser_rejects_a_signature_inside_the_message():
         validate_message(tampered)
 
 
+def test_parser_accepts_a2a_defined_optional_fields():
+    """1a: every field A2A v1.0 defines is accepted — a real A2A agent that
+    sends ``metadata`` must pass the harness."""
+    message = _make_message()
+    message["metadata"] = {"traceId": "t-1", "priority": 2}
+    message["extensions"] = ["https://example.com/ext/v1"]
+    message["referenceTaskIds"] = ["task-7"]
+    message["parts"] = [
+        {
+            "kind": "text",
+            "text": "Can you review §4?",
+            "metadata": {"lang": "en"},
+            "filename": "note.txt",
+            "mediaType": "text/plain",
+        }
+    ]
+    assert validate_message(message) == message
+
+
+def test_parser_accepts_metadata_and_extensions_but_still_rejects_signature():
+    """1a: ``metadata``/``extensions`` pass, a ``signature`` in the same
+    message is still a hard error — the rule is "no field A2A does not
+    define", not "only these five fields"."""
+    message = _make_message()
+    message["metadata"] = {"traceId": "t-1"}
+    message["extensions"] = ["https://example.com/ext/v1"]
+    assert validate_message(message) == message
+    message["signature"] = "ed25519:fake"
+    with pytest.raises(MessageValidationError, match="non-A2A fields"):
+        validate_message(message)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -119,6 +151,11 @@ def test_strict_parser_rejects_a_signature_inside_the_message():
         lambda m: m.update(parts=[{"kind": "file", "uri": "file:///etc/passwd"}]),
         lambda m: m.update(parts=[]),
         lambda m: m.update(extraField="knok-extension"),
+        # A2A-defined fields with the wrong A2A type are still rejected.
+        lambda m: m.update(metadata="not-an-object"),
+        lambda m: m.update(extensions=[42]),
+        lambda m: m.update(referenceTaskIds="task-7"),
+        lambda m: m.update(parts=[{"kind": "text", "text": "x", "filename": 7}]),
     ],
 )
 def test_strict_parser_rejects_non_a2a_shapes(mutate):
@@ -151,6 +188,17 @@ def test_client_and_library_validators_agree():
 
     valid = _make_message()
     assert lib_validate(valid) == validate_message(valid)
+
+    # The A2A-defined optional fields must agree too, in both copies.
+    rich = _make_message()
+    rich["metadata"] = {"traceId": "t-1"}
+    rich["extensions"] = ["https://example.com/ext/v1"]
+    rich["referenceTaskIds"] = ["task-7"]
+    rich["parts"] = [
+        {"kind": "text", "text": "x", "metadata": {"lang": "en"},
+         "filename": "note.txt", "mediaType": "text/plain"}
+    ]
+    assert lib_validate(rich) == validate_message(rich) == rich
 
     invalid = _make_message()
     invalid["signature"] = "ed25519:fake"

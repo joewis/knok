@@ -6,12 +6,14 @@ contains no bridge-specific code at all. The transport framing it adds around
 the ``Message`` (the Form 1 envelope of spec section 6) is plain dict
 construction, not a library call.
 
-The parser is strict on purpose. It accepts exactly the A2A shape the
-harness exchanges — ``kind``, ``messageId``, ``contextId``, ``role``, ``parts``
-of ``{kind: "text", text: ...}``, plus the optional A2A-defined ``taskId`` —
-and rejects any other field, including a top-level ``signature`` inside the
-``Message``. If a bridge-specific extension were ever required to parse a
-message, this parser would fail loudly instead of silently accepting it.
+The parser is strict on purpose. It accepts every field A2A v1.0 defines on
+a ``Message`` — ``kind``, ``messageId``, ``contextId``, ``role``, ``parts``
+of ``{kind: "text", text: ...}``, plus ``taskId``, ``metadata``,
+``extensions`` and ``referenceTaskIds``, and on a ``Part`` ``metadata``,
+``filename`` and ``mediaType`` — and rejects any other field, including a
+top-level ``signature`` inside the ``Message``. If a bridge-specific
+extension were ever required to parse a message, this parser would fail
+loudly instead of silently accepting it.
 
 The same validation rules live in the bridge library so the server can check
 inbound messages; the harness tests assert the two copies agree. Keeping a
@@ -32,8 +34,11 @@ from typing import Any
 
 __all__ = ["MessageValidationError", "build_envelope", "send_message", "validate_message"]
 
-_MESSAGE_KEYS = frozenset({"kind", "messageId", "contextId", "role", "parts", "taskId"})
-_PART_KEYS = frozenset({"kind", "text"})
+_MESSAGE_KEYS = frozenset(
+    {"kind", "messageId", "contextId", "role", "parts", "taskId",
+     "metadata", "extensions", "referenceTaskIds"}
+)
+_PART_KEYS = frozenset({"kind", "text", "metadata", "filename", "mediaType"})
 _ROLES = frozenset({"user", "agent"})
 
 
@@ -42,9 +47,11 @@ class MessageValidationError(ValueError):
 
 
 def validate_message(obj: Any) -> dict:
-    """Validate ``obj`` as a strict A2A v1.0 ``Message`` and return a copy.
+    """Validate ``obj`` as an A2A v1.0 ``Message`` and return a copy.
 
-    Raises ``MessageValidationError`` on the first violation.
+    The rule is "no field that A2A does not define": every A2A-defined field
+    is accepted (with its A2A type), anything else raises
+    ``MessageValidationError`` on the first violation.
     """
     if not isinstance(obj, dict):
         raise MessageValidationError(f"Message must be a JSON object, got {type(obj).__name__}")
@@ -64,6 +71,19 @@ def validate_message(obj: Any) -> dict:
     if obj.get("role") not in _ROLES:
         raise MessageValidationError(f"Message role must be 'user' or 'agent', got {obj.get('role')!r}")
 
+    if "metadata" in obj and not isinstance(obj["metadata"], dict):
+        raise MessageValidationError("Message metadata must be an object")
+    if "extensions" in obj and (
+        not isinstance(obj["extensions"], list)
+        or not all(isinstance(e, str) for e in obj["extensions"])
+    ):
+        raise MessageValidationError("Message extensions must be an array of strings")
+    if "referenceTaskIds" in obj and (
+        not isinstance(obj["referenceTaskIds"], list)
+        or not all(isinstance(t, str) for t in obj["referenceTaskIds"])
+    ):
+        raise MessageValidationError("Message referenceTaskIds must be an array of strings")
+
     parts = obj.get("parts")
     if not isinstance(parts, list) or not parts:
         raise MessageValidationError("Message parts must be a non-empty list")
@@ -81,6 +101,11 @@ def validate_message(obj: Any) -> dict:
             )
         if not isinstance(part.get("text"), str):
             raise MessageValidationError(f"parts[{i}].text must be a string")
+        if "metadata" in part and not isinstance(part["metadata"], dict):
+            raise MessageValidationError(f"parts[{i}].metadata must be an object")
+        for field in ("filename", "mediaType"):
+            if field in part and not isinstance(part[field], str):
+                raise MessageValidationError(f"parts[{i}].{field} must be a string")
 
     return copy.deepcopy(obj)
 
