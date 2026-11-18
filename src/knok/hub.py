@@ -648,7 +648,7 @@ class Hub:
         except (CanonicalisationError, Exception):
             return None
         # HUB.md specifies the header value as bare base64url; the library verifier wants the
-        # ``ed25519:`` form. An independent client following the contract must not be refused for
+        # ``ed25519:`` prefix. An independent client following the contract must not be refused for
         # omitting a prefix the contract never asked for, so accept both here.
         if not signature.startswith("ed25519:"):
             signature = "ed25519:" + signature

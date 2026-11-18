@@ -181,6 +181,7 @@ to the restarted B with no duplicate reaching the application.
    every request in it. The pruning rule and the storage bound need a number before Phase 3.
 3. **What the 10-agent ceiling really is.** The claim above is an estimate, not a measurement — the
    poll loop should be benchmarked before the number is treated as a limit.
+
 4. **Deposit is authenticated by the envelope alone.** That is deliberate on a private hub: the
    envelope signature is checked against the registry before anything is stored, and a replay is
    deduped by `(recipient, sender, messageId)`. What it does not give is a nonce and a skew bound on
