@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2.1 — 2026-11-18 — the issue sweep
+
+Seven open issues, closed against code rather than discussion. Every one of them was a place where
+the system answered a simpler question than the one being asked.
+
+- **Late arrivals are delivered, not dropped (#19).** A gap release used to destroy a message that
+  arrived afterwards: the seq had been skipped, so `put` called it a duplicate and returned. The
+  release now records the seqs it skipped, so an arrival for one is *late* — stored, delivered out
+  of order, preceded by a `late` notice — while a re-send of a delivered seq is still a duplicate.
+- **Dead letters tell the sender (#19).** The §6 `dead` frame is emitted once, through a notices
+  table with a `pending -> taken -> delivered` lifecycle. The bridge confirms only after the frame
+  is fsynced, so a crash or a failed write re-offers it instead of losing it; gap notices go through
+  the same path and commit inside the release transaction.
+- **The seen table is bounded (#13).** Pruned at the 30-day expiry bound, keeping rows whose message
+  is still live. Delivered notices and `skipped` rows go with it — the same growth class, one table
+  over.
+- **Form 2 (sealed) works (#20).** `messageId` stays in clear so dedupe and ack still work; the
+  signature covers the whole envelope, so swapping `messageId` or `sealed.hpke.ciphertext` fails
+  verification. A 2MB ciphertext is refused on size before canonicalisation.
+- **Refusal costs what acceptance costs (#24).** An unknown sender path performs the same two
+  Ed25519 verifications a known sender does, against a throwaway key. §9 now also says what the
+  requirement cannot promise: the string can be identical, the clock cannot.
+- **The health endpoint is liveness only (#25).** `{"status":"ok"}`, before and after mail.
+- **Keys are records with a history (#15, #23).** `KeyRecord` (agentId, keyType, publicKey,
+  fingerprint, validity window, revocation, supersession) replaces the dict of bytes as the model;
+  `Registry.status(fingerprint, at)` answers valid, not-yet-valid, expired, revoked, superseded or
+  unknown. Both live paths — `Bridge.deliver` and `Hub.deposit` — ask at the envelope's own
+  `sentAt`, so a key revoked this morning still validates yesterday's signature. The X25519 key is a
+  record of its own named by `bridge.encryptionKeyId`, so it rotates without reissuing the card.
+
+Known gaps, unchanged in kind but now written where they bite: records are not signed objects until
+the hub publishes a registry; `sentAt` is the sender's own claim, so revocation cannot bind a holder
+that backdates it; no registry is distributed over the wire; and no TLS off loopback. 225 tests, and
+the Phase 2 demo still passes from the merged tree.
+
 ## v0.2.0 — 2026-11-18 — Phase 2 complete
 
 A hub, three agents, and the exit criterion from §11 demonstrated rather than described.
