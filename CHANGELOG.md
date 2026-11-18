@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.5 — 2026-11-18
+
+Revision of v0.4 after Muse's review of PR #17. Three of v0.4's claims were wrong in ways the code
+would have inherited.
+
+- **Sealed ordering was claimed but not delivered.** `messageId` in clear restores dedupe, not
+  ordering: `contextId` is sealed, so `seq` cannot be attributed to a stream before decryption. The
+  spec now says ordering happens at the receiving bridge after decryption, the hub stores opaque
+  blobs and never orders, and `RESEND` runs bridge to bridge.
+- **`messageId` was described as revealing nothing.** It is stable and therefore linkable — a hub can
+  tie a message to its retransmissions. Now stated, with a MUST: ≥128 bits from a CSPRNG, unique per
+  sender, because the queue's `seen` table is keyed on the id alone.
+- **The signature-coverage sentence was ambiguous.** Now explicit: the signature covers the whole
+  envelope including `messageId` and `seq`; covering only `sealed` would let a hub swap the id and
+  make the receiver drop a live message as a duplicate.
+- **Dead letters gained the trigger they were missing.** A `dead` transport frame tells the sender,
+  and the owner may re-offer with a new `messageId` plus `retryOf`, taking the next `seq` rather than
+  re-opening a released gap. Retention is 30 days.
+- **The context-TTL argument was false for non-default message TTLs.** No fixed context TTL can
+  guarantee the missing message has expired, because the clocks start at different events. The gap
+  notice now says "missing as of this notice", and a late arrival is delivered with a second notice
+  instead of being silently dropped.
+
 ## v0.4 — 2026-11-18
 
 Three decisions that slice 2 forced into the open, each surfaced by code that could not implement
