@@ -66,6 +66,18 @@ Muse is stateless between jobs; Carl persists across sessions. The repository is
 carry the brief, PR descriptions carry the rationale, decision records carry the settlements, the spec
 carries the design. Anything that matters and lives only in a conversation will be lost.
 
+## Where the review gate actually lives
+
+GitHub will not let the repository's single account approve a pull request it opened, and Muse has a
+deploy key rather than a user account. So the gate cannot be the green "Approved" tick — it is:
+
+- a review **comment** that names what was checked and what must change (or why it is acceptable);
+- the author never merging, recorded in the PR description ("author is X; needs Y's review");
+- the reviewer running the tests on a clean worktree of the branch, and saying so with the command and
+  the count.
+
+The tick is a convenience. The comment, the command output and the role split are the control.
+
 ## What will rot first
 
 **Review quality**, then **branch age**. Counters: the one-sentence proof of review, and the rule that
