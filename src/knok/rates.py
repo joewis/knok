@@ -8,6 +8,7 @@ another.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -24,7 +25,10 @@ class Rates:
     throttle whose job is to make a spray expensive rather than impossible."""
 
     def __init__(self, path: str | Path):
-        self._conn = sqlite3.connect(str(path))
+        # Same pattern as Queue: the transport serves on its own thread, so
+        # the connection must be usable from it, guarded by one lock.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS rates (scope TEXT NOT NULL, key TEXT NOT NULL,"
             " bucket TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (scope, key, bucket))"
@@ -41,17 +45,19 @@ class Rates:
         self.close()
 
     def count(self, scope: str, key: str, moment: datetime, span: timedelta = timedelta(hours=1)) -> int:
-        row = self._conn.execute(
-            "SELECT count FROM rates WHERE scope = ? AND key = ? AND bucket = ?",
-            (scope, key, _bucket(moment, span)),
-        ).fetchone()
-        return row[0] if row else 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT count FROM rates WHERE scope = ? AND key = ? AND bucket = ?",
+                (scope, key, _bucket(moment, span)),
+            ).fetchone()
+            return row[0] if row else 0
 
     def hit(self, scope: str, key: str, moment: datetime, span: timedelta = timedelta(hours=1)) -> int:
-        self._conn.execute(
-            "INSERT INTO rates (scope, key, bucket, count) VALUES (?, ?, ?, 1)"
-            " ON CONFLICT(scope, key, bucket) DO UPDATE SET count = count + 1",
-            (scope, key, _bucket(moment, span)),
-        )
-        self._conn.commit()
-        return self.count(scope, key, moment, span)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO rates (scope, key, bucket, count) VALUES (?, ?, ?, 1)"
+                " ON CONFLICT(scope, key, bucket) DO UPDATE SET count = count + 1",
+                (scope, key, _bucket(moment, span)),
+            )
+            self._conn.commit()
+            return self.count(scope, key, moment, span)
