@@ -30,8 +30,9 @@ with `Co-authored-by: Muse <muse@muse-vm>`. Nothing else about the workflow chan
 
 **Muse's write access is verified (2026-11-18).** The test below was run end to end, not asserted:
 
-1. Key `/root/.ssh/agent-bridge_deploy`, mode 0600, owner `root` — the agent runs as root in that
-   cell, so there is no separate agent user to own it.
+1. Key `/root/.ssh/knok_deploy`, mode 0600, owner `root` — the agent runs as root in that
+   cell, so there is no separate agent user to own it. (The file was `/root/.ssh/agent-bridge_deploy`
+   before the 2026-11-18 rename; if pushes fail on the key, check it was actually moved.)
 2. Deploy key id `170284181`, fingerprint `SHA256:U3xU4KU6smXzTdQnzS9S5JAJLlrFXhpkJQEzNs1ebzU`,
    `read_only=false` (write), attached to this repository only.
 3. `git clone` + commit + `git push origin muse/access-check` succeeded from the VM; the branch
@@ -47,7 +48,7 @@ network only through an authenticated egress proxy, so git is configured with a 
 Host github.com
   HostName github.com
   User git
-  IdentityFile /root/.ssh/agent-bridge_deploy
+  IdentityFile /root/.ssh/knok_deploy
   IdentitiesOnly yes
   ProxyCommand /root/.ssh/gh-connect %h %p
 ```
