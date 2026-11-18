@@ -205,15 +205,16 @@ Generation is therefore a MUST, not a convenience: **at least 128 bits from a CS
 every message of every sender**. A sequential or timestamp-derived id is not conformant — it meets the
 "unique" half and fails the entropy half, and the two are not alternatives. Per-sender uniqueness is
 enough for a receiver's `seen` table, but the id also travels in unsigned hub frames, acks and
-dead-letter stores shared across senders, so global uniqueness costs nothing and removes the question. A sequential or timestamp-derived id is otherwise conformant and
-leaks volume and ordering, and the receiving queue's `seen` table is keyed on `messageId` alone — a
-sender that reuses one has its later message silently dropped as a duplicate.
+dead-letter stores shared across senders, so global uniqueness costs nothing and removes the question.
+
+The receiving queue's `seen` table is keyed on `messageId` alone, so a sender that reuses one has its
+later message silently dropped as a duplicate.
 
 **Ordering sealed traffic happens after decryption, at the receiving bridge.** `contextId` is inside
 the sealed body, so nothing before decryption can say which stream a `seq` belongs to. The hub
-therefore stores and forwards opaque blobs: it does not order, it does not hold messages behind a gap,
-and `RESEND` runs bridge to bridge, not through the hub. A hub asked to order sealed traffic would
-have to read it.
+therefore stores and forwards opaque blobs: it does not order and it does not hold messages behind a
+gap. `RESEND` is an ordinary message (below), so it travels the same path as everything else. A hub
+asked to order sealed traffic would have to read it.
 
 `RESEND` is a **control `Message` in the ordinary envelope**, not a side channel. It carries a
 `resend` part naming the missing sequences in its own `contextId`:
@@ -228,8 +229,10 @@ bridges have no channel that bypasses the hub — §7 defines direct transport o
 private deployments. `contextId` therefore stays inside the sealed body and the hub sees no more
 than it sees for any other message.
 
-The reply to a `RESEND` is the original envelope again, unchanged — same `messageId`, same
-signature — which is why dedupe must key on `messageId` rather than on receipt count.
+**Only a party to the context may send a `RESEND`** — practically enforced by the sealing key, and by
+the contact rules of §9 for form 1. The reply to a `RESEND` is the original envelope again, unchanged —
+same `messageId`, same signature — which is why dedupe must key on `messageId` rather than on receipt
+count.
 
 **The signature covers the whole envelope**, including `messageId` and `seq` — not the `sealed` field
 alone. If it covered only `sealed`, a hub could swap `messageId` for one already seen and the receiver
