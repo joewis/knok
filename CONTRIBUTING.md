@@ -30,13 +30,20 @@ with `Co-authored-by: Muse <muse@muse-vm>`. Nothing else about the workflow chan
 
 **Muse's write access is verified (2026-11-18).** The test below was run end to end, not asserted:
 
-1. Key `/root/.ssh/agent-bridge_deploy`, mode 0600, owner `root` — the agent runs as root in that
-   cell, so there is no separate agent user to own it.
-2. Deploy key id `170284181`, fingerprint `SHA256:U3xU4KU6smXzTdQnzS9S5JAJLlrFXhpkJQEzNs1ebzU`,
-   `read_only=false` (write), attached to this repository only.
-3. `git clone` + commit + `git push origin muse/access-check` succeeded from the VM; the branch
-   appeared on GitHub with commit `e507b01` authored `Muse <muse@muse-vm>`.
+1. Key `/home/hatch/.ssh/knok_deploy`, mode 0600. **The key lives under `/home/hatch`, not `/root`**:
+   `/root` is wiped on every VM restart and the first key died that way on 2026-11-18. `/home/hatch`
+   persists.
+2. Deploy key id `170291953`, fingerprint `SHA256:UTEmFkFKC/eE9q4vdyI0Ym50/ZrWTkfI1TX1ruFI2NE`,
+   `read_only=false` (write), attached to this repository only. The earlier key (`170284181`,
+   `SHA256:U3xU4KU6…`) was deleted when its private half was lost to the restart.
+3. `git clone` + commit + `git push origin muse/access-check-2` succeeded from the VM; the branch
+   appeared on GitHub with commit `8534ba5` authored `Muse <muse@muse-vm>`.
 4. The branch was deleted after verification; `main` was untouched.
+
+**Surviving a restart.** Because `/root` is ephemeral, everything git needs there is recreated by
+`/home/hatch/scripts/bootstrap-agent-bridge-git.sh`, which `bootstrap-api-bridge.sh` calls on every
+bridge start: it installs `/root/.ssh/gh-connect`, writes `/root/.ssh/config`, and sets the commit
+identity. The private key is never copied out of `/home/hatch`.
 
 **The VM has no direct internet egress**, and this is the part that will confuse the next person.
 DNS resolves external names to `198.18.x` fake addresses and direct connections are reset — a plain
@@ -47,7 +54,7 @@ network only through an authenticated egress proxy, so git is configured with a 
 Host github.com
   HostName github.com
   User git
-  IdentityFile /root/.ssh/agent-bridge_deploy
+  IdentityFile /home/hatch/.ssh/knok_deploy
   IdentitiesOnly yes
   ProxyCommand /root/.ssh/gh-connect %h %p
 ```
