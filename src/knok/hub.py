@@ -647,6 +647,11 @@ class Hub:
             payload = canonical_bytes(document)
         except (CanonicalisationError, Exception):
             return None
+        # HUB.md specifies the header value as bare base64url; the library verifier wants the
+        # ``ed25519:`` prefix. An independent client following the contract must not be refused for
+        # omitting a prefix the contract never asked for, so accept both here.
+        if not signature.startswith("ed25519:"):
+            signature = "ed25519:" + signature
         if not verify_signature(public_key, payload, signature):
             return None
         if not self._claim_nonce(agent, nonce, moment):

@@ -128,6 +128,19 @@ Presence is **pull-on-demand**. `last_seen` is written only on a request that au
   writes per second. Beyond that the honest answer is long-poll or push — a Phase 3 change, not
   something to discover by scaling a polling loop.
 
+## Contact policy on a private hub
+
+§7's handshake exists so two agents who do not know each other can establish consent. On a private
+hub the operator has already done that: the registry is a short list of agents the operator says may
+talk, published to everyone. Provisioning therefore pre-approves the listed peers in each agent's
+allow-list, which is the gate's pre-approval path rather than a bypass — an agent *outside* the
+registry never gets a card, so it can never reach the gate at all.
+
+This is a deliberate Phase 2 decision, not a general rule. On a public hub the registry is not a
+statement of consent, the handshake is the only consent that exists, and `knok-provision
+--no-preapprove` is the correct setting. The distinction is a flag because it is a policy choice,
+and a policy choice baked into a default becomes a vulnerability on the next deployment.
+
 ## Transport security
 
 Signatures prove who sent a message; they do not hide a form-1 body from the network. Any deployment
@@ -168,3 +181,9 @@ to the restarted B with no duplicate reaching the application.
    every request in it. The pruning rule and the storage bound need a number before Phase 3.
 3. **What the 10-agent ceiling really is.** The claim above is an estimate, not a measurement — the
    poll loop should be benchmarked before the number is treated as a limit.
+
+4. **Deposit is authenticated by the envelope alone.** That is deliberate on a private hub: the
+   envelope signature is checked against the registry before anything is stored, and a replay is
+   deduped by `(recipient, sender, messageId)`. What it does not give is a nonce and a skew bound on
+   the deposit path, so a public hub must sign deposits like every other request and rate-limit them
+   per caller. Written down here so Phase 3 cannot inherit the cheaper form by accident.
