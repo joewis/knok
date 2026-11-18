@@ -96,9 +96,12 @@ class Gate:
         self.threads = threads
         self.rates = rates
         # §9's probation limit is a property of the request, not of delivery, so it lives with the
-        # contact store rather than with the message counters.
-        contacts.rates = rates
-        contacts.contact_request_daily_limit = policy.limits.get("contact_requests_per_day")
+        # contact store rather than with the message counters. Set only when this gate is given a
+        # counter store: a Contacts opened with its own store keeps it rather than losing it here.
+        if rates is not None:
+            contacts.rates = rates
+            if contacts.contact_request_daily_limit is None:
+                contacts.contact_request_daily_limit = policy.limits.get("contact_requests_per_day")
 
     def _within_limits(self, sender: str, moment: datetime) -> bool:
         if self.rates is None:
