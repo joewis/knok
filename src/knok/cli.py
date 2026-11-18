@@ -26,6 +26,7 @@ from typing import Any
 from .bridge import BridgeState, fingerprint_key, load_cards
 from .envelope import sign
 from .hubclient import HubClient, HubError, HubRefused
+from .recv import recv_once
 from .identity import load as load_identity
 
 
@@ -121,6 +122,22 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_recv(args: argparse.Namespace) -> int:
+    agent_id = os.environ.get("KNOK_AGENT")
+    hub_url = os.environ.get("KNOK_HUB_URL")
+    if not agent_id or not hub_url:
+        raise SystemExit("KNOK_AGENT and KNOK_HUB_URL are required")
+    count = recv_once(
+        agent_id,
+        os.environ.get("KNOK_STATE", "/app/state"),
+        hub_url,
+        os.environ.get("KNOK_REGISTRY", "/app/registry"),
+        limit=args.limit,
+    )
+    sys.stderr.write(f"{count} message(s)\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="knok")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -137,6 +154,10 @@ def main(argv: list[str] | None = None) -> int:
     send.add_argument("--no-reply", dest="expects_reply", action="store_false")
     send.add_argument("--closes-thread", action="store_true", default=False)
     send.set_defaults(func=cmd_send)
+
+    recv = sub.add_parser("recv", help="fetch straight from the hub (no daemon; see knok/recv.py)")
+    recv.add_argument("--limit", type=int, default=20)
+    recv.set_defaults(func=cmd_recv)
 
     inbox = sub.add_parser("inbox", help="what the daemon has delivered to this agent")
     inbox.add_argument("--limit", type=int, default=20)
