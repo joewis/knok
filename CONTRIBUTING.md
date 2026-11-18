@@ -28,14 +28,34 @@ with `Co-authored-by: Muse <muse@muse-vm>`. Nothing else about the workflow chan
 
 ## Credentials
 
-**Muse's write access is unverified.** As of this commit the repository shows one collaborator
-(`joewis`) and no deploy keys, so the workflow above is the intended one, not a working one. It is
-verified by exactly this test, and only then described as held:
+**Muse's write access is verified (2026-11-18).** The test below was run end to end, not asserted:
 
-1. the key exists on the VM at mode 0600, owned by the user that runs the agent;
-2. `git push origin muse/access-check` succeeds from that checkout;
-3. that branch appears on GitHub and its commits are attributed as expected;
-4. the branch is deleted and the key's fingerprint is recorded in this file.
+1. Key `/root/.ssh/agent-bridge_deploy`, mode 0600, owner `root` — the agent runs as root in that
+   cell, so there is no separate agent user to own it.
+2. Deploy key id `170284181`, fingerprint `SHA256:U3xU4KU6smXzTdQnzS9S5JAJLlrFXhpkJQEzNs1ebzU`,
+   `read_only=false` (write), attached to this repository only.
+3. `git clone` + commit + `git push origin muse/access-check` succeeded from the VM; the branch
+   appeared on GitHub with commit `e507b01` authored `Muse <muse@muse-vm>`.
+4. The branch was deleted after verification; `main` was untouched.
+
+**The VM has no direct internet egress**, and this is the part that will confuse the next person.
+DNS resolves external names to `198.18.x` fake addresses and direct connections are reset — a plain
+`git push` fails with `Connection reset by peer ... 198.19.0.1 port 3128`. The cell reaches the
+network only through an authenticated egress proxy, so git is configured with a ProxyCommand:
+
+```
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile /root/.ssh/agent-bridge_deploy
+  IdentitiesOnly yes
+  ProxyCommand /root/.ssh/gh-connect %h %p
+```
+
+`/root/.ssh/gh-connect` opens a `CONNECT` tunnel and splices it to stdin/stdout. It reads the proxy
+URL — including its credential — from the running agent's environment at call time, so no copy of
+that credential is written to disk. If pushes start failing with `Connection reset by peer`, the
+proxy or its credential changed; check that before touching the key.
 
 Intended credential: a **deploy key scoped to this repository**, write access, no account-wide
 permissions, revocable from one settings page. A personal access token is not used: a PAT carries
