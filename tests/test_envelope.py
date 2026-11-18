@@ -2,8 +2,106 @@ import copy
 
 import pytest
 
-from knok.envelope import sign, validate, verify_envelope
+from knok.envelope import form_of, sign, validate, verify_envelope
 from knok.identity import generate
+
+
+def sealed_factory(envelope_factory, **overrides):
+    """A form 2 envelope: cleartext headers + messageId, sealed body in place of message."""
+    envelope = envelope_factory()
+    message_id = envelope["message"]["messageId"]
+    del envelope["message"]
+    envelope["messageId"] = message_id
+    envelope["sealed"] = {
+        "hpke": {"enc": "AAECAwQFBgc=", "ciphertext": "AAECAwQFBgcICQoLDA0ODw=="},
+        "recipientKeyId": "x25519:deadbeef",
+    }
+    envelope.update(overrides)
+    return envelope
+
+
+def test_valid_form_2_validates(identity, envelope_factory):
+    assert validate(sealed_factory(envelope_factory)) is None
+    assert form_of(sealed_factory(envelope_factory)) == "sealed"
+    assert form_of(envelope_factory()) == "plain"
+
+
+def test_form_2_sign_verify_round_trip(identity, envelope_factory):
+    signed = sign(sealed_factory(envelope_factory), identity)
+    ok, reason = verify_envelope(signed, identity.public_key)
+    assert ok, reason
+    assert form_of(signed) == "sealed"
+
+
+def test_form_2_tampered_sealed_fails(identity, envelope_factory):
+    signed = sign(sealed_factory(envelope_factory), identity)
+    signed["sealed"]["hpke"]["ciphertext"] = "AAAAAAAAAAAAAAAAAAAAAA=="
+    ok, reason = verify_envelope(signed, identity.public_key)
+    assert not ok and "signature" in reason
+
+
+def test_form_2_message_id_swap_breaks_signature(identity, envelope_factory):
+    """Changing messageId after signing must fail: the signature covers the whole
+    envelope, not the sealed field alone (SPEC §6)."""
+    signed = sign(sealed_factory(envelope_factory), identity)
+    signed["messageId"] = "m-swapped"
+    ok, reason = verify_envelope(signed, identity.public_key)
+    assert not ok and "signature" in reason
+
+
+def test_both_forms_present_is_invalid(identity, envelope_factory):
+    envelope = sealed_factory(envelope_factory)
+    envelope["message"] = envelope_factory()["message"]
+    reason = validate(envelope)
+    assert reason is not None and "message" in reason and "sealed" in reason
+
+
+def test_neither_form_present_is_invalid(identity, envelope_factory):
+    envelope = envelope_factory()
+    del envelope["message"]
+    reason = validate(envelope)
+    assert reason is not None and "message" in reason and "sealed" in reason
+    assert form_of(envelope) is None
+    assert form_of({"message": {}, "sealed": {}}) is None
+    assert form_of("not an envelope") is None
+
+
+def test_form_2_without_message_id_is_invalid(identity, envelope_factory):
+    envelope = sealed_factory(envelope_factory)
+    del envelope["messageId"]
+    reason = validate(envelope)
+    assert reason is not None and "messageId" in reason
+
+
+def test_form_2_without_recipient_key_id_is_invalid(identity, envelope_factory):
+    envelope = sealed_factory(envelope_factory)
+    del envelope["sealed"]["recipientKeyId"]
+    reason = validate(envelope)
+    assert reason is not None and "recipientKeyId" in reason
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda s: s["hpke"].pop("enc"),
+        lambda s: s["hpke"].pop("ciphertext"),
+        lambda s: s["hpke"].update(enc=42),
+        lambda s: s["hpke"].update(ciphertext=["not", "a", "string"]),
+        lambda s: s.update(hpke="not-an-object"),
+        lambda s: s.update(extra="smuggled"),
+    ],
+)
+def test_malformed_hpke_is_invalid(identity, envelope_factory, mutate):
+    envelope = sealed_factory(envelope_factory)
+    mutate(envelope["sealed"])
+    reason = validate(envelope)
+    assert reason is not None, "malformed sealed.hpke must be rejected"
+
+
+def test_form_1_with_top_level_message_id_is_invalid(identity, envelope_factory):
+    envelope = envelope_factory(messageId="m-1")
+    reason = validate(envelope)
+    assert reason is not None and "messageId" in reason
 
 
 def test_sign_verify_round_trip(identity, envelope_factory):
