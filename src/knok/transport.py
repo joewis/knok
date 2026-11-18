@@ -46,11 +46,12 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from .agentcard import sign_card, verify_card
 from .canonical import CanonicalisationError, canonical_bytes
 from .contacts import REFUSED
-from .envelope import verify_envelope
+from .envelope import sent_at as envelope_sent_at, verify_envelope
 from .gate import Gate
 from .identity import (Identity, b64url_decode, generate, public_key_from_b64,
                        verify_signature)
 from .queue import Queue
+from .registry import fingerprint_of_raw
 
 #: A throwaway identity for the refusal path only (issue #24). Nothing verifies
 #: against it and nothing is signed with it; it exists so a miss costs what a hit
@@ -112,6 +113,10 @@ def make_agent_card(identity: Identity, hub: str, url: str) -> dict[str, Any]:
         "bridge": {
             "publicKey": identity.public_b64(),
             "encryptionKey": "x25519:" + base64.b64encode(raw).decode("ascii"),
+            # The id names the key's record (decision 0002); the card carries the key itself for
+            # convenience, but a verifier that needs to know whether the key is still current asks
+            # the registry about this id, not about the bytes next to it.
+            "encryptionKeyId": fingerprint_of_raw(raw),
             "sealedRequired": False,
             "contactPolicy": "closed",
             "hub": hub,
@@ -268,8 +273,11 @@ class Bridge:
     """One agent's bridge: its queue, its gate, its keys, one loopback port.
 
     ``cards`` maps every sender this bridge will hear from to that sender's
-    signed Agent Card JWS; ``registry`` maps fingerprint -> public key (b64)
-    and is the only trust root for those cards (§4: no trust-on-first-use).
+    signed Agent Card JWS; ``registry`` is the only trust root for those cards
+    (§4: no trust-on-first-use) — either a
+    :class:`knok.registry.Registry`, which answers for an instant and can refuse
+    a revoked, expired or superseded key, or the legacy dict, which means every
+    key is valid forever.
     """
 
     def __init__(
@@ -279,7 +287,7 @@ class Bridge:
         queue: Queue,
         gate: Gate,
         cards: dict[str, dict[str, Any]],
-        registry: dict[str, str],
+        registry: "dict[str, str] | Registry",
         host: str = "127.0.0.1",
         port: int = 0,
     ):
@@ -348,7 +356,12 @@ class Bridge:
             # throw the result away; the answer is still exactly the same refusal.
             self._shadow_verify(envelope)
             return None
-        ok, _reason = verify_card(card, self.registry, expected_agent_id=sender)
+        # Asked of the registry at the instant the message was signed, not at receipt (decision
+        # 0002). With a plain dict the instant is ignored — every key is valid forever — but the
+        # call site is the live path a Registry plugs into, so the model is not dead code.
+        ok, _reason = verify_card(
+            card, self.registry, expected_agent_id=sender, now=envelope_sent_at(envelope)
+        )
         if not ok:
             return None
         try:

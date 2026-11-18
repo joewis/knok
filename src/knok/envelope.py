@@ -99,6 +99,17 @@ def _validate_sealed(sealed: Any) -> str | None:
     return None
 
 
+def sent_at(envelope: Any) -> datetime | None:
+    """The envelope's own ``sentAt``, or ``None`` when it has no parseable one.
+
+    Verification asks what a key meant *then*, not at the moment the bytes arrived: a key revoked
+    this morning must still validate a message signed yesterday (decision 0002, issue #23).
+    """
+    if not isinstance(envelope, dict):
+        return None
+    return _parse_time(envelope.get("sentAt"))
+
+
 def validate(envelope: Any, now: datetime | None = None) -> str | None:
     """Return why the envelope is invalid, or None when it is well formed and unexpired."""
     if not isinstance(envelope, dict):

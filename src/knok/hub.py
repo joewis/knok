@@ -585,12 +585,18 @@ class Hub:
 
     # -- cards ----------------------------------------------------------
 
-    def _card_public_key(self, agent_id: str):
-        """The registered public key for ``agent_id``, or None. Never raises."""
+    def _card_public_key(self, agent_id: str, at: datetime | None = None):
+        """The registered public key for ``agent_id``, or None. Never raises.
+
+        ``at`` is the instant the key's status is asked about. A deposit passes the envelope's
+        ``sentAt``: a key revoked this morning signed a message yesterday, and the hub must not
+        answer that question with today's status — while an unknown recipient is still asked about
+        at receipt, because nothing of theirs is being verified.
+        """
         card = self.cards.get(agent_id)
         if card is None:
             return None
-        ok, _reason = verify_card(card, self.registry, expected_agent_id=agent_id)
+        ok, _reason = verify_card(card, self.registry, expected_agent_id=agent_id, now=at)
         if not ok:
             return None
         try:
@@ -724,14 +730,21 @@ class Hub:
             raise _Refused("envelope has no sender")
         if sender == self.agent_id:
             raise _Refused("the hub is not an agent and deposits nothing")
-        public_key = self._card_public_key(sender)
-        if public_key is None:
-            raise _Refused("unknown sender")
         # verify_envelope refuses an envelope past expiresAt as of *now* —
         # but HUB.md says an already-expired deposit is accepted (202) and
         # produces an expired frame. Verify as of sentAt, then apply the
         # hub's own expiry decision below.
         sent_at = _parse_iso(envelope.get("sentAt"))
+        if sent_at is None:
+            # Falling back to receipt would answer a different question than the one asked, and
+            # answer it silently: a key's status now is not its status when the message was made.
+            raise _Refused("envelope has no parseable sentAt")
+        # The sender's card is checked as of the message's own instant, not the deposit's: a key
+        # revoked this morning must not refuse a message signed yesterday, and must refuse one
+        # signed after the revocation (decision 0002, issue #23).
+        public_key = self._card_public_key(sender, at=sent_at)
+        if public_key is None:
+            raise _Refused("unknown sender")
         ok, _reason = verify_envelope(envelope, public_key, sent_at)
         if not ok:
             raise _Refused("envelope does not verify")

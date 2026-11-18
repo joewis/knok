@@ -29,7 +29,8 @@ def new_message_id() -> str:
 
 def build_envelope(sender, recipient_id, *, seq=0, message_id=None,
                    context_id="c-1", text="Can you review §4?",
-                   expects_reply=True, closes_thread=False):
+                   expects_reply=True, closes_thread=False,
+                   sent_at=SENT_AT, expires_at=EXPIRES_AT):
     unsigned = {
         "envelopeVersion": 1,
         "seq": seq,
@@ -42,8 +43,8 @@ def build_envelope(sender, recipient_id, *, seq=0, message_id=None,
         },
         "from": sender.agent_id,
         "to": [recipient_id],
-        "sentAt": SENT_AT,
-        "expiresAt": EXPIRES_AT,
+        "sentAt": sent_at,
+        "expiresAt": expires_at,
         "turn": {"expectsReply": expects_reply, "closesThread": closes_thread},
     }
     return sign(unsigned, sender)
