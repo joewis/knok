@@ -245,7 +245,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self._refuse()
             return
-        ack = bridge.deliver(envelope)
+        # deliver() is written not to raise, but if it ever does — a card whose
+        # ``bridge`` object is the wrong shape, a sqlite error under load —
+        # the exception must not escape the handler: a 500 or a dropped
+        # connection is distinguishable from every other refusal (§9).
+        try:
+            ack = bridge.deliver(envelope)
+        except Exception:
+            self._refuse()
+            return
         if ack is None:
             self._refuse()
             return

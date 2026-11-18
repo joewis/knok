@@ -166,6 +166,21 @@ def test_refusal_is_indistinguishable(pair):
     assert pair.muse.queue.depth() == 0
 
 
+def test_deliver_raising_is_refused(pair, monkeypatch):
+    # §9: deliver() is written not to raise, but if it ever does — a card
+    # whose ``bridge`` object is the wrong shape, a sqlite error under load —
+    # the response must still be the shared refusal, not a 500 and not a
+    # dropped connection.
+    def _boom(envelope):
+        raise RuntimeError("sqlite under load")
+
+    monkeypatch.setattr(pair.muse.bridge, "deliver", _boom)
+    envelope = build_envelope(pair.carl_id, pair.muse_id.agent_id)
+    status, body = post_envelope(pair.muse.url, json.dumps(envelope).encode())
+    assert (status, body) == (REFUSAL_STATUS, REFUSAL_BODY)
+    assert pair.muse.queue.depth() == 0
+
+
 def test_unknown_sender_refused_with_the_shared_string(pair, tmp_path):
     # A second muse bridge holding only carl's card: mallory is unregistered
     # here, so her envelope is refused before any signature work on her key.
