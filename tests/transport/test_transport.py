@@ -169,7 +169,7 @@ def test_refusal_is_indistinguishable(pair):
 def test_unknown_sender_refused_with_the_shared_string(pair, tmp_path):
     # A second muse bridge holding only carl's card: mallory is unregistered
     # here, so her envelope is refused before any signature work on her key.
-    lonely = make_pair(tmp_path, muse_cards_for={pair.carl_id.agent_id})
+    lonely = make_pair(tmp_path / "lonely", muse_cards_for={pair.carl_id.agent_id})
     try:
         envelope = build_envelope(
             pair.mallory_id, pair.muse_id.agent_id, context_id="c-9"

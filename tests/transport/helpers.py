@@ -57,7 +57,7 @@ def make_bridge(tmp_path, name, identities, *, allow=(), cards_for=None):
     """
     identity = next(i for i in identities if i.agent_id.startswith(name + "@"))
     base = tmp_path / name
-    base.mkdir(exist_ok=True)
+    base.mkdir(parents=True, exist_ok=True)
     policy = parse({
         "agent_id": identity.agent_id,
         "contact_policy": "closed",
