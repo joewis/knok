@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.5 — 2026-11-18
+
+Revision of v0.4 after Muse's review of PR #17. Three of v0.4's claims were wrong in ways the code
+would have inherited.
+
+- **Sealed ordering was claimed but not delivered.** `messageId` in clear restores dedupe, not
+  ordering: `contextId` is sealed, so `seq` cannot be attributed to a stream before decryption. The
+  spec now says ordering happens at the receiving bridge after decryption, the hub stores opaque
+  blobs and never orders, and `RESEND` runs bridge to bridge.
+- **`messageId` was described as revealing nothing.** It is stable and therefore linkable — a hub can
+  tie a message to its retransmissions. Now stated, with a MUST: ≥128 bits from a CSPRNG, unique per
+  sender, because the queue's `seen` table is keyed on the id alone.
+- **The signature-coverage sentence was ambiguous.** Now explicit: the signature covers the whole
+  envelope including `messageId` and `seq`; covering only `sealed` would let a hub swap the id and
+  make the receiver drop a live message as a duplicate.
+- **Dead letters gained the trigger they were missing.** A `dead` transport frame tells the sender,
+  and the owner may re-offer with a new `messageId` plus `retryOf`, taking the next `seq` rather than
+  re-opening a released gap. Retention is 30 days.
+- **The context-TTL argument was false for non-default message TTLs.** No fixed context TTL can
+  guarantee the missing message has expired, because the clocks start at different events. The gap
+  notice now says "missing as of this notice", and a late arrival is delivered with a second notice
+  instead of being silently dropped.
+
+## v0.4 — 2026-11-18
+
+Three decisions that slice 2 forced into the open, each surfaced by code that could not implement
+the spec as written.
+
+- **Form 2 carries `messageId` in clear.** Slice 2 refuses sealed envelopes because the id was
+  sealed with the body, so nothing could dedupe or order them. A random identifier reveals nothing;
+  sealing it made every delivery guarantee in §6 conditional on the message not being sealed.
+  (issue #12)
+- **A dead letter is inspectable, never re-offered.** Re-offering restarts the five-attempt ladder
+  and its `seq` re-blocks the whole stream under per-context FIFO, so one poison message would block
+  every message behind it forever.
+- **Context TTL is 72 hours, equal to the message TTL.** A gap may only be closed once the missing
+  message can no longer arrive: shorter and the gap notice is a lie, longer and held messages expire
+  before they are ever released.
+
 ## Slice 2 — durable queue (issue #7, unreleased)
 
 `knok.queue.Queue`: SQLite (WAL, `synchronous=FULL`), one connection under
