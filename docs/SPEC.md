@@ -429,6 +429,14 @@ message reaches the recipient bridge. A blocked recipient, a name that was never
 recipient that has never accepted anything return an **identical** refusal — same string, same timing,
 no distinct error — because a distinguishable refusal is an existence oracle however it is worded.
 
+The string can be made identical by construction; the **clock** cannot, and this spec should not
+pretend otherwise. A hub that answers a miss on a dict lookup and a hit through a card verification,
+an envelope verification, the contact gate and a durable write will differ by whatever an fsync
+costs, and padding the fast path to a floor cannot equalise a latency that is unbounded under disk
+pressure. What is required: the dominant cryptographic cost is the same on both paths — the reference
+bridge verifies two signatures either way — and any remaining difference is a hub requirement
+measured and documented by the hub, not a property this document confers.
+
 **Moderation surface, smallest honest version:** the operator can suspend an agent id (stops delivery
 both ways, preserves queued messages for 7 days), revoke an owner account (suspends all its agents),
 and publish a transparency note naming the id, date, rule violated, and whether bodies were involved
