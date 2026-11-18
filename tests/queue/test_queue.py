@@ -16,9 +16,11 @@ from pathlib import Path
 
 import pytest
 
+from knok.identity import IdentityError
 from knok.queue import BACKOFF_SECONDS, Queue, QueueLockedError
 
 T0 = datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc)
+OWNER = "muse@bridge.example"  # the peer id the fixture envelopes are addressed to
 SRC = Path(__file__).resolve().parents[2] / "src"
 
 
@@ -36,7 +38,7 @@ def _at(seconds: float) -> datetime:
 
 @pytest.fixture
 def queue(tmp_path):
-    q = Queue(tmp_path / "queue.sqlite")
+    q = Queue(tmp_path / "queue.sqlite", OWNER)
     yield q
     q.close()
 
@@ -64,9 +66,9 @@ def test_dedupe_on_message_id(queue, envelope_factory):
 
 def test_dedupe_survives_restart(tmp_path, envelope_factory):
     db = tmp_path / "queue.sqlite"
-    with Queue(db) as q:
+    with Queue(db, OWNER) as q:
         q.put(_env(envelope_factory, message={"messageId": "m-1"}), T0)
-    with Queue(db) as q:
+    with Queue(db, OWNER) as q:
         assert q.put(_env(envelope_factory, message={"messageId": "m-1"}), T0) == "duplicate"
         assert q.get(T0)["message"]["messageId"] == "m-1"
         assert q.get(T0) is None
@@ -108,7 +110,7 @@ def test_gap_holds_resend_reports_and_close_releases(queue, envelope_factory):
 
 
 def test_gap_released_in_order_with_notice_after_ttl(tmp_path, envelope_factory):
-    with Queue(tmp_path / "q.sqlite", context_ttl=timedelta(seconds=60)) as q:
+    with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
         for seq in (0, 2):
             q.put(
                 _env(envelope_factory, seq=seq, message={"messageId": f"m-{seq}"}), T0
@@ -127,7 +129,7 @@ def test_gap_released_in_order_with_notice_after_ttl(tmp_path, envelope_factory)
 
 
 def test_gap_closing_before_ttl_cancels_the_notice(tmp_path, envelope_factory):
-    with Queue(tmp_path / "q.sqlite", context_ttl=timedelta(seconds=60)) as q:
+    with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
         for seq in (0, 2):
             q.put(
                 _env(envelope_factory, seq=seq, message={"messageId": f"m-{seq}"}), T0
@@ -193,14 +195,14 @@ def test_expire_emits_unsigned_frame(queue, envelope_factory):
 
 def test_restart_replays_unacked_never_acked(tmp_path, envelope_factory):
     db = tmp_path / "queue.sqlite"
-    with Queue(db) as q:
+    with Queue(db, OWNER) as q:
         q.put(_env(envelope_factory, message={"messageId": "m-1"}), T0)
         q.put(
             _env(envelope_factory, seq=1, message={"messageId": "m-2"}), T0
         )
         assert q.get(T0)["message"]["messageId"] == "m-1"
         q.ack("m-1")
-    with Queue(db) as q:
+    with Queue(db, OWNER) as q:
         assert q.get(T0)["message"]["messageId"] == "m-2"
         assert q.get(T0) is None
 
@@ -211,7 +213,7 @@ def _run_child(tmp_path, envelope, mode):
     payload.write_text(json.dumps(envelope))
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).parent / "child_put.py"),
-         str(db), str(payload), mode, T0.isoformat()],
+         str(db), str(payload), mode, T0.isoformat(), OWNER],
         env={"PYTHONPATH": str(SRC), "PATH": "/usr/bin:/bin"},
         capture_output=True, text=True, timeout=60,
     )
@@ -221,7 +223,7 @@ def _run_child(tmp_path, envelope, mode):
 
 def test_kill_before_ack_message_survives(tmp_path, envelope_factory):
     db = _run_child(tmp_path, _env(envelope_factory), "put")
-    with Queue(db) as q:
+    with Queue(db, OWNER) as q:
         # Real clock: crash recovery makes the message available at open time.
         got = q.get()
         assert got is not None and got["message"]["messageId"] == "m-1"
@@ -229,7 +231,7 @@ def test_kill_before_ack_message_survives(tmp_path, envelope_factory):
 
 def test_kill_after_get_before_ack_replays(tmp_path, envelope_factory):
     db = _run_child(tmp_path, _env(envelope_factory), "put_get")
-    with Queue(db) as q:
+    with Queue(db, OWNER) as q:
         got = q.get()
         assert got is not None and got["message"]["messageId"] == "m-1"
         assert q.ack("m-1") is True
@@ -240,7 +242,7 @@ def test_durability_pragmas_in_effect(tmp_path):
     import sqlite3
 
     db = tmp_path / "queue.sqlite"
-    with Queue(db):
+    with Queue(db, OWNER):
         pass
     conn = sqlite3.connect(str(db))
     try:
@@ -251,14 +253,14 @@ def test_durability_pragmas_in_effect(tmp_path):
 
 
 def test_second_opener_is_refused(tmp_path):
-    q1 = Queue(tmp_path / "queue.sqlite")
+    q1 = Queue(tmp_path / "queue.sqlite", OWNER)
     try:
         with pytest.raises(QueueLockedError):
-            Queue(tmp_path / "queue.sqlite")
+            Queue(tmp_path / "queue.sqlite", OWNER)
     finally:
         q1.close()
     # After close the lock is released and the queue opens again.
-    with Queue(tmp_path / "queue.sqlite"):
+    with Queue(tmp_path / "queue.sqlite", OWNER):
         pass
 
 
@@ -274,3 +276,38 @@ def test_sealed_envelope_refused(queue, envelope_factory):
 def test_expired_envelope_refused_at_put(queue, envelope_factory):
     with pytest.raises(ValueError, match="expired"):
         queue.put(_env(envelope_factory), datetime(2026, 11, 22, tzinfo=timezone.utc))
+
+
+def test_owner_id_validated_at_open(tmp_path):
+    with pytest.raises(IdentityError, match="invalid agent id"):
+        Queue(tmp_path / "queue.sqlite", "not-an-id")
+    with pytest.raises(IdentityError, match="invalid agent id"):
+        Queue(tmp_path / "queue.sqlite", "muse")
+    # A well-formed id opens fine, even if it is not the fixture peer.
+    with Queue(tmp_path / "queue.sqlite", "carl@bridge.example"):
+        pass
+
+
+def test_put_refuses_envelope_for_another_agent(queue, envelope_factory, identity):
+    other = _env(envelope_factory, to=[identity.agent_id])  # carl, not muse
+    with pytest.raises(
+        ValueError, match="envelope is not addressed to muse@bridge.example"
+    ):
+        queue.put(other, T0)
+    assert queue.get(T0) is None  # refused, not stored
+
+
+def test_put_refuses_two_recipients(queue, envelope_factory, identity):
+    both = _env(envelope_factory, to=[OWNER, identity.agent_id])
+    with pytest.raises(
+        ValueError, match="hub fan-out is not implemented: one queue serves one agent"
+    ):
+        queue.put(both, T0)
+    assert queue.get(T0) is None  # refused, not silently keyed to the first
+
+
+def test_get_returns_envelope_to_unchanged(queue, envelope_factory):
+    assert queue.put(_env(envelope_factory), T0) == "accepted"
+    got = queue.get(T0)
+    assert got["to"] == [OWNER]  # get() never rewrites the recipient list
+    assert got["from"] == "carl@bridge.example"

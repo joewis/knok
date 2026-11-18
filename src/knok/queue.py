@@ -24,6 +24,13 @@ make that promise survive a crash:
   :meth:`Queue.resend` reports what is missing; after the context TTL the
   held messages are released in order with a gap notice. A ``seq`` below
   the last delivered is dropped as a duplicate, not an error.
+* **The queue knows whose mail it is.** ``Queue(path, agent_id)`` is
+  bound at open to one owner, validated with
+  ``knok.identity.validate_agent_id``. ``put`` refuses an envelope not
+  addressed to the owner, and refuses a multi-recipient envelope outright:
+  fan-out is the hub's job, and silently keying a two-recipient message to
+  its first addressee would deliver it nowhere else. ``get`` returns the
+  envelope unchanged — it never rewrites ``to``.
 * **Poison messages dead-letter.** Five delivery attempts with backoff
   (1m, 5m, 30m, 2h, 12h), then the message moves to a dead-letter store
   visible to the owner via :meth:`Queue.dead_letter`. Nothing retries
@@ -55,6 +62,7 @@ from pathlib import Path
 from typing import Any
 
 from . import envelope as _envelope
+from .identity import validate_agent_id
 
 __all__ = ["Queue", "QueueLockedError", "BACKOFF_SECONDS", "DEFAULT_CONTEXT_TTL"]
 
@@ -125,13 +133,21 @@ def _ts(moment: datetime) -> float:
 
 
 class Queue:
-    """A durable, single-owner queue of signed envelopes for one bridge."""
+    """A durable, single-owner queue of signed envelopes for one agent.
+
+    ``agent_id`` is the queue's owner, validated at open. Only envelopes
+    addressed to that id are accepted; anything else is refused at
+    :meth:`put`, never stored.
+    """
 
     def __init__(
         self,
         path: str | Path,
+        agent_id: str,
         context_ttl: timedelta = DEFAULT_CONTEXT_TTL,
     ) -> None:
+        validate_agent_id(agent_id)
+        self.agent_id = agent_id
         self.path = Path(path)
         self.context_ttl = context_ttl
         self._lock = threading.RLock()
@@ -285,8 +301,10 @@ class Queue:
         acked, expired or dead — is accepted and dropped, never delivered
         twice. A ``seq`` below the last delivered for its stream is dropped
         the same way. Raises ``ValueError`` on a malformed or already
-        expired envelope, and on a sealed (form 2) envelope, whose
-        ``messageId`` the queue cannot see.
+        expired envelope, on a sealed (form 2) envelope, whose
+        ``messageId`` the queue cannot see, on an envelope not addressed
+        to this queue's owner, and on a multi-recipient envelope — the hub
+        does fan-out, this queue does not.
         """
         moment = now or datetime.now(timezone.utc)
         if not isinstance(env, dict) or "message" not in env:
@@ -301,7 +319,14 @@ class Queue:
         message_id = message["messageId"]
         context_id = message["contextId"]
         sender = env["from"]
-        recipient = env["to"][0]
+        recipients = env["to"]
+        if len(recipients) > 1:
+            raise ValueError(
+                "hub fan-out is not implemented: one queue serves one agent"
+            )
+        if recipients[0] != self.agent_id:
+            raise ValueError(f"envelope is not addressed to {self.agent_id}")
+        recipient = recipients[0]
         seq = env["seq"]
         with self._lock:
             if self._conn.execute(
