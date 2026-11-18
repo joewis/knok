@@ -206,3 +206,67 @@ def test_a_stranger_cannot_deposit(deployment, tmp_path):
 
     counts = bridges["muse"].poll_once()
     assert counts["fetched"] == 0
+
+
+def test_an_unverifiable_item_is_dropped_after_bounded_attempts(deployment):
+    """Registry lag must not starve a mailbox forever.
+
+    The hub knows bobby; this bridge's registry has not learned bobby's card yet. The message cannot
+    be verified, so it must not be delivered — but after a bounded number of attempts it has to be
+    acknowledged away, or it sits at the head of the mailbox and every message behind it waits
+    forever.
+    """
+    from knok.bridge import MAX_HANDLE_ATTEMPTS
+    from knok.hubclient import HubClient
+    from knok.provision import load_key
+
+    hub, bridges, root = deployment
+    muse = bridges["muse"]
+
+    bobby_identity = load_key(f"bobby@{DOMAIN}", root / "agents" / "bobby" / "identity.key")
+    moment = now()
+    unsigned = {
+        "envelopeVersion": 1,
+        "seq": 0,
+        "message": {
+            "kind": "message",
+            "messageId": "m-unverifiable",
+            "contextId": "c-blind",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "you cannot check my card yet"}],
+        },
+        "from": bobby_identity.agent_id,
+        "to": [muse.identity.agent_id],
+        "sentAt": iso(moment - timedelta(seconds=1)),
+        "expiresAt": iso(moment + timedelta(hours=1)),
+        "turn": {"expectsReply": False, "closesThread": False},
+    }
+    HubClient(hub.url, bobby_identity).deposit(sign(unsigned, bobby_identity))
+
+    # The bridge has not learned bobby's card: this is registry lag, exactly what the bound is for.
+    saved = muse.state.registry.pop(bobby_identity.agent_id)
+    try:
+        for _ in range(MAX_HANDLE_ATTEMPTS - 1):
+            counts = muse.poll_once()
+            assert counts["dropped"] == 0, "must not drop before the allowance is spent"
+            assert counts["queued"] == 0, "an unverifiable message is never delivered"
+            assert muse.client.fetch()["messages"], "still at the hub, still unacked"
+
+        final = muse.poll_once()
+        assert final["dropped"] == 1
+        assert muse.client.fetch()["messages"] == [], "the drop must clear the mailbox"
+        dropped = (root / "agents" / "muse" / "dropped.jsonl").read_text().splitlines()
+        assert len(dropped) == 1 and "m-unverifiable" in dropped[0]
+    finally:
+        muse.state.registry[bobby_identity.agent_id] = saved
+
+
+def test_reprovisioning_syncs_the_allow_list_for_a_new_agent(tmp_path):
+    """An allow-list written once is a snapshot; adding an agent must update the others."""
+    provision(tmp_path, hub_domain=DOMAIN, agents=["carl", "muse"])
+    carl_policy = tmp_path / "agents" / "carl" / "policy.json"
+    assert f"muse@{DOMAIN}" in json.loads(carl_policy.read_text())["allow"]
+
+    provision(tmp_path, hub_domain=DOMAIN, agents=["carl", "muse", "bobby"])
+    allow = json.loads(carl_policy.read_text())["allow"]
+    assert f"bobby@{DOMAIN}" in allow, "a new agent must be admitted without hand-editing policies"

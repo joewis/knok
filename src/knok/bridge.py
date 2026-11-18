@@ -21,6 +21,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,23 @@ from .rates import Rates
 log = logging.getLogger("knok.bridge")
 
 DEFAULT_POLL_SECONDS = 2.0
+#: How many times one mailbox item may fail to verify before the bridge acknowledges it away.
+#: Without a bound, a single unverifiable envelope sits at the head of the mailbox forever and the
+#: mail behind it is never reached — the hub's 72-hour expiry is the backstop, not the mechanism.
+MAX_HANDLE_ATTEMPTS = 5
+
+
+def item_key(item: Any) -> str:
+    """A stable id for a mailbox item, including one that is too broken to have a messageId."""
+    if isinstance(item, dict):
+        for candidate in (item.get("messageId"), (item.get("message") or {}).get("messageId")):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(
+        json.dumps(item, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:32]
 
 
 @dataclass
@@ -131,6 +149,10 @@ class Bridge:
         # queue into ``inbox.jsonl`` and acks each message. Off by default, because an embedded
         # bridge leaves delivery to whoever owns the queue (Hermes, a test, an agent runtime).
         self.deliver = deliver
+        #: Per-process attempt counter for items that could not be verified. A restart grants a
+        #: fresh allowance, which is the point: a registry that was briefly unreadable should
+        #: recover, while a permanently bad item is still bounded by the hub's own TTL.
+        self._attempts: dict[str, int] = {}
         self.poll_seconds = poll_seconds
         self._clock = clock
 
@@ -201,13 +223,26 @@ class Bridge:
             log.warning("fetch failed: %s", exc)
             return {"fetched": 0, "queued": 0, "refused": 0, "notices": 0, "unhandled": 1}
 
-        counts = {"fetched": 0, "queued": 0, "refused": 0, "notices": 0, "unhandled": 0}
+        counts = {"fetched": 0, "queued": 0, "refused": 0, "notices": 0, "unhandled": 0,
+                  "dropped": 0}
         handled: list[str] = []
         for item in page.get("messages", []):
             counts["fetched"] += 1
             outcome, message_id = self._handle(item)
             if message_id is None:
-                counts["unhandled"] += 1
+                key = item_key(item)
+                attempts = self._attempts.get(key, 0) + 1
+                self._attempts[key] = attempts
+                if attempts < MAX_HANDLE_ATTEMPTS:
+                    counts["unhandled"] += 1
+                    continue
+                # Bounded and now exhausted: acknowledge it away so the mailbox can advance, and
+                # leave a record. Re-offering it a sixth time only starves everything behind it.
+                log.error("dropping an unhandleable item after %d attempts: %s", attempts, key)
+                self._record_drop(item, key)
+                del self._attempts[key]
+                counts["dropped"] += 1
+                handled.append(key)
                 continue
             counts[outcome] += 1
             handled.append(message_id)
@@ -273,6 +308,18 @@ class Bridge:
         self._record_notice(frame)
         return "notices", message_id if isinstance(message_id, str) else None
 
+    def _record_drop(self, item: Any, key: str) -> None:
+        path = self.state.directory / "dropped.jsonl"
+        record = {"key": key, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "item": item}
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            log.error("could not record a dropped item %s: %s", key, exc)
+
     def _record_notice(self, frame: dict[str, Any]) -> None:
         """Keep notices where a human can see them; they are not messages and never enter a thread."""
         path = self.state.directory / "notices.jsonl"
@@ -297,6 +344,12 @@ class Bridge:
                 break
             if envelope.get("kind") in {"gap", "expired", "dead"}:
                 self._record_notice(envelope)
+                # A stored frame would otherwise be re-offered after every backoff forever.
+                if isinstance(envelope.get("messageId"), str):
+                    try:
+                        self.queue.ack(envelope["messageId"])
+                    except Exception:
+                        pass
                 continue
             try:
                 self._append_inbox(envelope)

@@ -59,6 +59,7 @@ def provision(
     agents: Iterable[str],
     hub_name: str = "postmaster",
     force: bool = False,
+    preapprove: bool = True,
 ) -> dict[str, Any]:
     """Create whatever is missing. Returns a manifest describing what exists now."""
     root = Path(root)
@@ -87,18 +88,29 @@ def provision(
             identity_mod.generate(name, hub_domain).save(key_path)
         agent_identity = load_key(agent_id, key_path)
 
+        # The policy is rewritten, not created-and-forgotten: an allow-list written only once is a
+        # snapshot, so adding a fourth agent would leave the first three refusing its mail with no
+        # error anywhere. Operator edits to other fields survive; the allow-list is recomputed.
         policy_path = directory / "policy.json"
-        if not policy_path.exists():
-            policy = dict(DEFAULT_POLICY)
-            policy["agent_id"] = agent_id
-            # A private hub whose registry already lists everyone: the allow-list is the
-            # pre-approval HUB.md describes, so peers need no handshake round trip. An agent
-            # outside this registry never gets a card, so it can never reach the gate anyway.
+        policy = dict(DEFAULT_POLICY)
+        if policy_path.exists():
+            try:
+                existing = json.loads(policy_path.read_text())
+                if isinstance(existing, dict):
+                    policy.update({k: v for k, v in existing.items() if k != "allow"})
+            except ValueError:
+                pass
+        policy["agent_id"] = agent_id
+        if preapprove:
+            # Private deployment: the registry is the operator's statement that these agents may
+            # talk, so the allow-list is a pre-approval and §7's handshake is not exercised. On a
+            # public hub the registry is open and the handshake is the only consent that exists,
+            # which is why this is a flag rather than a default baked into the gate.
             policy["allow"] = sorted(
                 [f"{other}@{hub_domain}" for other in agents if other != name] + [hub_id]
             )
-            policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n")
-            os.chmod(policy_path, 0o600)
+        policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n")
+        os.chmod(policy_path, 0o600)
 
         _write_card(
             root / "registry" / f"{agent_id}.json",
@@ -126,6 +138,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hub-name", default="postmaster")
     parser.add_argument("--agents", nargs="+", default=["carl", "muse", "bobby"])
     parser.add_argument("--force", action="store_true", help="replace existing keys (destroys identity)")
+    parser.add_argument(
+        "--no-preapprove",
+        dest="preapprove",
+        action="store_false",
+        help="leave the allow-list empty: every peer must complete the §7 handshake first",
+    )
     args = parser.parse_args(argv)
 
     manifest = provision(
@@ -134,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         agents=args.agents,
         hub_name=args.hub_name,
         force=args.force,
+        preapprove=args.preapprove,
     )
     json.dump(manifest, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
