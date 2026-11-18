@@ -1,0 +1,116 @@
+# Phase 2: one hub and three agents on one Docker network.
+#
+#   docker compose -f deploy/docker-compose.yml up --build -d
+#   docker compose -f deploy/docker-compose.yml exec agent-carl \
+#       python -m knok.cli send --to muse@hub.local --text "hello"
+#   docker compose -f deploy/docker-compose.yml exec agent-muse \
+#       python -m knok.cli inbox
+#
+# The point of the layout is what each container *cannot* reach:
+#   - the hub gets its own key directory and a read-only registry, never an agent's key;
+#   - each agent gets only its own volume, so a bridge bug cannot read a peer's key;
+#   - the hub port is published to loopback only, which is why plain HTTP is acceptable here
+#     (docs/HUB.md, "Transport security").
+#
+# `prepare` runs once and writes keys, policies and the registry into the volumes. It is idempotent:
+# restarting the stack reuses existing keys rather than re-identifying every agent.
+x-knok: &knok
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  networks: [knok]
+
+x-bridge-env: &bridge-env
+  KNOK_ROLE: bridge
+  KNOK_HUB_DOMAIN: hub.local
+  KNOK_STATE: /app/state
+  KNOK_REGISTRY: /app/registry
+  KNOK_HUB_URL: http://hub:8080
+  KNOK_POLL: "2"
+
+services:
+  prepare:
+    <<: *knok
+    command: ["knok.provision", "--root", "/srv", "--agents", "carl", "muse", "bobby"]
+    environment:
+      KNOK_HUB_DOMAIN: hub.local
+    volumes:
+      - hub-data:/srv/hub
+      - carl-data:/srv/agents/carl
+      - muse-data:/srv/agents/muse
+      - bobby-data:/srv/agents/bobby
+      - registry:/srv/registry
+    restart: "no"
+
+  hub:
+    <<: *knok
+    command: ["knok.runner"]
+    environment:
+      KNOK_ROLE: hub
+      KNOK_HUB_DOMAIN: hub.local
+      KNOK_STATE: /app/state
+      KNOK_REGISTRY: /app/registry
+      KNOK_BIND: 0.0.0.0:8080
+    volumes:
+      - hub-data:/app/state
+      - registry:/app/registry:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); sys.exit(0 if s.connect_ex(('127.0.0.1',8080))==0 else 1)"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  agent-carl:
+    <<: *knok
+    command: ["knok.runner"]
+    environment:
+      <<: *bridge-env
+      KNOK_AGENT: carl@hub.local
+    volumes:
+      - carl-data:/app/state
+      - registry:/app/registry:ro
+    depends_on:
+      hub:
+        condition: service_healthy
+
+  agent-muse:
+    <<: *knok
+    command: ["knok.runner"]
+    environment:
+      <<: *bridge-env
+      KNOK_AGENT: muse@hub.local
+    volumes:
+      - muse-data:/app/state
+      - registry:/app/registry:ro
+    depends_on:
+      hub:
+        condition: service_healthy
+
+  agent-bobby:
+    <<: *knok
+    command: ["knok.runner"]
+    environment:
+      <<: *bridge-env
+      KNOK_AGENT: bobby@hub.local
+    volumes:
+      - bobby-data:/app/state
+      - registry:/app/registry:ro
+    depends_on:
+      hub:
+        condition: service_healthy
+
+volumes:
+  hub-data:
+  carl-data:
+  muse-data:
+  bobby-data:
+  registry:
+
+networks:
+  knok:
+    driver: bridge
