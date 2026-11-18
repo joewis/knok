@@ -735,6 +735,10 @@ class Hub:
         # produces an expired frame. Verify as of sentAt, then apply the
         # hub's own expiry decision below.
         sent_at = _parse_iso(envelope.get("sentAt"))
+        if sent_at is None:
+            # Falling back to receipt would answer a different question than the one asked, and
+            # answer it silently: a key's status now is not its status when the message was made.
+            raise _Refused("envelope has no parseable sentAt")
         # The sender's card is checked as of the message's own instant, not the deposit's: a key
         # revoked this morning must not refuse a message signed yesterday, and must refuse one
         # signed after the revocation (decision 0002, issue #23).
