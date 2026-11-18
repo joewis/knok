@@ -33,8 +33,14 @@ def test_save_is_0600_and_refuses_overwrite(tmp_path, identity):
 
 def test_save_load_round_trip(tmp_path, identity):
     path = identity.save(tmp_path / "carl.key")
-    again = load(identity.agent_id, path)
+    again = load(identity.agent_id, path, identity.fingerprint)
     assert again.fingerprint == identity.fingerprint
+
+
+def test_load_refuses_a_key_that_is_not_the_registered_one(tmp_path, identity, peer):
+    path = identity.save(tmp_path / "carl.key")
+    with pytest.raises(IdentityError, match="not the registered"):
+        load(identity.agent_id, path, peer.fingerprint)
 
 
 def test_fingerprint_is_stable(identity):

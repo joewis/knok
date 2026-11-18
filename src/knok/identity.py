@@ -103,13 +103,23 @@ def generate(name: str, hub: str) -> Identity:
     return Identity(f"{name}@{hub}", Ed25519PrivateKey.generate())
 
 
-def load(agent_id: str, path: str | Path) -> Identity:
-    """Load a PKCS8 PEM private key. The caller vouches for the agent id."""
+def load(agent_id: str, path: str | Path, expected_fingerprint: str) -> Identity:
+    """Load a PKCS8 PEM private key and bind it to an id.
+
+    The fingerprint is required, not optional: a PEM carries no agent id, so without it
+    ``load("alice@hub", bob.pem)`` yields an Identity that fingerprints as Bob and signs as
+    Alice. Callers take the fingerprint from the registry, the only party that knows the binding.
+    """
     validate_agent_id(agent_id)
     key = load_pem_private_key(Path(path).read_bytes(), password=None)
     if not isinstance(key, Ed25519PrivateKey):
         raise IdentityError(f"{path} does not contain an Ed25519 private key")
-    return Identity(agent_id, key)
+    loaded = Identity(agent_id, key)
+    if loaded.fingerprint != expected_fingerprint:
+        raise IdentityError(
+            f"{path} holds a key for {loaded.fingerprint}, not the registered {expected_fingerprint}"
+        )
+    return loaded
 
 
 def public_key_from_b64(text: str) -> Ed25519PublicKey:
