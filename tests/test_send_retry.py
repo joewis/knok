@@ -9,12 +9,10 @@ the context the *recipient* ends up holding.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 
-from knok.bridge import Bridge, BridgeState, load_cards
 from knok.cli import SENT_LEDGER, main
 from knok.gate import Gate
 from knok.hubclient import HubError
