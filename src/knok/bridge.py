@@ -12,8 +12,10 @@ reason, so the ack below it cannot run first.
 The bridge does not interpret a body, does not accept a message for another agent (the queue refuses
 it), and does not trust a transport frame unless the hub signed it.
 
-``policy.json`` is re-read whenever the file changes (one ``stat`` per poll, #52): an operator's
-revocation takes effect on the next message, not on the next restart.
+Nothing the bridge reads once may stay read once. The pinned cards are re-read when the directory
+changes, because a peer that a restart would admit is a peer that is silently dropped until the
+restart happens (#54). ``policy.json`` fails the same way one layer up (#52); its reload is a
+separate change, and this one sits where that one will.
 """
 
 from __future__ import annotations
@@ -84,6 +86,10 @@ class BridgeState:
     directory: Path
     hub_url: str
     registry: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Where ``registry`` came from, when it came from a directory at all. The bridge re-reads it
+    #: when a card is added or removed, and cannot do that from the dict alone — so a state built
+    #: with an in-memory registry (a test, an embedded bridge) simply never reloads.
+    registry_dir: Path | None = None
 
     @property
     def key_path(self) -> Path:
@@ -222,6 +228,12 @@ class Bridge:
         #: ``stat`` is the cheap way to notice an edit: the daemon must not pay a parse per poll, and
         #: a parse per *message* would still race a mid-decision rewrite.
         self._policy_stamp = self._policy_file_stamp()
+        #: The set of card files the registry in force was loaded from, by (name, mtime, size, inode).
+        #: The directory's own mtime is not enough: rewriting an existing card changes the file, not
+        #: the directory, and on a coarse clock a rewrite can land inside the same timestamp tick.
+        self._registry_stamp: tuple[tuple[str, int, int, int], ...] | None = (
+            self._registry_dir_stamp()
+        )
 
     # -- helpers ----------------------------------------------------------
 
@@ -318,6 +330,91 @@ class Bridge:
         )
         return True
 
+    def _registry_dir_stamp(self) -> tuple[tuple[str, int, int, int], ...] | None:
+        """Identity of the registry directory's card files, or ``None`` when it is unreadable.
+
+        Every card is stamped, not just the directory: ``provision.py`` rewrites one file at a time,
+        so a new peer changes the set while the directory's own mtime may already have settled. A
+        removal changes the set too, which is the half that makes a *revoked* card stop being trusted.
+        """
+        if self.state.registry_dir is None:
+            return None
+        try:
+            paths = sorted(Path(self.state.registry_dir).glob("*.json"))
+        except OSError:
+            return None
+        stamps: list[tuple[str, int, int, int]] = []
+        for path in paths:
+            try:
+                info = path.stat()
+            except OSError:
+                # A file that vanished between the glob and the stat is simply not in this stamp;
+                # the next poll will not see it either, and the set is what is compared.
+                continue
+            stamps.append((path.name, info.st_mtime_ns, info.st_size, info.st_ino))
+        return tuple(stamps)
+
+    def reload_registry_if_changed(self) -> bool:
+        """Adopt a card added, changed or removed since the last poll (#54). True when swapped.
+
+        The policy reload (#52) fixes the *gate*; this fixes the trust anchor behind it. A peer
+        provisioned after this bridge started has no pinned card, so ``_handle`` cannot verify its
+        signature, leaves the envelope at the hub, and after the bounded attempt counter it is dropped
+        — a silent drop, which is the #48 class one layer down.
+
+        Two things make this a security change rather than a plumbing one, and both fail closed by
+        keeping the registry already in force:
+
+        * **A card removed from the directory stops being trusted.** Otherwise revocation of a *key*,
+          as opposed to a peer, would still need a restart — the same bug one layer down.
+        * **A directory that yields no cards at all is refused.** An empty registry is not "trust
+          nobody": it is every correspondent suddenly unverifiable, i.e. silently dropped mail, and
+          the usual cause is a provisioning step caught mid-rewrite. ``load_cards`` already drops a
+          card that fails its own signature check, so a single bad edit narrows the registry rather
+          than emptying it — that case still swaps, because it is a real statement about that card.
+        """
+        if self.state.registry_dir is None:
+            return False
+        stamp = self._registry_dir_stamp()
+        if stamp is None or stamp == self._registry_stamp:
+            return False
+        # Remembered before loading, so a directory that cannot be loaded is reported once instead
+        # of re-read on every poll until someone fixes it.
+        self._registry_stamp = stamp
+        cards = load_cards(self.state.registry_dir)
+        if not cards:
+            log.error(
+                "registry reload refused: %s yields no cards; keeping the %d already pinned",
+                self.state.registry_dir,
+                len(self.state.registry),
+            )
+            return False
+        if self.state.agent_id not in cards:
+            log.error(
+                "registry reload refused: %s has no card for this agent (%s); keeping the registry "
+                "in force",
+                self.state.registry_dir,
+                self.state.agent_id,
+            )
+            return False
+        if cards == self.state.registry:
+            return False
+
+        added = sorted(cards.keys() - self.state.registry.keys())
+        removed = sorted(self.state.registry.keys() - cards.keys())
+        # One assignment: ``public_key_of`` and ``_handle`` read the dict per message, so a message
+        # is verified against one registry or the other, never half of each.
+        self.state.registry = cards
+        log.info(
+            "registry reloaded: +%d -%d, %d pinned%s%s",
+            len(added),
+            len(removed),
+            len(cards),
+            f"; added {', '.join(added)}" if added else "",
+            f"; removed {', '.join(removed)}" if removed else "",
+        )
+        return True
+
     def poll_once(self) -> dict[str, int]:
         """Fetch one page, handle it in order, ack what was handled.
 
@@ -326,6 +423,7 @@ class Bridge:
         left unacked so the hub offers it again, because the alternative is silently dropping mail.
         """
         self.reload_policy_if_changed()
+        self.reload_registry_if_changed()
         try:
             page = self.client.fetch(limit=self.batch)
         except HubError as exc:

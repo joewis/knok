@@ -171,6 +171,12 @@ there — and that reason is written down rather than assumed.
   There is no dynamic registration in Phase 2: adding an agent is editing a directory and restarting
   the hub. That removes §9's registration surface until the public hub exists, and it is why card
   distribution, rotation and revocation are an open question rather than designed here.
+  **The bridges do not have to be part of that restart.** A bridge re-reads the directory when a
+  card is added, changed or removed, and swaps the pinned set in one assignment between messages —
+  so a peer provisioned mid-run is admitted, and a deleted card stops being trusted, without
+  bouncing a container. Two cases are refused rather than swapped: a directory that yields no cards
+  (a provisioning step caught mid-rewrite is not "trust nobody"), and one that no longer holds the
+  bridge's own card (a misconfigured bridge is not a decommission).
 - Each agent runs in its own container with its own volume and a `0600` key. A hub bug must not reach
   an agent's private key; a bridge bug must not reach another agent's.
 

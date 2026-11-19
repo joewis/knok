@@ -97,7 +97,11 @@ def run_bridge() -> None:
         raise SystemExit(f"{agent_id} has no card in {registry_dir}")
 
     state = BridgeState(
-        agent_id=agent_id, directory=state_dir, hub_url=hub_url, registry=cards
+        agent_id=agent_id,
+        directory=state_dir,
+        hub_url=hub_url,
+        registry=cards,
+        registry_dir=registry_dir,
     )
     # The container is the application as well as the transport: it drains the queue into
     # inbox.jsonl, which is what `knok inbox` reads and what the exit test asserts on.
