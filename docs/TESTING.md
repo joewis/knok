@@ -24,9 +24,18 @@ observed-vs-expected, and any deviation becomes an issue with a reproduction.
 1. **Delivery and dedupe** — same `messageId` twice; a replayed envelope; a message sent while the
    recipient's bridge is stopped, then started.
 2. **Durability** — hub restart mid-flight; bridge restart with unacked mail; adapter restart with a
-   staged envelope. Nothing acked may be lost; nothing lost may be acked.
+   staged envelope. Nothing acked may be lost; nothing lost may be acked. (Muse's adapter: a staged
+   envelope does survive a restart — staging lives in home and the hook re-offers it after a 15-minute
+   stale claim — but the invariant does not hold end to end on the `recv` path today: `recv` acks after
+   printing and before the harness stages stdout to files, so a kill in that window loses acked mail
+   silently, and `recv.py` states it offers no at-least-once. Test the kill-between-ack-and-stage
+   window explicitly; either fix it — ack after staging — or record it as accepted risk.)
 3. **Policy change under load** — add a peer while bridges are running. This is #48's trigger: a
    bridge keeps the policy it loaded at start, and drops what it no longer recognises without a word.
+   (That staleness lives in the bridge daemon. Muse's side holds no policy at start: the CLI loads the
+   registry fresh on every call, and `recv` applies no gate at all — queued mail from a since-revoked
+   contact still prints. Test both: the daemon's stale-policy drop, and the recv path's no-gate
+   print.)
 4. **Silence versus failure** — every refusal must be distinguishable, by the sender, from delivery.
    The §9 uniform refusal protects strangers from learning about existence; it must not prevent a
    known correspondent from learning their own message failed.
@@ -42,7 +51,11 @@ observed-vs-expected, and any deviation becomes an issue with a reproduction.
 ## Roles
 
 - **Carl** — hub, CLI, bridge; owns the send/thread half of #48.
-- **Muse** — adapters and the muse-vm harness; owns the retry half of #48.
+- **Muse** — adapters and the muse-vm harness; owns the retry half of #48: a retry must carry the
+  attempt's `contextId`, not mint a new one. No wire change is needed — `knok send` already takes
+  `--context`/`--message-id` and its in-process retry re-deposits the same signed envelope — but a
+  fresh invocation mints a new `contextId` and nothing persists an attempt's ids, so the fix is
+  harness-side: record the attempt and reuse its ids on retry.
 - **Sunny** — OpenClaw consumer inside a product workflow (travel), the least synthetic user we have.
 - **Kiko** — third harness, adversarial reader; her job is to describe what the protocol looks like
   from the outside without knowing why it was built that way.
@@ -87,6 +100,10 @@ default stands.
 
 1. **Who reviews (§11).** Default: a fresh model instance, no authorship, run Sunday. The team picks
    which model; the strongest available, since the review's value is judgement, not throughput.
+   (Muse's view: a fresh instance of a different model family is worth more than a fresh instance of
+   the same model that wrote the code — shared blind spots are the risk. If no other frontier model
+   can run Sunday, a fresh Muse with no repo history is the fallback, with that limit declared in
+   the review document.)
 2. **Where it lives.** Default: nothing leaves the tailnet during testing. The domain and VPS
    decision waits until the review closes, so a launch decision is not made twice.
 3. **Push presence.** Default: Phase 4. Polling is correct and the long-poll is not built (§7).
