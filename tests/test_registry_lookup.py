@@ -124,7 +124,17 @@ def test_a_card_that_does_not_verify_is_refused(stale_registry, monkeypatch):
     use_env(monkeypatch, situation["env"])
 
     document = json.loads((situation["stale"] / f"muse@{DOMAIN}.json").read_text())
-    document["signature"] = "A" + document["signature"][1:]
+    # Mangle a byte *in the middle* of the signature and check that the value actually changed: a
+    # signature whose first base64url character already is "A" would otherwise be left untouched,
+    # and the test would then be asserting a refusal it did not earn. That happened once in a full
+    # suite run before this line existed — the keys are fresh per run, so it was a ~1-in-64 flake
+    # rather than a never.
+    signature = document["signature"]
+    middle = len(signature) // 2
+    document["signature"] = (
+        signature[:middle] + ("A" if signature[middle] != "A" else "B") + signature[middle + 1:]
+    )
+    assert document["signature"] != signature, "the signature must actually differ from the original"
     # The precondition is about *this* document, not about ``card_body``: the payload still decodes
     # and still carries a public key, so a refusal here is a statement about the signature. Written
     # this way on purpose — it holds whether or not #59 is fixed, so this suite cannot be broken by
