@@ -48,17 +48,21 @@ def notices_of(root, name):
 
 
 def test_a_refused_message_reaches_the_sender_as_a_notice(deployment):
-    """The core claim: hub acked it, gate refused it, and the sender is told anyway."""
+    """The core claim: hub acked it, gate refused it, and the sender is told anyway.
+
+    The sender is a pinned correspondent, refused under policy (not an accepted contact, not in
+    the allow-list) — not a blocked one: blocked peers get silence, not a notice.
+    """
     hub, bridges, root = deployment
     carl, muse = bridges["carl"], bridges["muse"]
     context = "c-thread-50"
 
-    rewrite(root, "muse", block=[f"carl@{DOMAIN}"])
+    rewrite(root, "muse", block=[], allow=[])
     apply_policy(muse, policy_path(root, "muse"))
 
     send(carl, muse.identity.agent_id, "are you there?", context=context, message_id="m-50")
     refused = muse.poll_once()
-    assert refused["refused"] == 1, "the gate must refuse a blocked sender"
+    assert refused["refused"] == 1, "the gate must refuse an unlisted sender"
     assert muse.queue.get() is None, "and nothing reaches the application"
 
     # The hub's copy is gone (the refusal was acked, so a page of refusals still advances)...
@@ -73,10 +77,42 @@ def test_a_refused_message_reaches_the_sender_as_a_notice(deployment):
     assert notice["from"] == muse.identity.agent_id
     assert notice["messageId"] == "m-50", "the notice names the message that died"
     assert notice["contextId"] == context, "and the thread, so a retry can reuse it (#48)"
-    assert notice["rule"] == "blocked"
+    assert notice["rule"] == "policy"
 
     # The sender's own mailbox is clear: the notice was handled, not left to be re-offered.
     assert carl.client.fetch()["messages"] == []
+
+
+def test_a_blocked_peer_gets_silence(deployment):
+    """The paired negative that matters: blocking must look like nonexistence.
+
+    A blocked peer's message is refused at the gate and recorded locally, but no notice is
+    deposited back — a notice would confirm the identity is recognised and gated, and would
+    distinguish blocked from never-seen (the same uniform-refusal reasoning as the #42 denial).
+    """
+    hub, bridges, root = deployment
+    carl, muse = bridges["carl"], bridges["muse"]
+
+    rewrite(root, "muse", block=[f"carl@{DOMAIN}"])
+    apply_policy(muse, policy_path(root, "muse"))
+
+    send(carl, muse.identity.agent_id, "are you there?", message_id="m-blocked")
+    refused = muse.poll_once()
+    assert refused["refused"] == 1, "the gate must refuse a blocked sender"
+    assert muse.queue.get() is None, "and nothing reaches the application"
+
+    # No notice is deposited back: the blocked peer sees nothing.
+    assert carl.client.fetch()["messages"] == [], "a blocked peer must get silence"
+    assert carl.poll_once()["notices"] == 0, "no notice is handled for a blocked peer"
+    assert notices_of(root, "carl") == [], "no notice recorded for a blocked peer"
+
+    # But the refusal is still recorded locally for the operator.
+    record = json.loads(
+        (root / "agents" / "muse" / "refused.jsonl").read_text().splitlines()[0]
+    )
+    assert record["messageId"] == "m-blocked"
+    assert record["rule"] == "blocked"
+    assert record["from"] == f"carl@{DOMAIN}"
 
 
 def test_a_notice_is_not_a_message_in_a_thread(deployment):
@@ -84,7 +120,7 @@ def test_a_notice_is_not_a_message_in_a_thread(deployment):
     hub, bridges, root = deployment
     carl, muse = bridges["carl"], bridges["muse"]
 
-    rewrite(root, "muse", block=[f"carl@{DOMAIN}"])
+    rewrite(root, "muse", block=[], allow=[])
     apply_policy(muse, policy_path(root, "muse"))
     send(carl, muse.identity.agent_id, "one", context="c-quiet", message_id="m-quiet")
     muse.poll_once()
@@ -106,7 +142,7 @@ def test_the_refusal_is_recorded_locally_even_if_the_notice_fails(deployment):
     hub, bridges, root = deployment
     carl, muse = bridges["carl"], bridges["muse"]
 
-    rewrite(root, "muse", block=[f"carl@{DOMAIN}"])
+    rewrite(root, "muse", block=[], allow=[])
     apply_policy(muse, policy_path(root, "muse"))
 
     # A hub that refuses every deposit: the notice cannot be sent.
@@ -124,7 +160,7 @@ def test_the_refusal_is_recorded_locally_even_if_the_notice_fails(deployment):
         (root / "agents" / "muse" / "refused.jsonl").read_text().splitlines()[0]
     )
     assert record["messageId"] == "m-void"
-    assert record["rule"] == "blocked"
+    assert record["rule"] == "policy"
     assert record["from"] == f"carl@{DOMAIN}"
 
 

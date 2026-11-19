@@ -28,7 +28,9 @@ class Decision:
     ``reason`` is the only thing that may ever reach a stranger, and it is the same string for
     every refusal, so the answer cannot be used as a directory oracle. ``rule`` is the internal
     category (#50): it never leaves this process on the 403 path, and it is only ever quoted in a
-    notice to a sender whose key the operator has already pinned in this agent's registry.
+    notice to a sender whose key the operator has already pinned in this agent's registry — except
+    ``blocked``, which is never quoted anywhere, because a blocked sender gets no notice at all:
+    blocking must look like nonexistence.
     Refusals that name a rule: ``blocked``, ``policy``, ``limits``, ``thread``, ``malformed``.
     """
 

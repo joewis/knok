@@ -361,6 +361,12 @@ class Bridge:
             },
             level="error",
         )
+        # A blocked peer is exempt from the notice: blocking must look like nonexistence, so a
+        # notice would confirm the identity is recognised and gated, and would distinguish blocked
+        # from never-seen (the same uniform-refusal reasoning as the #42 denial). The local record
+        # above is the only trace a blocked refusal leaves.
+        if decision.rule == "blocked":
+            return
         self._send_refusal_notice(sender, message_id, context, decision.rule, moment)
 
     def _send_refusal_notice(
@@ -372,6 +378,8 @@ class Bridge:
         registry — a stranger never gets this far, because ``_handle`` cannot verify its signature
         and leaves the envelope at the hub. Telling a known correspondent that its own message
         failed leaks nothing about anyone else; the uniform 403 for strangers is untouched.
+        Blocked senders never reach this method: ``_refuse`` exempts them, so blocking looks like
+        nonexistence.
 
         The notice is an ordinary form-1 envelope carrying ``message.metadata["knok.notice"]``
         rather than a new ``kind``: A2A fixes ``Message.kind`` to ``"message"`` and ``metadata`` is
