@@ -21,8 +21,26 @@ expected observation; "it felt fine" is not a result.
 Six directed pairs, three harnesses. Each scenario is run by one agent against another, recorded as
 observed-vs-expected, and any deviation becomes an issue with a reproduction.
 
+## How an expected observation must be written
+
+Four failure modes make a scenario decorative; every scenario here is written to avoid them:
+
+- **No negative control.** "The reply arrives" also passes a silent drop followed by a harness retry
+  (#48, both halves). Every delivery scenario carries a paired negative in which the sender observes
+  a *failure*, and the harness must be able to tell "not yet" from "never".
+- **Thread and identity continuity unasserted.** "The reply arrives" says nothing about *which*
+  thread. A retry that mints a fresh `contextId` (`cli.py:64`) or a second message at the default
+  `seq 0` (`cli.py:139`) is a different message on the wire. Assert the pair `(contextId, seq)`.
+- **Timing folded into correctness.** "Delivered within N seconds" hides ordering and duplication.
+  At-least-once with dedupe means a correct sender occasionally delivers twice; the assertion is
+  "same `messageId`, once at the agent", not "no duplicates ever".
+- **Harness behaviour mistaken for product behaviour.** Three harnesses and prose expectations get
+  graded against each runner's intuition. Where two agents run the same scenario the expected
+  observation is identical text; any divergence is a per-harness annotation, never a quiet edit.
+
 1. **Delivery and dedupe** — same `messageId` twice; a replayed envelope; a message sent while the
-   recipient's bridge is stopped, then started.
+   recipient's bridge is stopped, then started. The assertion is "same `messageId`, once at the
+   agent" for the hub's re-offer, and a replayed envelope must not produce a second delivery.
 2. **Durability** — hub restart mid-flight; bridge restart with unacked mail; adapter restart with a
    staged envelope. Nothing acked may be lost; nothing lost may be acked. (Muse's adapter: a staged
    envelope does survive a restart — staging lives in home and the hook re-offers it after a 15-minute
@@ -36,17 +54,86 @@ observed-vs-expected, and any deviation becomes an issue with a reproduction.
    registry fresh on every call, and `recv` applies no gate at all — queued mail from a since-revoked
    contact still prints. Test both: the daemon's stale-policy drop, and the recv path's no-gate
    print.)
+
+   Expected observation for the daemon half: after `policy.json` changes on disk, the *next* message
+   from a peer the new policy disallows is refused **without a restart**, and the sender learns of it
+   (scenario 9). A run that passes only because the bridge was restarted is a fail: measure the
+   daemon's staleness with a clock, not with a restart.
 4. **Silence versus failure** — every refusal must be distinguishable, by the sender, from delivery.
    The §9 uniform refusal protects strangers from learning about existence; it must not prevent a
-   known correspondent from learning their own message failed.
+   known correspondent from learning their own message failed, and §5's exemption for a
+   signature-verified correspondent is the rule the code must implement.
+
+   **Expected observation.** Send from an accepted contact. At the recipient, make the gate refuse —
+   `policy.block`, then `not allow` and not accepted, then rate-limit. Expected: a signed
+   `{"kind":"refused","messageId":…,"contextId":…,"rule":"…"}` frame reaches the sender's bridge and
+   is appended to `notices.jsonl`, **or** an issue is filed with that exact repro and the scenario
+   fails. "Delivered" is not an acceptable observation.
+
+   **Paired negative, in the same run.** The same probe from an unregistered stranger must produce the
+   uniform 403 and no frame, and the sender must not be able to distinguish blocked from nonexistent.
+   Both directions are one scenario on purpose: a fix for one that breaks the other is exactly the
+   regression the pair exists to catch. Note that `429 over-capacity` already carries its own body and
+   `Retry-After`, so "refusal is uniform" is false on the wire today — this scenario asserts it
+   rather than assuming it.
 5. **Approval flow** — #42's `held → approved → accepted`, driven by a real third party rather than a
    fixture: an agent the owner has not approved must not become a contact.
-6. **Turn-taking and threads** — overlapping threads, `expectsReply` counters, `closesThread`,
-   and the retry-continuity question #48 raises.
+6. **Turn-taking and threads** — overlapping threads, `expectsReply` counters, `closesThread`, and
+   the retry-continuity question #48 raises: a retry re-uses the attempt's `contextId` **and** its
+   `seq`, so the peer sees one message, not two.
 7. **Limits and backpressure** — hit the per-sender and per-hub rates deliberately; confirm the
    refusal is uniform, prompt, and does not consume the sender's budget.
 8. **Cross-harness** — the same conversation from Hermes, Hatch and OpenClaw. Assumptions that
    survive two implementations tend to break on the third.
+
+### Added by review — five, all owners named
+
+9. **Gate-refusal notice** (the #4 fix, as a scenario) — scenario 4's expected observation, run and
+   recorded. Owner: bridge/Carl. It blocks the silent-drop exit criterion rather than sitting inside
+   it: today `bridge._handle` (`bridge.py:287-291`) logs the refusal and acks the envelope anyway,
+   `hub.ack` (`hub.py:826-846`) deletes it, and `knok send` has already exited 0 (`cli.py:79-82`), so
+   the sender is told nothing, forever. Tracked as #50.
+10. **Stale policy, measured** — `Bridge.__init__` loads the policy once (`bridge.py:177`) and nothing
+    in `src/knok/` reloads it or checks its mtime, while `provision.py:91-112` rewrites `policy.json`
+    under a running daemon. An operator who removes a peer mid-run writes a file the bridge never
+    reads again and that peer keeps delivering until restart. Expected observation: after the file
+    changes, the next message from a now-disallowed peer is refused, and the change is visible
+    without a restart, or an issue is filed. Clock, not restart. Owner: bridge/Carl. Tracked as #52.
+11. **`recv` applies no gate** — `recv_once` (`recv.py:56-78`) fetches, prints and acks with no
+    `Gate.decide` in the path, so revocation and blocking are enforced at deposit only and a blocked
+    sender's queued mail still reaches stdout. That is a §9 claim violated, not a harness detail:
+    expected observation is that blocked mail does not print; if it does, it is a defect against
+    `recv` (with a written accepted-risk note if the owner accepts it), never a passing test.
+    Owner: recv/Muse. Tracked as #51.
+12. **Cross-harness parity, per scenario, as a table** — the table below. The point is not agreement;
+    it is that every disagreement is written down and attributed, so it cannot evaporate. Kiko owns
+    the OpenClaw-B column and drafts the table; Sunny owns hers.
+13. **Hub down at send, as a distinct failure** — `knok send` exits 3 when the hub is unreachable and
+    2 on refusal (`cli.py:93-99`), and both are deposit signals, not delivery signals. Scenario: hub
+    unreachable, `send` exits 3, then the hub returns. Expected: nothing was delivered, and the
+    harness's staging layer re-offers with the *same* ids. `send` exiting 3 with no retry is a silent
+    drop by the caller; the scenario states which side is responsible, or its pass is luck.
+
+## Parity table
+
+Filled in as scenarios are run. An empty cell means *not run* — never "passed". Where two agents run
+the same scenario the expected-observation text is identical; a divergence is annotated per harness.
+
+| # | Expected, one line | Hermes | Hatch | OpenClaw-A (Sunny) | OpenClaw-B (Kiko) | Verdict |
+|---|---|---|---|---|---|---|
+| 1 | same `messageId`, once at the agent; replay not re-delivered | | | | | |
+| 2 | nothing acked is lost; nothing lost is acked, incl. the recv ack-before-stage window | | | | | |
+| 3 | policy change takes effect without a restart | | | | | |
+| 4 | gate refusal reaches the sender as a signed frame; stranger sees the uniform 403 | | | | | |
+| 5 | an unapproved agent never becomes a contact | | | | | |
+| 6 | retry keeps `(contextId, seq)` | | | | | |
+| 7 | refusal uniform, prompt, does not consume budget | | | | | |
+| 8 | same conversation across three harnesses | | | | | |
+| 9 | signed `refused` frame in `notices.jsonl` | | | | | |
+| 10 | revocation visible on the next message, clock only | | | | | |
+| 11 | blocked mail never reaches `recv` stdout | | | | | |
+| 12 | this table | | | | | |
+| 13 | exit 3 delivers nothing; retry re-offers the same ids | | | | | |
 
 ## Roles
 
@@ -66,9 +153,20 @@ silently.
 ## Exit criteria
 
 - Every scenario above has an observed result written down, including the ones that passed.
+- No scenario is recorded as a pass on a requirement that states no observation. A requirement the
+  code does not meet fails its scenario and becomes an issue; a checkmark is not a result.
 - Zero open **silent-drop** classes: no path where a message is discarded and the sender is not told.
 - Every defect found has either a merged fix or an issue with an accepted-risk note.
 - A written record exists of what was *not* tested, so the gap is visible rather than implied.
+
+## What is not tested
+
+Kept visible rather than implied, and updated as the phase runs. As of this amendment:
+
+- **Sealed traffic end to end.** §6's gap-release and late-arrival notices, §8 sealing and `RESEND`
+  are not exercised by any scenario above, and the hub's opaque-blob behaviour is where the ordering
+  guarantees actually live. Either a scenario covers it before Sunday, or the review is assessing a
+  spec whose most delicate section has no evidence behind it — and the review document says so.
 
 ## The security review — Sunday 22 November
 
@@ -104,8 +202,13 @@ default stands.
    the same model that wrote the code — shared blind spots are the risk. If no other frontier model
    can run Sunday, a fresh Muse with no repo history is the fallback, with that limit declared in
    the review document.)
+   Order: the review runs **before** the §11(b) abuse-runbook exercise — two gates, one after the
+   other, both before launch, never in parallel — because a runbook exercised once and graded by the
+   people who wrote the spray detection inherits their blind spots.
 2. **Where it lives.** Default: nothing leaves the tailnet during testing. The domain and VPS
    decision waits until the review closes, so a launch decision is not made twice.
 3. **Push presence.** Default: Phase 4. Polling is correct and the long-poll is not built (§7).
-4. **Testing scope.** Default: the eight scenarios above, not an open-ended soak. Adding a scenario
-   is one line in this file and a message; removing one needs a reason recorded here.
+4. **Testing scope.** Default: the eight scenarios above plus the four added here (9, 10, 11, 13) and
+   the parity table (12) — not an open-ended soak. Adding a scenario is one line in this file and a
+   message; removing one needs a reason recorded here. The "what is not tested" record names sealed
+   traffic end to end.
