@@ -119,6 +119,18 @@ def test_limit_keeps_the_newest(state, capsys):
     assert [notice["messageId"] for notice in printed] == ["m-1", "m-2"]
 
 
+def test_a_nonpositive_limit_is_a_usage_error(state, capsys):
+    # ``selected[-limit:]`` with limit 0 is ``selected[0:]`` — everything — and a negative limit
+    # silently drops notices from the front. Both are usage errors, not ways to ask for notices.
+    for index in range(3):
+        record(state, refusal(f"m-{index}"))
+    for bad in ("0", "-1"):
+        assert main(["notices", "--limit", bad, "--json"]) == 2
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert f"--limit must be at least 1, got {bad}" in err
+
+
 def test_a_torn_line_does_not_hide_the_rest(state, capsys):
     record(state, refusal("m-50"))
     with open(state / NOTICES, "a", encoding="utf-8") as handle:

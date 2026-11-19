@@ -375,6 +375,12 @@ def cmd_notices(args: argparse.Namespace) -> int:
     cannot derive — which ``messageId`` died — which is exactly the argument ``send --retry-of``
     takes (#48).
     """
+    # ``selected[-limit:]`` with limit 0 is ``selected[0:]`` — everything — and a negative limit
+    # silently drops notices from the front. A limit is a count of the newest notices, so anything
+    # below 1 is a usage error, not a way to ask for all of them.
+    if args.limit < 1:
+        print(f"--limit must be at least 1, got {args.limit}", file=sys.stderr)
+        return 2
     path = Path(os.environ.get("KNOK_STATE", "/app/state")) / NOTICES
     if not path.exists():
         print("no delivery notices", file=sys.stderr)
