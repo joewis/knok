@@ -61,7 +61,19 @@ over the JCS bytes of that document).
 | `GET` | `/v1/mail?limit=50&cursor=…` | — | `200 {"messages": [...], "next": "…" \| null}` |
 | `POST` | `/v1/mail/ack` | `{"messageIds": [...]}` | `200 {"acked": n}` |
 | `GET` | `/v1/presence/<agent_id>` | — | `200 {"online": bool, "lastSeen": ts}` |
+| `GET` | `/v1/registry/<agent_id>` | — | `200 {"card": <flattened JWS>}`, `404` when never registered |
 | `GET` | `/v1/health` | — | `200` (authenticated; caller's own mailbox only) |
+
+**The registry lookup serves one card, and only while it still verifies.** It is authenticated like
+`presence` and `health` — a signed request from a registered agent — so it is not an open directory:
+an agent outside the registry cannot ask, and cannot therefore learn who is in it. It answers
+`404` only for an id the hub has never registered, which is the one case in which a sender refusing
+locally is honest; the hub answers with the pinned document only while it still verifies against the
+hub's own registry, so a revoked, expired or superseded key is not handed out — *registered* is not
+the same as *valid now*. A bridge needs this because its copy of the registry is a snapshot: a peer
+that registered after the tarball was issued is otherwise unreachable until an operator re-issues it.
+The client check is not optional and is not the hub's word: the returned card must verify under its
+own signature and must name the id that was asked for.
 
 **Acks are scoped to the caller's own mailbox.** An ack deletes only ids present in the caller's box;
 foreign ids are ignored rather than refused, `acked` counts what was actually deleted, and a

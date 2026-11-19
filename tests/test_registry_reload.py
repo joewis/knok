@@ -22,7 +22,7 @@ from knok.bridge import Bridge, BridgeState, load_cards
 from knok.envelope import sign
 from knok.hub import Hub
 from knok.hubclient import HubClient
-from knok.identity import b64url_decode, fingerprint, public_key_from_b64
+from knok.identity import b64url, b64url_decode, fingerprint, public_key_from_b64
 from knok.provision import load_key, provision
 
 from test_phase2 import DOMAIN, iso, now
@@ -167,9 +167,10 @@ def test_a_corrupt_card_narrows_the_registry_instead_of_emptying_it(late_registr
     assert others
 
     # Carl's file is replaced by a document that parses but is not a card: no ``bridge.publicKey``,
-    # so ``card_body`` refuses it. (A half-written file is the other shape of the same edit — that
-    # one fails at ``json.loads`` and is dropped a line earlier — so this exercises the check the
-    # trust anchor actually makes, not the JSON reader.)
+    # so ``card_body`` refuses it at the presence check — before ``verify_card`` is ever reached.
+    # (A half-written file is the other shape of the same edit — that one fails at ``json.loads``
+    # and is dropped a line earlier.) The signature check itself is exercised by the tampered-card
+    # test below; this one is about a narrowing, not about verification.
     (cards_dir / f"{victim}.json").write_text(
         json.dumps({"protected": "eyJhbGciOiJFZERTQSJ9", "payload": "e30", "signature": "AAAA"})
     )
@@ -177,6 +178,33 @@ def test_a_corrupt_card_narrows_the_registry_instead_of_emptying_it(late_registr
     assert muse.reload_registry_if_changed() is True
     assert victim not in muse.state.registry, "a card that no longer verifies must stop being trusted"
     assert set(muse.state.registry) == others, "one broken card must not cost the others"
+
+
+def test_a_tampered_card_is_not_adopted(late_registry):
+    """A card that parses and carries a key, but whose signature no longer verifies, is not a card.
+
+    The corrupt-card test above stops at the missing ``bridge.publicKey``. The dangerous edit
+    keeps valid JSON and a present key and breaks only the signature — bobby's freshly issued
+    card, re-addressed to a new id, with carl's key substituted into the payload under bobby's
+    original signature. If the reload trusts decoded payloads instead of ``verify_card``'s
+    verdict, that file pins carl's key as the new peer's, and every later message "from" that
+    name verifies against a key the operator never granted it.
+    """
+    hub, bridges, root, cards_dir, late_text, bobby = late_registry
+    muse = bridges[OBSERVER]
+    before = dict(muse.state.registry)
+
+    document = json.loads(late_text)
+    body = json.loads(b64url_decode(document["payload"]))
+    body["bridge"]["publicKey"] = muse.state.registry[f"carl@{DOMAIN}"]["bridge"]["publicKey"]
+    document["payload"] = b64url(json.dumps(body).encode())
+    forged = f"mallory@{DOMAIN}"
+    (cards_dir / f"{forged}.json").write_text(json.dumps(document))
+    assert muse.reload_registry_if_changed() is False, "a swap must not happen for a failed card"
+    assert muse.state.registry == before, "the registry in force must be kept"
+    assert forged not in muse.state.registry
+    assert muse.public_key_of(forged) is None
+    assert forged not in load_cards(cards_dir), "a full load drops it too, not just the reload"
 
 
 def test_an_empty_registry_directory_is_refused(late_registry):

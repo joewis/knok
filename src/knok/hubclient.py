@@ -164,6 +164,26 @@ class HubClient:
     def presence(self, agent_id: str) -> dict[str, Any]:
         return self._signed_json("GET", "/v1/presence/" + urllib.parse.quote(agent_id, safe=""))
 
+    def card(self, agent_id: str) -> dict[str, Any] | None:
+        """The hub's pinned card document for ``agent_id``, or None when it does not know the id.
+
+        Signed like every other call, so the hub will only answer an agent it has registered — this
+        is not an open directory (`#57`). ``None`` means the hub has never registered that id, which
+        is the one case in which refusing to send is honest.
+        """
+        try:
+            payload = self._signed_json(
+                "GET", "/v1/registry/" + urllib.parse.quote(agent_id, safe="")
+            )
+        except HubRefused as exc:
+            if exc.status == 404:
+                return None
+            raise
+        if not isinstance(payload, dict):
+            return None
+        document = payload.get("card")
+        return document if isinstance(document, dict) else None
+
     def health(self) -> dict[str, Any]:
         status, raw = self._request("GET", "/v1/health")
         if status >= 400:
