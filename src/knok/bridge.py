@@ -102,7 +102,15 @@ def load_cards(directory: str | Path) -> dict[str, dict[str, Any]]:
 
 
 def card_body(document: Any) -> dict[str, Any] | None:
-    """Decode and self-verify a flattened JWS card. None when it does not verify."""
+    """Decode and self-verify a flattened JWS card. None when it does not verify.
+
+    ``None`` is the only answer for anything that is not a card this process may trust, and there
+    are more ways to fail that test than a bad signature: a body that will not decode, a public key
+    that will not parse, and a signature that does not verify all mean the same thing to the caller,
+    whose only use for the body is as a pinned key. Nothing in here raises on bad input —
+    ``load_cards`` runs it over a whole directory, and one unreadable file must not take the trust
+    anchor, and with it the bridge, down.
+    """
     if not isinstance(document, dict) or "payload" not in document:
         return None
     try:
@@ -113,13 +121,25 @@ def card_body(document: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(body, dict):
         return None
-    public_key = body.get("bridge", {}).get("publicKey")
+    bridge = body.get("bridge")
+    public_key = bridge.get("publicKey") if isinstance(bridge, dict) else None
     if not isinstance(public_key, str):
         return None
-    registry = {fingerprint_key(public_key): public_key}
     try:
-        verify_card(document, registry)
+        registry = {fingerprint_key(public_key): public_key}
     except Exception:
+        # Fingerprinting the key is what has to succeed before ``verify_card`` can be asked, and it
+        # raises on a key that is not a key. That is the same answer, and it is logged because a
+        # silent drop in the trust anchor is how the bug below survived for as long as it did.
+        log.warning("registry: card carries a public key that is not a key: %r", public_key[:64])
+        return None
+    ok, reason = verify_card(document, registry)
+    if not ok:
+        # ``verify_card`` *returns* its verdict; it does not raise on a bad signature, and never
+        # did. Discarding that verdict — a bare call inside a ``try`` — accepted every document
+        # whose payload merely decoded, so a mangled signature or a swapped body still became a
+        # pinned key (#59). The docstring above has always promised this check; this is it.
+        log.warning("registry: card does not verify: %s", reason)
         return None
     return body
 
