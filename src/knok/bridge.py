@@ -23,8 +23,9 @@ import logging
 import os
 import random
 import time
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,7 @@ from . import identity as identity_mod
 from . import policy as policy_mod
 from .agentcard import verify_card
 from .contacts import Contacts
-from .envelope import verify_envelope
+from .envelope import sign, verify_envelope
 from .gate import Gate, Threads
 from .hub import verify_frame
 from .hubclient import HubClient, HubError, HubRefused
@@ -47,6 +48,19 @@ DEFAULT_POLL_SECONDS = 2.0
 #: Without a bound, a single unverifiable envelope sits at the head of the mailbox forever and the
 #: mail behind it is never reached — the hub's 72-hour expiry is the backstop, not the mechanism.
 MAX_HANDLE_ATTEMPTS = 5
+#: How many refusal notices one sender may land in our ``notices.jsonl`` per hour. A notice is
+#: handled before the gate (it *is* a gate answer), so it is not rate-limited by §9's message
+#: counters; without a bound of its own a pinned correspondent could grow our log without limit.
+MAX_REFUSAL_NOTICES_PER_HOUR = 100
+#: The metadata key a refusal notice travels under. A2A fixes ``Message.kind`` to ``"message"``
+#: and ``metadata`` is the one place it defines for extensions, so the notice rides there rather
+#: than inventing a kind the validator (rightly) rejects.
+NOTICE_KEY = "knok.notice"
+
+
+def iso(moment: datetime) -> str:
+    """The one timestamp format the wire and the logs both use."""
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def item_key(item: Any) -> str:
@@ -377,12 +391,19 @@ class Bridge:
             log.warning("refused an unverifiable envelope from %s: %s", sender, reason)
             return "unhandled", None
 
+        # A peer's answer to our own mailbox is not mail for the agent: it is a statement about a
+        # message we sent, and it is handled here so it can never enter a thread or a gate decision.
+        notice = (item["message"].get("metadata") or {}).get(NOTICE_KEY)
+        if notice is not None:
+            return self._handle_refusal_notice(item, sender, notice)
+
         decision = self.gate.decide(item)
         message_id = item["message"]["messageId"]
         if not decision.allowed:
             # Recorded as handled: the hub must stop offering it, or a 50-message page that is all
             # refusals never advances (HUB.md, "ack means handled").
             log.info("gate refused %s from %s: %s", message_id, sender, decision.reason)
+            self._refuse(item, decision, message_id)
             return "refused", message_id
 
         result = self.queue.put(item)
@@ -406,6 +427,146 @@ class Bridge:
         )
         self._record_notice(frame)
         return "notices", message_id if isinstance(message_id, str) else None
+
+    # -- refusals: tell the sender, don't just ack the hub (#50) -----------
+
+    def _refuse(self, item: dict[str, Any], decision, message_id: str) -> None:
+        """Record a refusal locally, then answer the sender.
+
+        The hub treats a refusal exactly like a delivery: our ack deletes the only copy, and the
+        sender's ``knok send`` exited 0 long before this moment. So the fact that the message died
+        has to be written down here and sent back here, or it is lost with the envelope.
+
+        The local record comes first: if the notice cannot be deposited (peer mailbox full, hub
+        down), the operator still has evidence of what was refused and under which rule.
+        """
+        sender = item.get("from")
+        if not isinstance(sender, str):
+            return
+        context = (item.get("message") or {}).get("contextId")
+        moment = datetime.now(timezone.utc)
+        self._append_line(
+            "refused.jsonl",
+            {
+                "at": iso(moment),
+                "messageId": message_id,
+                "contextId": context,
+                "from": sender,
+                "rule": decision.rule,
+            },
+            level="error",
+        )
+        # A blocked peer is exempt from the notice: blocking must look like nonexistence, so a
+        # notice would confirm the identity is recognised and gated, and would distinguish blocked
+        # from never-seen (the same uniform-refusal reasoning as the #42 denial). The local record
+        # above is the only trace a blocked refusal leaves.
+        if decision.rule == "blocked":
+            return
+        self._send_refusal_notice(sender, message_id, context, decision.rule, moment)
+
+    def _send_refusal_notice(
+        self, sender: str, message_id: str, context: str | None, rule: str, moment: datetime
+    ) -> bool:
+        """Deposit a signed notice to the sender of a message this bridge refused.
+
+        Only ever addressed to a sender whose key the operator has already pinned in this agent's
+        registry — a stranger never gets this far, because ``_handle`` cannot verify its signature
+        and leaves the envelope at the hub. Telling a known correspondent that its own message
+        failed leaks nothing about anyone else; the uniform 403 for strangers is untouched.
+        Blocked senders never reach this method: ``_refuse`` exempts them, so blocking looks like
+        nonexistence.
+
+        The notice is an ordinary form-1 envelope carrying ``message.metadata["knok.notice"]``
+        rather than a new ``kind``: A2A fixes ``Message.kind`` to ``"message"`` and ``metadata`` is
+        the extension point it defines, so a validator on the far side keeps working unchanged.
+        """
+        notice: dict[str, Any] = {"kind": "refused", "messageId": message_id, "rule": rule}
+        if isinstance(context, str) and context:
+            notice["contextId"] = context
+        unsigned: dict[str, Any] = {
+            "envelopeVersion": 1,
+            "seq": 0,
+            # A fresh context: a notice is about a message, it is not a reply in its thread. Putting
+            # it in the refused message's context would spend a reply expectation and could close it.
+            "message": {
+                "kind": "message",
+                "messageId": f"r-{uuid.uuid4().hex}",
+                "contextId": f"c-notice-{uuid.uuid4().hex}",
+                "role": "agent",
+                "parts": [
+                    {"kind": "text", "text": f"knok: {rule} refused {message_id} before delivery"}
+                ],
+                "metadata": {NOTICE_KEY: notice},
+            },
+            "from": self.identity.agent_id,
+            "to": [sender],
+            "sentAt": iso(moment),
+            "expiresAt": iso(moment + timedelta(hours=24)),
+            "turn": {"expectsReply": False, "closesThread": False},
+        }
+        try:
+            self.client.deposit(sign(unsigned, self.identity))
+            return True
+        except HubError as exc:
+            # Not fatal and not retried here: the refusal already has a durable local record, and
+            # retrying inside the poll would let one unreachable peer stall every other message.
+            log.error("could not tell %s that %s was refused: %s", sender, message_id, exc)
+            return False
+
+    def _handle_refusal_notice(self, item: dict[str, Any], sender: str, notice: Any):
+        """Record a peer's refusal of one of our messages, then let the hub drop it.
+
+        This is the receiving half of #50: the sender learns, in its own ``notices.jsonl``, that
+        its message was refused and under which rule — instead of waiting forever for a reply that
+        cannot come.
+        """
+        message_id = item["message"]["messageId"]
+        moment = datetime.now(timezone.utc)
+        if not isinstance(notice, dict) or not isinstance(notice.get("messageId"), str):
+            log.warning("ignoring a malformed refusal notice from %s", sender)
+            return "refused", message_id
+        if (
+            self.rates.count("notice", sender, moment, timedelta(hours=1))
+            >= MAX_REFUSAL_NOTICES_PER_HOUR
+        ):
+            # A pinned peer can still flood us: a notice is handled before the gate, so §9's
+            # message counters never see it. Bound our own log rather than the sender's mailbox.
+            log.error("too many refusal notices from %s; not recording %s", sender, message_id)
+            return "refused", message_id
+        frame = {
+            "kind": "refused",
+            "from": sender,
+            "receivedAt": iso(moment),
+            "messageId": notice["messageId"],
+            "contextId": notice.get("contextId"),
+            "rule": notice.get("rule"),
+        }
+        log.warning(
+            "%s refused our message %s at its gate (%s)",
+            sender,
+            notice["messageId"],
+            notice.get("rule"),
+        )
+        if not self._record_notice(frame):
+            # The notice is the only evidence the message died. Without it on disk, leave the frame
+            # at the hub and let the bounded attempt counter decide, rather than ack it away.
+            return "unhandled", None
+        self.rates.hit("notice", sender, moment, timedelta(hours=1))
+        return "notices", message_id
+
+    def _append_line(self, name: str, record: dict[str, Any], *, level: str = "warning") -> bool:
+        """Append one fsynced JSON line to a state file. False (and logged) when it cannot be written."""
+        path = self.state.directory / name
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return True
+        except OSError as exc:
+            log.log(getattr(logging, level.upper(), logging.WARNING),
+                    "could not write %s: %s", name, exc)
+            return False
 
     def _record_drop(self, item: Any, key: str) -> bool:
         """Write the drop record. False when it could not be written, so the caller does not ack.
