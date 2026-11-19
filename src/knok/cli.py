@@ -23,10 +23,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .agentcard import verify_card
 from .bridge import BridgeState, fingerprint_key, load_cards
 from .envelope import sign
 from .hubclient import HubClient, HubError, HubRefused
-from .identity import load as load_identity
+from .identity import b64url_decode, load as load_identity
 from .recv import recv_once
 
 
@@ -52,11 +53,84 @@ def _state_from_env() -> tuple[BridgeState, Any]:
     return BridgeState(agent_id=agent_id, directory=directory, hub_url=hub_url, registry=cards), identity
 
 
+def _verified_card(document: Any, agent_id: str) -> tuple[dict[str, Any] | None, str]:
+    """The card body, but only if its own signature verifies *and* it names ``agent_id``.
+
+    Deliberately not ``card_body``: that helper calls ``verify_card`` and discards the answer, so it
+    returns a tampered card as readily as a good one (#59). This is the one path where a card
+    arrives from off-host, so it reads the result.
+    """
+    if not isinstance(document, dict):
+        return None, "not a card"
+    try:
+        body = json.loads(b64url_decode(document.get("payload") or ""))
+    except Exception:
+        return None, "payload does not decode"
+    if not isinstance(body, dict):
+        return None, "payload is not an object"
+    public_key = (body.get("bridge") or {}).get("publicKey")
+    if not isinstance(public_key, str):
+        return None, "no public key in the card"
+    ok, reason = verify_card(document, {fingerprint_key(public_key): public_key})
+    if not ok:
+        return None, reason
+    # §12's public id is ``name@hub-domain``, and that is what the card has to spell out: a card is
+    # bound to an id by its own body, not by the name it was fetched under.
+    bridge = body.get("bridge") or {}
+    name, hub_domain = body.get("name"), bridge.get("hub")
+    claimed = (
+        f"{name}@{hub_domain}" if isinstance(name, str) and isinstance(hub_domain, str) else None
+    )
+    if claimed != agent_id:
+        return None, f"it is the card for {claimed or 'an unnamed agent'}"
+    return body, ""
+
+
+def _learn_card(state: BridgeState, identity, agent_id: str) -> None:
+    """Ask the hub for a card this registry predates, and pin it for this process (#57).
+
+    The local registry is a snapshot unpacked from ``registry.tgz``; the hub is the namespace
+    authority (§4) and holds the live one. Refusing locally meant a newly registered agent was
+    unreachable — *and* unverifiable — until an operator re-issued the tarball by hand, while the
+    hub had the card all along.
+
+    Two things this deliberately does not do:
+
+    * It does not trust the document because the hub sent it. The card is fetched over the same
+      channel as everything else and must still pass its own signature check (``_verified_card``),
+      and the body it decodes must name the id we asked for. Over a loopback or tailnet hop that is
+      a meaningful check against a mangled answer and a meaningless one against a hostile hub — §4's
+      answer to that is TLS plus a pinned hub key, which is not built yet, so this is exactly as
+      strong as the channel. Written down here rather than implied.
+    * It does not persist. The pin lasts for this invocation; the next ``send`` asks again. Making
+      the registry self-updating is a cache with an eviction question (#54 covers the bridge side),
+      and a stale cache is the bug this fixes.
+    """
+    try:
+        document = HubClient(state.hub_url, identity).card(agent_id)
+    except HubError as exc:
+        raise SystemExit(f"cannot reach the hub to look up {agent_id}: {exc}")
+    if document is None:
+        raise SystemExit(
+            f"{agent_id} is not registered with the hub; refusing to send into the void"
+        )
+    body, why = _verified_card(document, agent_id)
+    if body is None:
+        raise SystemExit(
+            f"the hub sent a card for {agent_id} that cannot be trusted ({why}); refusing"
+        )
+    state.registry[agent_id] = body
+    print(
+        f"{agent_id} was not in the local registry; learned its card from the hub",
+        file=sys.stderr,
+    )
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     state, identity = _state_from_env()
     recipient = args.to
     if recipient not in state.registry:
-        raise SystemExit(f"{recipient} is not in the registry; refusing to send into the void")
+        _learn_card(state, identity, recipient)
 
     moment = datetime.now(timezone.utc)
     message_id = args.message_id or f"m-{uuid.uuid4().hex}"
