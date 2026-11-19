@@ -30,6 +30,7 @@ def test_unknown_peer_is_none(contacts):
 
 def test_request_accept_flow(contacts):
     assert contacts.request(PEER, "hello", T0) == "requested"
+    contacts.approve(PEER, "owner", now=T0)
     contacts.accept(PEER, T0)
     assert contacts.state(PEER, T0) == "accepted"
     assert contacts.accepted() == {PEER}
@@ -80,12 +81,14 @@ def test_request_text_is_capped(contacts):
 
 def test_accept_without_request_is_an_error(contacts):
     with pytest.raises(ContactError):
+        contacts.approve(PEER, "owner", now=T0)
         contacts.accept(PEER, T0)
 
 
 def test_accepted_contact_is_withdrawn_by_revoke_not_refusal(contacts):
     # §9's diagram has no accepted -> refused edge; withdrawing an accepted contact is a local act.
     contacts.request(PEER, "", T0)
+    contacts.approve(PEER, "owner", now=T0)
     contacts.accept(PEER, T0)
     contacts.revoke(PEER, T0)
     assert contacts.state(PEER, T0) == "none"
@@ -96,6 +99,7 @@ def test_state_survives_restart(tmp_path):
     path = tmp_path / "contacts.db"
     with Contacts(path) as store:
         store.request(PEER, "", T0)
+        store.approve(PEER, "owner", now=T0)
         store.accept(PEER, T0)
     with Contacts(path) as store:
         assert store.state(PEER, T0) == "accepted"
@@ -119,6 +123,7 @@ def test_cooldown_is_a_rolling_window_not_a_lifetime_quota(contacts):
 
 def test_refuse_requires_a_live_request(contacts):
     contacts.request(PEER, "", T0)
+    contacts.approve(PEER, "owner", now=T0)
     contacts.accept(PEER, T0)
     with pytest.raises(ContactError, match="no live request"):
         contacts.refuse(PEER, T0)
@@ -126,6 +131,7 @@ def test_refuse_requires_a_live_request(contacts):
 
 def test_revoke_removes_an_accepted_contact(contacts):
     contacts.request(PEER, "", T0)
+    contacts.approve(PEER, "owner", now=T0)
     contacts.accept(PEER, T0)
     contacts.revoke(PEER, T0)
     assert contacts.state(PEER, T0) == "none"

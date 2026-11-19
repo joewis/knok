@@ -470,6 +470,25 @@ characters); acceptance is a `Message` in reply; refusal is silence or a `Messag
 `open` mode on a public hub; a private hub or a local pair MAY allow direct delivery, and MUST say so
 in its policy file.
 
+**Owner approval is a local precondition, not a wire state.** A request that arrives is `held`: the
+owner is shown who asked, what they wrote and the key fingerprint the request carried, and nothing is
+accepted until that owner decides. `held` is invisible off-box — the wire stays
+`requested → accepted | refused | expired`, and the peer sees `requested` until a decision lands, or
+`expired` if none does. Publishing `held` on the wire would hand a stranger an oracle for whether a
+human is watching, and would break every client that already reads the four-state machine.
+
+**Fail closed.** Expiry while held is `expired`, never `accepted`. A denial is terminal and is
+delivered as silence, which is indistinguishable from refusal by construction (§9). An approval
+records who decided, when, and the fingerprint that was shown — "the owner approved this key" must be
+distinguishable from "approved this name, keys rotated since".
+
+**The approval queue is an attack surface and is capped.** At most five presentations per owner in any
+rolling 24 hours, and a peer that asks again inside the cooldown is deduped rather than presented
+twice. An
+uncapped queue turns the owner's prompt into the spam channel, which is the same attack one layer up
+from the message itself. Requests the owner never answers expire on the same seven-day clock as any
+other request.
+
 **Rate limits:** 100 messages/hour per sender, 20/hour from any one sender to any one recipient,
 10,000/hour per hub. A sender whose messages receive no **reply** — a `Message` in response, or a
 `Task` state change — for 90% of 50+ messages is throttled to 5/hour for 24 hours or until an operator
