@@ -12,7 +12,6 @@ import os
 
 import pytest
 
-from knok.bridge import Bridge, BridgeState, load_cards
 from knok.policy import PolicyError
 
 from test_phase2 import AGENTS, DOMAIN, deployment, send  # noqa: F401  (fixture reused by import)
