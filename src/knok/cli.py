@@ -68,7 +68,6 @@ def cmd_send(args: argparse.Namespace) -> int:
             "contextId": args.context or f"c-{uuid.uuid4().hex}",
             "role": "agent",
             "parts": [{"kind": "text", "text": args.text}],
-            **({"replyTo": args.reply_to} if args.reply_to else {}),
         },
         "from": identity.agent_id,
         "to": [recipient],
@@ -129,7 +128,6 @@ def main(argv: list[str] | None = None) -> int:
     send.add_argument("--to", required=True)
     send.add_argument("--text", required=True)
     send.add_argument("--context", default=None)
-    send.add_argument("--reply-to", default=None)
     send.add_argument("--message-id", default=None)
     send.add_argument("--seq", type=int, default=0)
     send.add_argument("--ttl-hours", type=int, default=72)
