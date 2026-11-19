@@ -49,6 +49,17 @@ def _card_time(card: dict, key: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def card_valid_until(card: dict) -> datetime | None:
+    """The instant the card stops being trusted, or ``None`` when it states no ``validUntil``.
+
+    The one reading of the field, shared by the two places that ask the question at different
+    times: ``verify_card`` asks it while the document is in hand, and a holder of an already
+    pinned body (``Bridge.public_key_of``) asks it per message, because a card that verified at
+    load does not stay valid on its own (#62).
+    """
+    return _card_time(card, "validUntil")
+
+
 def verify_card(
     jws: Any,
     registry: "dict[str, str] | Registry",
@@ -114,7 +125,7 @@ def verify_card(
         if agent_id != expected_agent_id:
             return False, f"card is for {agent_id!r}, expected {expected_agent_id!r}"
 
-    valid_until = _card_time(card, "validUntil")
+    valid_until = card_valid_until(card)
     if valid_until is not None and (now or datetime.now(timezone.utc)) >= valid_until:
         return False, "card has expired"
     return True, ""

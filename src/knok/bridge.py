@@ -27,9 +27,9 @@ from typing import Any
 
 from . import identity as identity_mod
 from . import policy as policy_mod
-from .agentcard import verify_card
+from .agentcard import card_valid_until, verify_card
 from .contacts import Contacts
-from .envelope import verify_envelope
+from .envelope import sent_at, verify_envelope
 from .gate import Gate, Threads
 from .hub import verify_frame
 from .hubclient import HubClient, HubError, HubRefused
@@ -197,9 +197,37 @@ class Bridge:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def public_key_of(self, agent_id: str):
+    def public_key_of(self, agent_id: str, at: datetime | None = None):
+        """The pinned key for ``agent_id``, or None when its card does not account for ``at``.
+
+        ``load_cards`` verified each card once, when this process started. That verdict does not
+        age with the clock: a card carrying ``validUntil`` was trusted forever by whoever loaded
+        it (#62). So the expiry is re-read here, from the body that is pinned — the field is
+        inside the signed payload, which is what load-time verification checked, so the answer
+        cannot be moved without the key that signed the card.
+
+        ``at`` is the instant asked about, and the loop passes the envelope's ``sentAt``
+        (decision 0002: ask about the key when the message was signed, not when it arrived). A
+        card with no ``validUntil`` — every card in the current live registry — states no limit
+        and answers exactly as it did before.
+
+        What this does *not* do is re-verify the signature per message, or consult a ``Registry``
+        for revocation: the pinned entry is a body, not a document, and the registry here is the
+        legacy dict. Both are named on #62; this answers the expiry question only, which is the
+        one the field actually makes.
+        """
         card = self.state.registry.get(agent_id)
         if card is None:
+            return None
+        instant = at or datetime.now(timezone.utc)
+        valid_until = card_valid_until(card)
+        if valid_until is not None and instant >= valid_until:
+            log.warning(
+                "card for %s expired at %s; not trusting it at %s",
+                agent_id,
+                valid_until.isoformat(),
+                instant.isoformat(),
+            )
             return None
         from .identity import public_key_from_b64
 
@@ -273,9 +301,12 @@ class Bridge:
         sender = item.get("from")
         if not isinstance(sender, str):
             return "unhandled", None
-        public_key = self.public_key_of(sender)
+        # The card is asked about as of the envelope's own ``sentAt``, matching transport and the
+        # hub (decision 0002): a card that lapsed this morning must still account for a message
+        # signed yesterday, and must not account for one signed after it lapsed.
+        public_key = self.public_key_of(sender, at=sent_at(item))
         if public_key is None:
-            log.warning("no registered card for sender %s; leaving the message at the hub", sender)
+            log.warning("no trusted card for sender %s; leaving the message at the hub", sender)
             return "unhandled", None
         ok, reason = verify_envelope(item, public_key)
         if not ok:
