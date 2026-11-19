@@ -1,9 +1,9 @@
 """A running bridge adopts a card added, changed or removed on disk (#54).
 
-The policy reload (#52) made the *gate* follow the file. This is the trust anchor behind it: a peer
-provisioned after the bridge started has no pinned card, so its signature cannot be verified, the
-envelope is left at the hub, and after the bounded attempt counter it is dropped — the #48 silent-drop
-class one layer down.
+The policy reload (#52) is the same failure at the *gate*: a file that was read once at start. This
+is the trust anchor behind it: a peer provisioned after the bridge started has no pinned card, so
+its signature cannot be verified, the envelope is left at the hub, and after the bounded attempt
+counter it is dropped — the #48 silent-drop class one layer down.
 
 The clock is the assertion, never a restart. The bridge is built once, before the card exists, and
 every test drives it through ``poll_once`` afterwards. Nothing here constructs a second ``Bridge``
@@ -166,8 +166,13 @@ def test_a_corrupt_card_narrows_the_registry_instead_of_emptying_it(late_registr
     others = set(muse.state.registry) - {victim}
     assert others
 
-    # Carl's file is present but truncated: `load_cards` drops it, everything else still verifies.
-    (cards_dir / f"{victim}.json").write_text('{"payload": "not-a-jws"')
+    # Carl's file is replaced by a document that parses but is not a card: no ``bridge.publicKey``,
+    # so ``card_body`` refuses it. (A half-written file is the other shape of the same edit — that
+    # one fails at ``json.loads`` and is dropped a line earlier — so this exercises the check the
+    # trust anchor actually makes, not the JSON reader.)
+    (cards_dir / f"{victim}.json").write_text(
+        json.dumps({"protected": "eyJhbGciOiJFZERTQSJ9", "payload": "e30", "signature": "AAAA"})
+    )
 
     assert muse.reload_registry_if_changed() is True
     assert victim not in muse.state.registry, "a card that no longer verifies must stop being trusted"

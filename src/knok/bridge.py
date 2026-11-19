@@ -12,9 +12,10 @@ reason, so the ack below it cannot run first.
 The bridge does not interpret a body, does not accept a message for another agent (the queue refuses
 it), and does not trust a transport frame unless the hub signed it.
 
-Nothing the bridge reads once may stay read once. ``policy.json`` and the pinned cards are both
-re-read when the files change, because a peer that a restart would admit is a peer that is silently
-dropped until the restart happens (#52, #54).
+Nothing the bridge reads once may stay read once. The pinned cards are re-read when the directory
+changes, because a peer that a restart would admit is a peer that is silently dropped until the
+restart happens (#54). ``policy.json`` fails the same way one layer up (#52); its reload is a
+separate change, and this one sits where that one will.
 """
 
 from __future__ import annotations
@@ -251,7 +252,7 @@ class Bridge:
     def reload_registry_if_changed(self) -> bool:
         """Adopt a card added, changed or removed since the last poll (#54). True when swapped.
 
-        The policy reload (#52) fixed the *gate*; this fixes the trust anchor behind it. A peer
+        The policy reload (#52) fixes the *gate*; this fixes the trust anchor behind it. A peer
         provisioned after this bridge started has no pinned card, so ``_handle`` cannot verify its
         signature, leaves the envelope at the hub, and after the bounded attempt counter it is dropped
         — a silent drop, which is the #48 class one layer down.
