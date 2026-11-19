@@ -57,6 +57,7 @@ def test_an_accepted_contact_is_admitted_without_being_pre_listed(tmp_path):
     # refused forever, which made §9's handshake decorative.
     gate, contacts = build(tmp_path, {**CLOSED, "allow": []})
     contacts.request(SENDER, "", T0)
+    contacts.approve(SENDER, "owner", now=T0)
     contacts.accept(SENDER, T0)
     assert gate.decide(envelope(), T0).allowed is True
 
@@ -65,6 +66,7 @@ def test_blocked_agent_is_refused_even_when_accepted(tmp_path):
     doc = {**CLOSED, "allow": [], "block": [SENDER]}
     gate, contacts = build(tmp_path, doc)
     contacts.request(SENDER, "", T0)
+    contacts.approve(SENDER, "owner", now=T0)
     contacts.accept(SENDER, T0)
     decision = gate.decide(envelope(), T0)
     assert decision.allowed is False and decision.reason == REFUSED

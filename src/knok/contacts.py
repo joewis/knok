@@ -25,7 +25,12 @@ MAX_REQUEST_CHARS = 280
 #: carefully it is worded (§9).
 REFUSED = "refused: delivery not permitted"
 
+#: The states a PEER may see. ``held`` is local and never appears on the wire (§9).
 STATES = {"requested", "accepted", "refused", "expired"}
+#: A request the owner has been shown but has not decided. Deliberately absent from STATES.
+LOCAL_HELD = "held"
+#: Presentations per owner per day. The queue is an attack surface; uncapped it is the spam channel.
+MAX_PRESENTATIONS_PER_DAY = 5
 
 
 class ContactError(ValueError):
@@ -84,6 +89,13 @@ class Contacts:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS contact_requests (peer TEXT NOT NULL, at TEXT NOT NULL)"
         )
+        #: The audit of owner decisions. "The owner approved this key" has to be distinguishable
+        #: from "approved this name before the key was rotated", so the fingerprint is recorded.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS approvals (peer TEXT PRIMARY KEY, text TEXT NOT NULL,"
+            " fingerprint TEXT NOT NULL, presented TEXT NOT NULL, decision TEXT,"
+            " decided_by TEXT, decided_at TEXT)"
+        )
         self._conn.commit()
 
     def close(self) -> None:
@@ -111,7 +123,33 @@ class Contacts:
         The expiry is written down rather than recomputed on every read: a recomputed expiry would
         resurrect a stale request on the next call.
         """
+        return self.wire_state(peer, now)
+
+    @_locked
+    def wire_state(self, peer: str, now: datetime | None = None) -> str:
+        """What the PEER is told. A held request is still `requested` on the wire (§9).
+
+        Publishing `held` would hand a stranger an oracle for whether a human is watching, and
+        would break every client that reads the four-state machine.
+        """
+        raw = self._state_locked(peer, now or datetime.now(timezone.utc))
+        return "requested" if raw == LOCAL_HELD else raw
+
+    @_locked
+    def local_state(self, peer: str, now: datetime | None = None) -> str:
+        """The owner's view: `held` is visible here and nowhere else."""
         return self._state_locked(peer, now or datetime.now(timezone.utc))
+
+    @_locked
+    def pending(self) -> list[dict]:
+        """Requests waiting on the owner, oldest first, with the text and fingerprint shown."""
+        rows = self._conn.execute(
+            "SELECT c.peer, c.updated, a.text, a.fingerprint FROM contacts c"
+            " JOIN approvals a ON a.peer = c.peer"
+            " WHERE c.state = ? AND a.decision IS NULL ORDER BY c.updated",
+            (LOCAL_HELD,),
+        ).fetchall()
+        return [{"peer": r[0], "at": r[1], "text": r[2], "fingerprint": r[3]} for r in rows]
 
     def _state_locked(self, peer: str, moment: datetime) -> str:
         """State lookup with the lock already held (``state`` wraps this)."""
@@ -119,7 +157,7 @@ class Contacts:
         if row is None:
             return "none"
         state, updated = row[0], row[1]
-        if state == "requested" and moment - updated >= REQUEST_TTL:
+        if state in ("requested", LOCAL_HELD) and moment - updated >= REQUEST_TTL:
             self._set(peer, "expired", moment)
             return "expired"
         return state
@@ -152,7 +190,8 @@ class Contacts:
         self._conn.commit()
 
     @_locked
-    def request(self, peer: str, text: str = "", now: datetime | None = None) -> str:
+    def request(self, peer: str, text: str = "", now: datetime | None = None,
+                fingerprint: str = "") -> str:
         """Record an inbound contact request.
 
         Raises ``DuplicateRequest`` for a live or accepted request, ``ContactError`` after a refusal
@@ -181,18 +220,91 @@ class Contacts:
             if self.rates.count("requests", "all", moment, timedelta(days=1)) >= self.contact_request_daily_limit:
                 raise Cooldown(f"{peer}: the daily contact-request limit is spent")
 
-        self._set(peer, "requested", moment, bump=True)
+        if self._presentations_today(moment) >= MAX_PRESENTATIONS_PER_DAY:
+            # The owner's prompt is the last thing a spammer can reach. Cap the queue, not just the
+            # messages: an uncapped approval queue is the spam channel one layer up (§9).
+            raise Cooldown(f"{peer}: the owner's approval queue is full for today")
+
+        self._set(peer, LOCAL_HELD, moment, bump=True)
+        self._conn.execute(
+            "INSERT INTO approvals (peer, text, fingerprint, presented, decision)"
+            " VALUES (?, ?, ?, ?, NULL)"
+            " ON CONFLICT(peer) DO UPDATE SET text = excluded.text,"
+            " fingerprint = excluded.fingerprint, presented = excluded.presented,"
+            " decision = NULL, decided_by = NULL, decided_at = NULL",
+            (peer, text, fingerprint, _ts(moment)),
+        )
         self._conn.execute(
             "INSERT INTO contact_requests (peer, at) VALUES (?, ?)", (peer, _ts(moment))
         )
         self._conn.commit()
         if self.rates is not None:
             self.rates.hit("requests", "all", moment, timedelta(days=1))
-        return "requested"
+        return "requested"   # the peer sees requested; the owner sees held
+
+    @_locked
+    def _presentations_today(self, moment: datetime) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE presented > ?",
+            (_ts(moment - timedelta(days=1)),),
+        ).fetchone()
+        return row[0]
+
+    @_locked
+    def approve(self, peer: str, decided_by: str, fingerprint: str = "",
+                now: datetime | None = None) -> None:
+        """Record the OWNER's approval of a held request. Does not accept it — that is separate.
+
+        ``fingerprint`` is what the owner was shown. If they name one and it is not the one on the
+        request, the approval is refused: approving this name while a different key is attached is
+        the substitution an approval prompt exists to prevent (§9).
+        """
+        moment = now or datetime.now(timezone.utc)
+        row = self._conn.execute(
+            "SELECT fingerprint, decision FROM approvals WHERE peer = ?", (peer,)
+        ).fetchone()
+        if row is None or self.local_state(peer, moment) != LOCAL_HELD:
+            raise ContactError(f"{peer} has no held request to approve")
+        if row[1] is not None:
+            raise ContactError(f"{peer} has already been {row[1]}")
+        if fingerprint and fingerprint != row[0]:
+            raise ContactError(f"{peer}: the key shown to the owner is not the key on the request")
+        self._conn.execute(
+            "UPDATE approvals SET decision = 'approved', decided_by = ?, decided_at = ? WHERE peer = ?",
+            (decided_by, _ts(moment), peer),
+        )
+        self._conn.commit()
+
+    @_locked
+    def deny(self, peer: str, decided_by: str, now: datetime | None = None) -> None:
+        """Record the owner's refusal. Terminal, and delivered as silence like every refusal."""
+        moment = now or datetime.now(timezone.utc)
+        row = self._conn.execute(
+            "SELECT decision FROM approvals WHERE peer = ?", (peer,)
+        ).fetchone()
+        if row is None or self.local_state(peer, moment) != LOCAL_HELD:
+            raise ContactError(f"{peer} has no held request to deny")
+        if row[0] is not None:
+            raise ContactError(f"{peer} has already been {row[0]}")
+        self._conn.execute(
+            "UPDATE approvals SET decision = 'denied', decided_by = ?, decided_at = ? WHERE peer = ?",
+            (decided_by, _ts(moment), peer),
+        )
+        self._set(peer, "refused", moment)
 
     @_locked
     def accept(self, peer: str, now: datetime | None = None) -> None:
-        if self.state(peer, now) != "requested":
+        """Accept a request — only after the OWNER approved it.
+
+        This is the invariant issue #42 names: no code path may turn a request into a contact on its
+        own. The check is here rather than in a caller so there is no second place to forget it.
+        """
+        row = self._conn.execute(
+            "SELECT decision FROM approvals WHERE peer = ?", (peer,)
+        ).fetchone()
+        if row is None or row[0] != "approved":
+            raise ContactError(f"{peer} has not been approved by the owner")
+        if self.local_state(peer, now) not in (LOCAL_HELD, "requested"):
             raise ContactError(f"{peer} has no live request to accept")
         self._set(peer, "accepted", now or datetime.now(timezone.utc))
 
@@ -221,7 +333,11 @@ class Contacts:
     def expire(self, now: datetime | None = None) -> int:
         """Mark stale requests as expired. Returns how many changed."""
         moment = now or datetime.now(timezone.utc)
-        rows = self._conn.execute("SELECT peer FROM contacts WHERE state = 'requested'").fetchall()
+        # `held` expires on the same clock as `requested`: an owner who never answers is
+        # not a yes (§9, issue #42).
+        rows = self._conn.execute(
+            "SELECT peer FROM contacts WHERE state IN ('requested', ?)", (LOCAL_HELD,)
+        ).fetchall()
         changed = 0
         for (peer,) in rows:
             if self.state(peer, moment) == "expired":
