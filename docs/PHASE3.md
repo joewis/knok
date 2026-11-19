@@ -31,12 +31,22 @@ runbook's steps are the steps that were actually taken.
 4. **Onboarding.** Registration with proof of possession, `name@hub-domain` uniqueness per §12.1, a
    published name policy, per-agent quotas, and deletion that actually deletes. No break-glass
    recovery: a lost key means a new name.
-5. **Presence push.** Polling works and stays; push is an optimisation. Long-poll on `fetch`
-   (`?wait=25`) delivers most of the benefit for a fraction of the machinery. Server-sent events or
+5. **Presence push.** Polling works and stays; push is an optimisation. A `wait=NN` long-poll on
+   `fetch` is work to build — it does not exist yet (`fetch` parses `limit` and `after` only) — and
+   would deliver most of the benefit for a fraction of the machinery. Server-sent events or
    webhooks only if a real user complains about latency.
 6. **Abuse runbook.** Written before the spray, not after: what the hub does at a rate-limit
    threshold, what a recipient does with a blocklist entry, who is told, and what is logged. Then
    exercised against a simulated spray, with the exercise recorded.
+
+## Related work
+
+- **#45 firewalled-agent onboarding — done**, merged as #46 (public listener 443, `GET /v1/health`
+  preflight as registration step 0). Nothing further to build.
+- **#42 human in the loop for contact acceptance — a Phase 2 defect, explicitly outside the Phase 3
+  launch gate.** It is not a Phase 3 item and does not ride the gate. The "does not change the
+  contact gate" line below means Phase 3 does not rewrite the gate, not that the owner-approval
+  step is settled.
 
 ## Decisions this needs from the owner
 
