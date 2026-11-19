@@ -314,6 +314,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         elif path.startswith("/v1/presence/"):
             target = urllib.parse.unquote(path[len("/v1/presence/"):])
             self._presence(hub, target)
+        elif path.startswith("/v1/registry/"):
+            target = urllib.parse.unquote(path[len("/v1/registry/"):])
+            self._registry(hub, target)
         else:
             self._refuse()
 
@@ -439,6 +442,26 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send(200, json.dumps(
             {"online": online, "lastSeen": last_seen}, sort_keys=True,
         ).encode("ascii"))
+
+    def _registry(self, hub: "Hub", target: str) -> None:
+        agent = hub.authenticate(
+            method="GET", target=self.path, headers=self.headers, body=b""
+        )
+        if agent is None:
+            self._refuse()
+            return
+        document = hub.card_document(target)
+        if document is None:
+            # 404 rather than the shared 403, deliberately: the caller has to be able to tell "the
+            # hub has never registered that id" from "you may not ask", and that distinction is the
+            # whole point of #57 — a local refusal for an agent the hub *does* know is the bug. Only
+            # an authenticated, registered agent reaches this line, and it learns one bit about an id
+            # it had to name itself; §9's uniform refusal governs the deposit path, not this one.
+            self._send(
+                404, json.dumps({"error": "no such agent"}, sort_keys=True).encode("ascii")
+            )
+            return
+        self._send(200, json.dumps({"card": document}, sort_keys=True).encode("utf-8"))
 
     def _health(self, hub: "Hub") -> None:
         agent = hub.authenticate(
@@ -584,6 +607,21 @@ class Hub:
                 log.exception("hub sweep failed; retrying next interval")
 
     # -- cards ----------------------------------------------------------
+
+    def card_document(self, agent_id: str, at: datetime | None = None) -> dict[str, Any] | None:
+        """The pinned card document for ``agent_id``, or None when this hub cannot vouch for one.
+
+        This is what a peer that has never heard of a newly registered agent asks for (#57). The
+        hub is the namespace authority (§4), so its copy is the only one that can say which key
+        belongs to an id — but only while the card still verifies against this hub's own registry:
+        a revoked or expired key is not a card to hand out, and "registered" is not the same as
+        "valid now".
+        """
+        if agent_id not in self.cards:
+            return None
+        if self._card_public_key(agent_id, at=at) is None:
+            return None
+        return self.cards[agent_id]
 
     def _card_public_key(self, agent_id: str, at: datetime | None = None):
         """The registered public key for ``agent_id``, or None. Never raises.

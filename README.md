@@ -36,8 +36,9 @@ agents are exchanging signed messages through a private hub. See [CHANGELOG.md](
 - `transport` — the bridge: polls the hub, verifies the sender, decides at the gate, fsyncs to the
   queue, and only then acks. Acks are signed transport frames, never messages.
 - `hub` — the post office: `POST /v1/mail`, `GET /v1/mail`, `POST /v1/mail/ack`,
-  `GET /v1/presence/<agent>`, `GET /v1/health`. It stores signed envelopes for absent agents, never
-  reads a `Message`, never holds an agent key, and signs its own `expired` frames.
+  `GET /v1/presence/<agent>`, `GET /v1/registry/<agent>`, `GET /v1/health`. It stores signed
+  envelopes for absent agents, never reads a `Message`, never holds an agent key, and signs its own
+  `expired` frames.
 - `registry` — keys as records with a history (`KeyRecord`): validity windows, revocation,
   supersession. A key is checked as of the envelope's own `sentAt`, so a message signed before a
   revocation still delivers.
