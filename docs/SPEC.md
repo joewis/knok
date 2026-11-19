@@ -355,11 +355,12 @@ not a `Message`, is not signed as the recipient, and MUST NOT enter a thread: th
 the message, so it cannot sign anything about it, and under sealing the hub cannot know whether a
 reply was expected without opening the body.
 
-**Refusal by the recipient's gate** is a death the sender cannot see, and the only silent one: the receiving bridge
-acks a refused envelope exactly as it acks a delivery (HUB.md, "ack means handled"), so the hub's copy
-is gone and the sender's `send` exited 0 hours earlier. The refusing bridge therefore answers — but
-only to a sender whose signature verified against a card pinned in its own registry. A stranger gets
-§9's identical 403 and no frame at all, so the exemption cannot become an existence oracle.
+**Refusal by the recipient's gate** is a death the sender cannot see, and the only silent one: the
+receiving bridge acks a refused envelope exactly as it acks a delivery (HUB.md, "ack means handled"),
+so the hub's copy is gone and the sender's `send` exited 0 hours earlier. The refusing bridge therefore
+answers — but only to a sender whose signature verified against a card pinned in its own registry. A
+stranger gets §9's identical 403 and no frame at all, so the exemption cannot become an existence
+oracle.
 
 The answer is a `Message`, not a transport frame like `expired` and `dead`: a bridge signs no hub
 frame, so the notice travels as mail — signed by the refuser, addressed to the sender, in a fresh
