@@ -11,6 +11,9 @@ reason, so the ack below it cannot run first.
 
 The bridge does not interpret a body, does not accept a message for another agent (the queue refuses
 it), and does not trust a transport frame unless the hub signed it.
+
+``policy.json`` is re-read whenever the file changes (one ``stat`` per poll, #52): an operator's
+revocation takes effect on the next message, not on the next restart.
 """
 
 from __future__ import annotations
@@ -181,6 +184,10 @@ class Bridge:
             )
         self.gate = Gate(self.policy, self.contacts, self.threads, self.rates)
         self.client = HubClient(state.hub_url, self.identity)
+        #: The file identity (mtime, size, inode) of the policy the running gate was built from.
+        #: ``stat`` is the cheap way to notice an edit: the daemon must not pay a parse per poll, and
+        #: a parse per *message* would still race a mid-decision rewrite.
+        self._policy_stamp = self._policy_file_stamp()
 
     # -- helpers ----------------------------------------------------------
 
@@ -210,6 +217,73 @@ class Bridge:
 
     # -- the loop ---------------------------------------------------------
 
+    def _policy_file_stamp(self) -> tuple[int, int, int] | None:
+        """Identity of the policy file on disk, or ``None`` when it is gone.
+
+        ``st_mtime_ns`` alone can miss a rewrite that lands inside the same timestamp tick on a
+        coarse filesystem, so size and inode ride along: an editor that writes-then-renames changes
+        the inode even when the size does not.
+        """
+        try:
+            info = os.stat(self.state.policy_path)
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size, info.st_ino)
+
+    def reload_policy_if_changed(self) -> bool:
+        """Adopt a changed ``policy.json`` without a restart (#52). True when a new policy is live.
+
+        Called at the top of every poll, so an edit takes effect on the *next* message rather than
+        the next process lifetime — revocation that needs a restart is not revocation.
+
+        A reload never throws the store away: ``Contacts``, ``Threads`` and ``Rates`` are DB-backed
+        and outlive any one policy, so only the ``Gate`` is rebuilt, around the same three objects.
+        A file that does not parse, names another agent, or is unreadable leaves the policy already
+        in force untouched and says so at ERROR — a policy bug must not quietly open a gate, and it
+        must not crash the bridge either, or a typo becomes an outage.
+        """
+        stamp = self._policy_file_stamp()
+        if stamp is None:
+            if self._policy_stamp is not None:
+                log.error(
+                    "policy %s is gone or unreadable; keeping the policy in force",
+                    self.state.policy_path,
+                )
+                self._policy_stamp = stamp
+            return False
+        if stamp == self._policy_stamp:
+            return False
+        # Remember the stamp before parsing: a file that fails to load must be reported once, not
+        # re-read and re-logged every poll until someone fixes it.
+        self._policy_stamp = stamp
+        try:
+            policy = policy_mod.load(self.state.policy_path)
+        except policy_mod.PolicyError as exc:
+            log.error("policy reload failed, keeping the policy in force: %s", exc)
+            return False
+        if policy.agent_id != self.state.agent_id:
+            log.error(
+                "policy reload refused: the file is for %s, this bridge is %s",
+                policy.agent_id,
+                self.state.agent_id,
+            )
+            return False
+        if policy == self.policy:
+            return False
+
+        added = policy.allow - self.policy.allow
+        removed = self.policy.allow - policy.allow
+        self.policy = policy
+        self.gate = Gate(policy, self.contacts, self.threads, self.rates)
+        log.info(
+            "policy reloaded: allow +%d -%d, %d blocked, contact_policy=%s",
+            len(added),
+            len(removed),
+            len(policy.block),
+            policy.contact_policy,
+        )
+        return True
+
     def poll_once(self) -> dict[str, int]:
         """Fetch one page, handle it in order, ack what was handled.
 
@@ -217,6 +291,7 @@ class Bridge:
         the gate; a message that could not be handled at all (unverifiable sender, unknown card) is
         left unacked so the hub offers it again, because the alternative is silently dropping mail.
         """
+        self.reload_policy_if_changed()
         try:
             page = self.client.fetch(limit=self.batch)
         except HubError as exc:
