@@ -93,12 +93,30 @@ Four failure modes make a scenario decorative; every scenario here is written to
    it: today `bridge._handle` (`bridge.py:287-291`) logs the refusal and acks the envelope anyway,
    `hub.ack` (`hub.py:826-846`) deletes it, and `knok send` has already exited 0 (`cli.py:79-82`), so
    the sender is told nothing, forever. Tracked as #50.
+
+   **Wire form, decided after review (19 Nov).** The notice is a deposit made by the *recipient's*
+   bridge, not a hub-generated frame. The hub has already accepted and acked the envelope by the time
+   the gate refuses it, so a hub that then reports "refused" is asserting a fact it learned from the
+   recipient — and on sealed traffic it cannot know a refusal occurred at all. A recipient-bridge
+   deposit reuses the signed-envelope path, so the sender verifies it against the registry like any
+   other envelope, and `rule` stays a statement by the only party that made the decision. Two
+   constraints ride on it: it must **not** spend the sender's budget (§9 — a blocked sender must not
+   be billed for learning they are blocked), and it must carry `retryable: false`, because a retry is
+   the amplification vector. The test for the fix is this scenario run end to end, not a unit test of
+   whatever function emits the frame: a unit test of `emit_refusal()` passes while the frame never
+   crosses between the two processes.
 10. **Stale policy, measured** — `Bridge.__init__` loads the policy once (`bridge.py:177`) and nothing
     in `src/knok/` reloads it or checks its mtime, while `provision.py:91-112` rewrites `policy.json`
     under a running daemon. An operator who removes a peer mid-run writes a file the bridge never
     reads again and that peer keeps delivering until restart. Expected observation: after the file
-    changes, the next message from a now-disallowed peer is refused, and the change is visible
-    without a restart, or an issue is filed. Clock, not restart. Owner: bridge/Carl. Tracked as #52.
+    changes, the next message from a now-disallowed peer is refused **and the sender observes that
+    refusal** — a `refused` frame (scenario 9), or an explicit classified failure — within one poll
+    interval, without any restart; or an issue is filed. The assertion is on what the sender saw, not
+    on the file's mtime: a clock proves the file changed, never that the daemon noticed it, and a
+    refused delivery is the only outside evidence of the latter. Clock, not restart. Restart-in-place
+    of revocation is a fail even though §10 says the queue is fsynced and so survives: from outside,
+    "revoked" and "restarted, still running the old policy for another 50 polls" look identical.
+    Owner: bridge/Carl. Tracked as #52.
 11. **`recv` applies no gate** — `recv_once` (`recv.py:56-78`) fetches, prints and acks with no
     `Gate.decide` in the path, so revocation and blocking are enforced at deposit only and a blocked
     sender's queued mail still reaches stdout. That is a §9 claim violated, not a harness detail:
@@ -130,7 +148,7 @@ the same scenario the expected-observation text is identical; a divergence is an
 | 7 | refusal uniform, prompt, does not consume budget | | | | | |
 | 8 | same conversation across three harnesses | | | | | |
 | 9 | signed `refused` frame in `notices.jsonl` | | | | | |
-| 10 | revocation visible on the next message, clock only | | | | | |
+| 10 | revocation observable by the sender on the next message, clock only | | | | | |
 | 11 | blocked mail never reaches `recv` stdout | | | | | |
 | 12 | this table | | | | | |
 | 13 | exit 3 delivers nothing; retry re-offers the same ids | | | | | |
