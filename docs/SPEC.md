@@ -355,6 +355,35 @@ not a `Message`, is not signed as the recipient, and MUST NOT enter a thread: th
 the message, so it cannot sign anything about it, and under sealing the hub cannot know whether a
 reply was expected without opening the body.
 
+**Refusal by the recipient's gate** is a death the sender cannot see, and the only silent one: the receiving bridge
+acks a refused envelope exactly as it acks a delivery (HUB.md, "ack means handled"), so the hub's copy
+is gone and the sender's `send` exited 0 hours earlier. The refusing bridge therefore answers — but
+only to a sender whose signature verified against a card pinned in its own registry. A stranger gets
+§9's identical 403 and no frame at all, so the exemption cannot become an existence oracle.
+
+The answer is a `Message`, not a transport frame like `expired` and `dead`: a bridge signs no hub
+frame, so the notice travels as mail — signed by the refuser, addressed to the sender, in a fresh
+`c-notice-*` context of its own (never the refused message's, which would spend its reply
+expectation), with `turn.expectsReply` false and a 24-hour expiry. It carries
+
+```json
+"metadata": {"knok.notice": {"kind": "refused", "messageId": "m-9f2c41d0",
+                             "contextId": "c-7a11e902", "rule": "policy"}}
+```
+
+where `metadata` is the extension point A2A defines, so `Message.kind` stays `"message"` and a
+validator on the far side keeps working. The receiving bridge diverts a notice to `notices.jsonl`
+before the gate and never delivers it to an agent, enters it into a thread, or counts it as mail.
+`rule` is the gate's own category — `blocked`, `policy`, `limits`, `thread`, `malformed` — and is
+shown only to a correspondent the operator had already pinned; the `reason` in a 403 is one string
+for every rule. `contextId` is the refused message's, so the sender can retry inside the thread that
+was refused instead of opening a second one.
+
+The notice is best effort: it is deposited only after the refusal is already recorded locally, the
+bridge does not retry it, and it is bounded per sender per hour like any other inbound traffic. What
+the sender learns is "this was refused", not "this was refused and will be retried" — the retry policy
+belongs to the sender's adapter, not to the refuser.
+
 ## 7. Routing and topology
 
 **What runs where.**
@@ -501,6 +530,15 @@ message reaches the recipient bridge. A blocked recipient, a name that was never
 recipient that has never accepted anything return an **identical** refusal — same string, same timing,
 no distinct error — because a distinguishable refusal is an existence oracle however it is worded.
 
+That uniformity governs the **admission of strangers**. It does not require silence towards a
+correspondent: a sender whose signature verified against a card this agent's operator pinned is not a
+stranger, and §6's refusal notice tells it that its own message was refused. `blocked` is deliberately
+inside what a pinned correspondent may learn — a block is the recipient owner's statement *to that
+peer*, not a fact about a third party, and hiding it reproduces the "the peer ignored me" confusion
+the protocol exists to prevent. The rule that must hold is narrower than "all refusals look alike": a
+stranger's answer must not differ from another stranger's, and nothing in the notice may describe
+anyone but the sender's own message.
+
 The string can be made identical by construction; the **clock** cannot, and this spec should not
 pretend otherwise. A hub that answers a miss on a dict lookup and a hit through a card verification,
 an envelope verification, the contact gate and a durable write will differ by whatever an fsync
@@ -578,6 +616,12 @@ from the start or it is a Phase 4 rewrite of everything built in Phases 1–3.
    v1 — a funding dependency and a governance question before there is a community to govern.
 5. **Reference client:** a library first, with the CLI as a thin wrapper over it. A framework needs the
    library, a human needs the CLI, and two implementations diverge on the envelope within a month.
+6. **A refusal reaches the sender:** a gate refusal tells the sender it failed, and only a sender whose
+   signature verified against a pinned card hears it (§6). §9's uniform answer is about strangers and
+   stays uniform; a correspondent who already knows the recipient exists learns nothing new from its
+   own message's fate, and the alternative is the silent drop the whole protocol is a reaction to.
+   Blocking is disclosed to the blocked peer for the same reason: it is the owner's statement to that
+   peer, not a fact about anybody else.
 
 ## 13. First three things to build
 
