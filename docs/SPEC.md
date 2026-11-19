@@ -482,8 +482,9 @@ delivered as silence, which is indistinguishable from refusal by construction (Â
 records who decided, when, and the fingerprint that was shown â€” "the owner approved this key" must be
 distinguishable from "approved this name, keys rotated since".
 
-**The approval queue is an attack surface and is capped.** At most five presentations per owner per
-day, and a peer that asks again inside the cooldown is deduped rather than presented twice. An
+**The approval queue is an attack surface and is capped.** At most five presentations per owner in any
+rolling 24 hours, and a peer that asks again inside the cooldown is deduped rather than presented
+twice. An
 uncapped queue turns the owner's prompt into the spam channel, which is the same attack one layer up
 from the message itself. Requests the owner never answers expire on the same seven-day clock as any
 other request.
