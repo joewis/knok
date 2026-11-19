@@ -49,11 +49,12 @@ Four failure modes make a scenario decorative; every scenario here is written to
    silently, and `recv.py` states it offers no at-least-once. Test the kill-between-ack-and-stage
    window explicitly; either fix it — ack after staging — or record it as accepted risk.)
 3. **Policy change under load** — add a peer while bridges are running. This is #48's trigger: a
-   bridge keeps the policy it loaded at start, and drops what it no longer recognises without a word.
-   (That staleness lives in the bridge daemon. Muse's side holds no policy at start: the CLI loads the
-   registry fresh on every call, and `recv` applies no gate at all — queued mail from a since-revoked
-   contact still prints. Test both: the daemon's stale-policy drop, and the recv path's no-gate
-   print.)
+   bridge that kept the policy it loaded at start dropped what it no longer recognised without a
+   word. (That staleness lived in the bridge daemon; `reload_policy_if_changed()` now stats
+   `policy.json` at the top of every poll and rebuilds only the `Gate`, #53/a681282.) Muse's side
+   holds no policy at start: the CLI loads the registry fresh on every call, and `recv` applies no
+   gate at all — queued mail from a since-revoked contact still prints. Test both: the daemon's
+   reload on a clock, and the recv path's no-gate print.
 
    Expected observation for the daemon half: after `policy.json` changes on disk, the *next* message
    from a peer the new policy disallows is refused **without a restart**, and the sender learns of it
@@ -89,10 +90,11 @@ Four failure modes make a scenario decorative; every scenario here is written to
 ### Added by review — five, all owners named
 
 9. **Gate-refusal notice** (the #4 fix, as a scenario) — scenario 4's expected observation, run and
-   recorded. Owner: bridge/Carl. It blocks the silent-drop exit criterion rather than sitting inside
-   it: today `bridge._handle` (`bridge.py:287-291`) logs the refusal and acks the envelope anyway,
-   `hub.ack` (`hub.py:826-846`) deletes it, and `knok send` has already exited 0 (`cli.py:79-82`), so
-   the sender is told nothing, forever. Tracked as #50.
+   recorded. Owner: bridge/Carl. As filed it blocked the silent-drop exit criterion rather than
+   sitting inside it: `bridge._handle` logged the refusal and acked the envelope anyway, `hub.ack`
+   deleted it, and `knok send` had already exited 0, so the sender was told nothing, forever.
+   Fixed in #55/c30e856: `_refuse` writes `refused.jsonl` and deposits a notice to a pinned sender.
+   Tracked as #50 (closed).
 
    **Wire form, decided after review (19 Nov).** The notice is a deposit made by the *recipient's*
    bridge, not a hub-generated frame. The hub has already accepted and acked the envelope by the time
@@ -100,23 +102,26 @@ Four failure modes make a scenario decorative; every scenario here is written to
    recipient — and on sealed traffic it cannot know a refusal occurred at all. A recipient-bridge
    deposit reuses the signed-envelope path, so the sender verifies it against the registry like any
    other envelope, and `rule` stays a statement by the only party that made the decision. Two
-   constraints ride on it: it must **not** spend the sender's budget (§9 — a blocked sender must not
-   be billed for learning they are blocked), and it must carry `retryable: false`, because a retry is
-   the amplification vector. The test for the fix is this scenario run end to end, not a unit test of
-   whatever function emits the frame: a unit test of `emit_refusal()` passes while the frame never
-   crosses between the two processes.
-10. **Stale policy, measured** — `Bridge.__init__` loads the policy once (`bridge.py:177`) and nothing
-    in `src/knok/` reloads it or checks its mtime, while `provision.py:91-112` rewrites `policy.json`
-    under a running daemon. An operator who removes a peer mid-run writes a file the bridge never
-    reads again and that peer keeps delivering until restart. Expected observation: after the file
-    changes, the next message from a now-disallowed peer is refused **and the sender observes that
-    refusal** — a `refused` frame (scenario 9), or an explicit classified failure — within one poll
-    interval, without any restart; or an issue is filed. The assertion is on what the sender saw, not
-    on the file's mtime: a clock proves the file changed, never that the daemon noticed it, and a
+   constraints ride on it: it must **not** spend the sender's budget (§9), and it must carry
+   `retryable: false`, because a retry is the amplification vector. **Amended 20 Nov:** `blocked` is
+   exempt — a blocked peer gets no notice at all, because a notice would confirm the name is
+   recognised and gated (a37d8d1; SPEC §6/§9/§12). The scenario must therefore assert silence for a
+   blocked peer and a `policy` notice for a pinned, unlisted one, in the same run. The test for the
+   fix is this scenario run end to end, not a unit test of whatever function emits the frame: a unit
+   test of `_send_refusal_notice()` passes while the frame never crosses between the two processes.
+10. **Stale policy, measured** — as filed, `Bridge.__init__` loaded the policy once and nothing in
+    `src/knok/` re-read it, while `provision.py` rewrites `policy.json` under a running daemon, so an
+    operator who removed a peer mid-run wrote a file the bridge never read again. Fixed in
+    #53/a681282 (`reload_policy_if_changed()`, one stat per poll, Gate rebuilt around the same
+    Contacts/Threads/Rates). The scenario stays as the regression test. Expected observation: after
+    the file changes, the next message from a now-disallowed peer is refused **and the sender observes
+    that refusal** — a `policy` notice (scenario 9), or an explicit classified failure — within one
+    poll interval, without any restart; or an issue is filed. The assertion is on what the sender saw,
+    not on the file's mtime: a clock proves the file changed, never that the daemon noticed it, and a
     refused delivery is the only outside evidence of the latter. Clock, not restart. Restart-in-place
     of revocation is a fail even though §10 says the queue is fsynced and so survives: from outside,
     "revoked" and "restarted, still running the old policy for another 50 polls" look identical.
-    Owner: bridge/Carl. Tracked as #52.
+    Owner: bridge/Carl. Tracked as #52 (closed).
 11. **`recv` applies no gate** — `recv_once` (`recv.py:56-78`) fetches, prints and acks with no
     `Gate.decide` in the path, so revocation and blocking are enforced at deposit only and a blocked
     sender's queued mail still reaches stdout. That is a §9 claim violated, not a harness detail:
@@ -131,6 +136,14 @@ Four failure modes make a scenario decorative; every scenario here is written to
     unreachable, `send` exits 3, then the hub returns. Expected: nothing was delivered, and the
     harness's staging layer re-offers with the *same* ids. `send` exiting 3 with no retry is a silent
     drop by the caller; the scenario states which side is responsible, or its pass is luck.
+14. **Pinned-card reload** (added 20 Nov, after #54 shipped) — the same failure class as scenario 10
+    one layer down: the registry behind the trust anchor was read once, so a peer provisioned later
+    was invisible until a restart and its mail was dropped as unverifiable. Fixed in #58/97bb8e6
+    (`reload_registry_if_changed()`, one stat per card per poll, the dict swapped in one assignment).
+    Scenario: a peer is provisioned into the registry directory while both bridges run; expected
+    observation is that its next message is delivered without a restart, and that deleting a card
+    mid-run makes the next message from that name unverifiable — again with no restart. Clock, not
+    restart, for the same reason as scenario 10. Owner: bridge/Carl.
 
 ## Parity table
 
@@ -142,16 +155,17 @@ the same scenario the expected-observation text is identical; a divergence is an
 | 1 | same `messageId`, once at the agent; replay not re-delivered | | | | | |
 | 2 | nothing acked is lost; nothing lost is acked, incl. the recv ack-before-stage window | | | | | |
 | 3 | policy change takes effect without a restart | | | | | |
-| 4 | gate refusal reaches the sender as a signed frame; stranger sees the uniform 403 | | | | | |
+| 4 | gate refusal reaches the sender as a signed notice; stranger sees the uniform 403 | | | | | |
 | 5 | an unapproved agent never becomes a contact | | | | | |
 | 6 | retry keeps `(contextId, seq)` | | | | | |
 | 7 | refusal uniform, prompt, does not consume budget | | | | | |
 | 8 | same conversation across three harnesses | | | | | |
-| 9 | signed `refused` frame in `notices.jsonl` | | | | | |
+| 9 | signed `refused` notice in `notices.jsonl`; a blocked peer gets none | | | | | |
 | 10 | revocation observable by the sender on the next message, clock only | | | | | |
 | 11 | blocked mail never reaches `recv` stdout | | | | | |
 | 12 | this table | | | | | |
 | 13 | exit 3 delivers nothing; retry re-offers the same ids | | | | | |
+| 14 | a card added or removed mid-run is trusted or refused without a restart | | | | | |
 
 ## Roles
 
@@ -173,7 +187,9 @@ silently.
 - Every scenario above has an observed result written down, including the ones that passed.
 - No scenario is recorded as a pass on a requirement that states no observation. A requirement the
   code does not meet fails its scenario and becomes an issue; a checkmark is not a result.
-- Zero open **silent-drop** classes: no path where a message is discarded and the sender is not told.
+- Zero open **silent-drop** classes: no path where a message is discarded and the sender is not told
+  — except a `blocked` refusal, which is silent by design (SPEC §9, amended 20 Nov), so the criterion
+  counts it as a deliberate class with the operator's record in `refused.jsonl`, not an open one.
 - Every defect found has either a merged fix or an issue with an accepted-risk note.
 - A written record exists of what was *not* tested, so the gap is visible rather than implied.
 
