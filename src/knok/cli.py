@@ -97,9 +97,9 @@ def _learn_card(state: BridgeState, identity, agent_id: str) -> None:
     Two things this deliberately does not do:
 
     * It does not trust the document because the hub sent it. The card is fetched over the same
-      channel as everything else and must still pass ``card_body``'s own signature check, and the
-      body it decodes must name the id we asked for. Over a loopback or tailnet hop that is a
-      meaningful check against a mangled answer and a meaningless one against a hostile hub — §4's
+      channel as everything else and must still pass its own signature check (``_verified_card``),
+      and the body it decodes must name the id we asked for. Over a loopback or tailnet hop that is
+      a meaningful check against a mangled answer and a meaningless one against a hostile hub — §4's
       answer to that is TLS plus a pinned hub key, which is not built yet, so this is exactly as
       strong as the channel. Written down here rather than implied.
     * It does not persist. The pin lasts for this invocation; the next ``send`` asks again. Making

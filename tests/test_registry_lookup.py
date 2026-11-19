@@ -18,7 +18,7 @@ import urllib.parse
 
 import pytest
 
-from knok.bridge import card_body, load_cards
+from knok.bridge import load_cards
 from knok.cli import main
 from knok.hubclient import HubClient
 from knok.identity import b64url_decode
@@ -125,9 +125,12 @@ def test_a_card_that_does_not_verify_is_refused(stale_registry, monkeypatch):
 
     document = json.loads((situation["stale"] / f"muse@{DOMAIN}.json").read_text())
     document["signature"] = "A" + document["signature"][1:]
-    assert card_body(document) is not None, (
-        "precondition: card_body is the bug in #59 — it accepts this document"
-    )
+    # The precondition is about *this* document, not about ``card_body``: the payload still decodes
+    # and still carries a public key, so a refusal here is a statement about the signature. Written
+    # this way on purpose — it holds whether or not #59 is fixed, so this suite cannot be broken by
+    # an unrelated PR landing, and #59's own test pins ``card_body``'s half.
+    body = json.loads(b64url_decode(document["payload"]))
+    assert body["bridge"]["publicKey"], "the payload must still decode: this is a bad signature"
 
     monkeypatch.setattr(
         "knok.cli.HubClient",
