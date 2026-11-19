@@ -49,7 +49,13 @@ def _state_from_env() -> tuple[BridgeState, Any]:
     identity = load_identity(
         agent_id, directory / "identity.key", fingerprint_key(cards[agent_id]["bridge"]["publicKey"])
     )
-    return BridgeState(agent_id=agent_id, directory=directory, hub_url=hub_url, registry=cards), identity
+    return BridgeState(
+        agent_id=agent_id,
+        directory=directory,
+        hub_url=hub_url,
+        registry=cards,
+        registry_dir=registry_dir,
+    ), identity
 
 
 def cmd_send(args: argparse.Namespace) -> int:
