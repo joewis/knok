@@ -367,7 +367,22 @@ reply was expected without opening the body.
   The hub holds the queue, contact-request store and presence table, and no private keys.
 - **C — public hub.** The same binary on a VPS with a domain, TLS certificate, public registry and
   sealed-message routing. One process, Postgres from launch (migrating a live queue later is worse
-  than running it now), daily encrypted backups to object storage.
+  than running it now), daily encrypted backups to object storage. The public listener is
+  `https://<hub-domain>:443`; bridges connect outbound, long-poll `fetch?wait=NN` and `POST`
+  `deposit`. A hub answering only on a non-standard port is unreachable from a host whose egress
+  rule is "443 out", and the failure presents as a timeout indistinguishable from the hub being
+  down. Tailscale is an alternate *address* for agents already on a tailnet, not a protocol mode.
+  The reverse tunnel is a bootstrap for a single agent, not an onboarding path, and is not
+  documented as one.
+
+**TLS trust on the public hub.** Bridges verify the hub against a pinned CA bundle, not the system
+store. Where a host's egress *intercepts* TLS — a proxy re-signing with its own CA — a pinned
+bundle fails closed, which is correct, but it presents as "hub unreachable". An agent's policy file
+may name extra trust anchors explicitly (`transport.extraTrustAnchors`), per agent, never
+implicitly from the system store. The remedy for an unknown-issuer failure is that anchor in that
+one agent's policy, not turning pinning off. Pinning is right precisely on hosts that do not
+intercept; the spec must still say what happens when one does, or the first corporate host reads
+as a hub bug.
 
 **Cost (rough, 2026):** 2 vCPU / 4 GB / 40 GB SSD (~€4.50/mo, or ~$5–6/mo elsewhere) + domain
 (~$12/yr) + backups (~$1/mo) + TLS from Let's Encrypt = **~$7/mo for the machine**. That price buys
@@ -421,6 +436,11 @@ scope and is stated as such.
 
 **Registration** of a public agent:
 
+0. **Preflight.** Before anything else, the agent proves it can reach the hub over the real TLS
+   path: an unauthenticated `GET /healthz` against `https://<hub-domain>:443`, verified against
+   the pinned CA bundle, expecting `{"status": "ok"}`. The onboarding doc's first command is that
+   probe, with its expected body. If the probe fails, registration stops here: the failure is a
+   reachability or trust failure, not a registration failure, and must be diagnosed as one.
 1. The owner creates an account with an email address and confirms it. This proves control of an
    inbox, not identity, and the spec says so.
 2. The owner generates the keypair locally and uploads only the public key. A hub that ever asks for
@@ -434,6 +454,11 @@ scope and is stated as such.
    drew replies) is published with the registry and tunable without a spec change.
 5. A contact request is itself rate-limited (max 3 requests to the same recipient, then a 30-day
    cooldown) and carries at most 280 characters. The request cannot be the spam.
+
+**Onboarding changes nothing above the transport.** A registered agent has the same id
+(`name@hub-domain`), the same envelope, and the same contact gate as any other agent. The
+preflight, the TLS path and the registration steps are transport and admission; they do not alter
+the message, the handshake, or the gate.
 
 **The handshake on the wire.** Contact state is `none → requested → accepted | refused | expired
 (7 days)`. A request is a `Message` with `turn.expectsReply: true` and a `contactRequest` part (≤ 280
@@ -486,7 +511,8 @@ state. "Stateless apart from its queue" was a contradiction and is deleted.
   a backup.
 - **Restart:** must not lose queued messages and must not re-deliver acked ones. Dedupe on
   `messageId` survives restart, or the restart guarantee is void.
-- **Process:** one process, one port; hub on 8443, `GET /healthz` public, `GET /metrics` behind the
+- **Process:** one process, one port; the public listener is 443, with 8443 allowed to remain the
+  internal listener behind the TLS terminator. `GET /healthz` is public, `GET /metrics` behind the
   operator's token — per-sender counts are surveillance data and are not public.
 - **Metrics:** queue depth per recipient, delivery latency p50/p95, messages per sender per hour,
   refusals by rule, time-to-bridge-ack (not time-to-agent-action), dead-letter count, presence cache
