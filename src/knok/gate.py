@@ -23,8 +23,18 @@ from .rates import Rates
 
 @dataclass(frozen=True)
 class Decision:
+    """One answer from the gate: allowed or not, and — for our own records — why.
+
+    ``reason`` is the only thing that may ever reach a stranger, and it is the same string for
+    every refusal, so the answer cannot be used as a directory oracle. ``rule`` is the internal
+    category (#50): it never leaves this process on the 403 path, and it is only ever quoted in a
+    notice to a sender whose key the operator has already pinned in this agent's registry.
+    Refusals that name a rule: ``blocked``, ``policy``, ``limits``, ``thread``, ``malformed``.
+    """
+
     allowed: bool
     reason: str = ""
+    rule: str = ""
 
 
 class Threads:
@@ -79,7 +89,7 @@ class Threads:
             if closed or expects <= 0:
                 # A reply to a message that asked for none, or to a closed thread, is a protocol error.
                 # Dropping it is what stops two agents answering each other forever (§6, §2 goal 4).
-                return Decision(False, REFUSED)
+                return Decision(False, REFUSED, "thread")
             self._conn.execute(
                 "UPDATE threads SET expects = expects - 1, updated = ? WHERE context = ?",
                 (now.isoformat(), context),
@@ -131,29 +141,29 @@ class Gate:
     def decide(self, envelope: object, now: datetime | None = None) -> Decision:
         moment = now or datetime.now(timezone.utc)
         if not isinstance(envelope, dict):
-            return Decision(False, REFUSED)
+            return Decision(False, REFUSED, "malformed")
         message = envelope.get("message")
         if not isinstance(message, dict):
             # Sealed, or malformed. The gate is the post-decryption decision point (§6 v0.5).
-            return Decision(False, REFUSED)
+            return Decision(False, REFUSED, "malformed")
         sender = envelope.get("from")
         if not isinstance(sender, str) or not sender:
-            return Decision(False, REFUSED)
+            return Decision(False, REFUSED, "malformed")
 
         if sender in self.policy.block:
-            return Decision(False, REFUSED)
+            return Decision(False, REFUSED, "blocked")
         if sender not in self.policy.allow:
             if self.contacts.state(sender, moment) != "accepted":
                 if not self.policy.direct_delivery:
-                    return Decision(False, REFUSED)
+                    return Decision(False, REFUSED, "policy")
 
         # Validate before charging the budget: a refused envelope must not spend a sender's quota,
         # or one malformed caller can throttle everyone else on the shared window.
         context = message.get("contextId")
         if not isinstance(context, str) or not context:
-            return Decision(False, REFUSED)
+            return Decision(False, REFUSED, "malformed")
 
         if not self._within_limits(sender, moment):
-            return Decision(False, REFUSED)
+            return Decision(False, REFUSED, "limits")
 
         return self.threads.note_received(context, moment)
