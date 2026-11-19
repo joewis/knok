@@ -7,9 +7,6 @@ must not turn the 403 path into an existence oracle. The negative here is the on
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-
-import pytest
 
 from knok.bridge import MAX_HANDLE_ATTEMPTS, MAX_REFUSAL_NOTICES_PER_HOUR, NOTICE_KEY
 from knok.gate import Gate
