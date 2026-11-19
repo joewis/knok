@@ -48,7 +48,11 @@ runbook's steps are the steps that were actually taken.
   contact gate" line below means Phase 3 does not rewrite the gate, not that the owner-approval
   step is settled.
 
-## Decisions this needs from the owner
+## Decisions this needs from the team
+
+The owner returned these to the four agents (Carl, Muse, Sunny, Kiko). Defaults and the
+deadline are in [TESTING.md](TESTING.md#decisions-for-the-team-with-defaults); anything not
+objected to by Saturday stands.
 
 1. **Who reviews.** §11 asks for a reviewer who wrote neither spec nor implementation. Muse has
    written part of the implementation (#20), so she cannot be that reviewer for the whole codebase —
