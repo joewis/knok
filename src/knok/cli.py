@@ -299,15 +299,62 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Every kind the bridge writes into ``notices.jsonl``, and so every kind this reader can be asked
+#: to select. A filter that cannot name a line the reader prints is a hole in the same file.
+NOTICE_KINDS = ("refused", "expired", "dead", "late", "gap")
+
+#: Each kind dates itself with its own word: a refusal was ``receivedAt`` at the peer's gate, a dead
+#: letter ``deadedAt`` here, a gap release ``releasedAt``. A reader that knew only one or two of
+#: them would print ``?`` where the only copy of a failure should say when it happened.
+NOTICE_TIMES = ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at")
+
+
+def _ranges(seqs: list[Any]) -> str:
+    """``[3, 4, 5, 9]`` -> ``"3-5,9"``: a gap's column stays readable when it skipped many seqs."""
+    numbers = sorted({int(seq) for seq in seqs if isinstance(seq, int)})
+    if len(numbers) != len(seqs):
+        return ",".join(str(seq) for seq in seqs)
+    if not numbers:
+        return ""
+    parts: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        parts.append(f"{start}-{previous}" if previous != start else str(start))
+        start = previous = number
+    parts.append(f"{start}-{previous}" if previous != start else str(start))
+    return ",".join(parts)
+
+
+def _notice_subject(notice: dict[str, Any]) -> str:
+    """Which message the notice is about. A gap has no single message, so it names the seqs it skipped."""
+    message_id = notice.get("messageId")
+    if message_id:
+        return str(message_id)
+    missing = notice.get("missing")
+    if isinstance(missing, list) and missing:
+        return f"seqs {_ranges(missing)}"
+    return "?"
+
+
 def _notice_line(notice: dict[str, Any]) -> str:
-    """One notice as a line a human can scan: when, who, which message, which thread, what."""
+    """One notice as a line a human can scan: when, who, which message, which thread, what.
+
+    Every shape the bridge records must fill every column: a ``?`` here means the reader dropped a
+    fact the file holds, which is the one thing a failure record must not do.
+    """
+    when = next((str(notice[key]) for key in NOTICE_TIMES if notice.get(key)), "?")
     rule = notice.get("rule")
     kind = str(notice.get("kind") or "?")
     return "  ".join(
         [
-            str(notice.get("receivedAt") or notice.get("expiredAt") or notice.get("at") or "?"),
-            str(notice.get("from") or "?"),
-            str(notice.get("messageId") or "?"),
+            when,
+            # A dead letter's frame carries no sender — the queue knows it, the record does not —
+            # so "-" says "not recorded" where "?" would say "the reader failed to find it".
+            str(notice.get("from") or "-"),
+            _notice_subject(notice),
             f"[{notice.get('contextId') or '-'}]",
             f"{kind} ({rule})" if rule else kind,
         ]
@@ -318,9 +365,10 @@ def cmd_notices(args: argparse.Namespace) -> int:
     """Report what became of the messages this agent sent, as far as anything here can know.
 
     ``send`` exits 0 when the hub accepted the envelope; delivery can still fail afterwards, and
-    the failure lands here — a refusal notice from the peer's gate (#50), or the hub's own
-    ``expired``/``dead`` frame. The bridge writes them as it learns them and never queues them, so
-    this reads the same ``notices.jsonl`` the operator sees.
+    the failure lands here — a refusal notice from the peer's gate (#50), the hub's own
+    ``expired``/``dead`` frame, or the receiver's ``gap``/``late`` notice when a stream skipped or
+    reordered messages. The bridge writes them as it learns them and never queues them, so this
+    reads the same ``notices.jsonl`` the operator sees.
 
     It reports and does not act: whether to repeat an attempt, and how often, is a decision about
     the caller's own failure, so it belongs to the adapter. What this gives it is the one fact it
@@ -400,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     #: reports the messageId; repeating the attempt with --retry-of remains the caller's decision.
     notices = sub.add_parser("notices", help="what became of the messages this agent sent")
     notices.add_argument("--limit", type=int, default=20)
-    notices.add_argument("--kind", choices=["refused", "expired", "dead"], default=None)
+    notices.add_argument("--kind", choices=list(NOTICE_KINDS), default=None)
     notices.add_argument("--json", action="store_true")
     notices.set_defaults(func=cmd_notices)
 

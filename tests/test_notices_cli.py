@@ -130,6 +130,71 @@ def test_a_torn_line_does_not_hide_the_rest(state, capsys):
     assert "1 unreadable line" in err
 
 
+#: One of each frame the bridge can write into ``notices.jsonl``, in the writer's own field names.
+#: ``deadedAt``, ``detectedAt`` and ``releasedAt`` are not typos — queue.py records each kind with
+#: its own word for "when", and a gap has ``missing`` seqs instead of one ``messageId``. These are
+#: cases of one reader, not five readers: every shape must fill every column.
+SHAPES = {
+    "refused": {
+        "kind": "refused", "from": f"muse@{DOMAIN}", "receivedAt": "2026-11-19T20:00:00Z",
+        "messageId": "m-50", "contextId": "c-1", "rule": "policy",
+    },
+    "expired": {
+        "kind": "expired", "from": f"muse@{DOMAIN}", "expiredAt": "2026-11-19T21:00:00Z",
+        "messageId": "m-51", "contextId": "c-2",
+    },
+    "dead": {
+        "kind": "dead", "deadedAt": "2026-11-19T22:00:00Z",
+        "messageId": "m-52", "contextId": "c-3", "attempts": 5,
+    },
+    "late": {
+        "kind": "late", "from": f"muse@{DOMAIN}", "to": f"carl@{DOMAIN}",
+        "messageId": "m-53", "contextId": "c-4", "seq": 7, "detectedAt": "2026-11-19T23:00:00Z",
+    },
+    "gap": {
+        "kind": "gap", "from": f"muse@{DOMAIN}", "to": f"carl@{DOMAIN}",
+        "contextId": "c-5", "missing": [3, 4, 5, 9], "releasedAt": "2026-11-20T00:00:00Z",
+    },
+}
+
+
+def test_the_filter_covers_every_kind_the_bridge_writes():
+    # If a kind can be printed but not selected, the adapter has to parse prose to skip it — the
+    # thing --json exists to avoid. The filter and the shapes it filters come from one list.
+    from knok.cli import NOTICE_KINDS
+
+    assert set(NOTICE_KINDS) == set(SHAPES)
+
+
+@pytest.mark.parametrize("kind", sorted(SHAPES))
+def test_every_shape_fills_every_column(state, capsys, kind):
+    record(state, SHAPES[kind])
+    assert main(["notices"]) == 0
+    line = capsys.readouterr().out.strip()
+    assert "?" not in line, f"the reader dropped a fact {kind} records: {line}"
+    when = next(value for key, value in SHAPES[kind].items() if key.endswith("At"))
+    assert when in line
+    assert kind in line
+    assert "m-" in line or "seqs 3-5,9" in line
+
+
+@pytest.mark.parametrize("kind", sorted(SHAPES))
+def test_kind_selects_its_own_shape_and_not_the_others(state, capsys, kind):
+    for shape in SHAPES.values():
+        record(state, shape)
+    assert main(["notices", "--kind", kind, "--json"]) == 0
+    printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert printed == [SHAPES[kind]]
+
+
+def test_a_gap_names_the_seqs_it_skipped_rather_than_one_message(state, capsys):
+    # A gap has no messageId: the honest subject is what the queue actually skipped, compacted so
+    # a long gap stays one scannable column.
+    record(state, SHAPES["gap"])
+    assert main(["notices"]) == 0
+    assert "seqs 3-5,9" in capsys.readouterr().out.strip()
+
+
 @pytest.fixture
 def carl_env(monkeypatch, deployment):
     """The real CLI as carl, against the real hub and bridges."""
