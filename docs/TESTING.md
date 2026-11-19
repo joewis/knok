@@ -29,8 +29,8 @@ Four failure modes make a scenario decorative; every scenario here is written to
   (#48, both halves). Every delivery scenario carries a paired negative in which the sender observes
   a *failure*, and the harness must be able to tell "not yet" from "never".
 - **Thread and identity continuity unasserted.** "The reply arrives" says nothing about *which*
-  thread. A retry that mints a fresh `contextId` (`cli.py:64`) or a second message at the default
-  `seq 0` (`cli.py:139`) is a different message on the wire. Assert the pair `(contextId, seq)`.
+  thread. A retry that mints a fresh `contextId` (`cli.py:157`) or a second message at the default
+  `seq 0` (`cli.py:321`) is a different message on the wire. Assert the pair `(contextId, seq)`.
 - **Timing folded into correctness.** "Delivered within N seconds" hides ordering and duplication.
   At-least-once with dedupe means a correct sender occasionally delivers twice; the assertion is
   "same `messageId`, once at the agent", not "no duplicates ever".
@@ -87,7 +87,7 @@ Four failure modes make a scenario decorative; every scenario here is written to
 8. **Cross-harness** — the same conversation from Hermes, Hatch and OpenClaw. Assumptions that
    survive two implementations tend to break on the third.
 
-### Added by review — five, all owners named
+### Added by review — six, all owners named
 
 9. **Gate-refusal notice** (the #4 fix, as a scenario) — scenario 4's expected observation, run and
    recorded. Owner: bridge/Carl. As filed it blocked the silent-drop exit criterion rather than
@@ -122,7 +122,7 @@ Four failure modes make a scenario decorative; every scenario here is written to
     of revocation is a fail even though §10 says the queue is fsynced and so survives: from outside,
     "revoked" and "restarted, still running the old policy for another 50 polls" look identical.
     Owner: bridge/Carl. Tracked as #52 (closed).
-11. **`recv` applies no gate** — `recv_once` (`recv.py:56-78`) fetches, prints and acks with no
+11. **`recv` applies no gate** — `recv_once` (`recv.py:51-70`) fetches, prints and acks with no
     `Gate.decide` in the path, so revocation and blocking are enforced at deposit only and a blocked
     sender's queued mail still reaches stdout. That is a §9 claim violated, not a harness detail:
     expected observation is that blocked mail does not print; if it does, it is a defect against
@@ -132,7 +132,7 @@ Four failure modes make a scenario decorative; every scenario here is written to
     it is that every disagreement is written down and attributed, so it cannot evaporate. Kiko owns
     the OpenClaw-B column and drafts the table; Sunny owns hers.
 13. **Hub down at send, as a distinct failure** — `knok send` exits 3 when the hub is unreachable and
-    2 on refusal (`cli.py:93-99`), and both are deposit signals, not delivery signals. Scenario: hub
+    2 on refusal (`cli.py:196-200`), and both are deposit signals, not delivery signals. Scenario: hub
     unreachable, `send` exits 3, then the hub returns. Expected: nothing was delivered, and the
     harness's staging layer re-offers with the *same* ids. `send` exiting 3 with no retry is a silent
     drop by the caller; the scenario states which side is responsible, or its pass is luck.
@@ -242,7 +242,7 @@ default stands.
 2. **Where it lives.** Default: nothing leaves the tailnet during testing. The domain and VPS
    decision waits until the review closes, so a launch decision is not made twice.
 3. **Push presence.** Default: Phase 4. Polling is correct and the long-poll is not built (§7).
-4. **Testing scope.** Default: the eight scenarios above plus the four added here (9, 10, 11, 13) and
+4. **Testing scope.** Default: the eight scenarios above plus the five added here (9, 10, 11, 13, 14) and
    the parity table (12) — not an open-ended soak. Adding a scenario is one line in this file and a
    message; removing one needs a reason recorded here. The "what is not tested" record names sealed
    traffic end to end.
