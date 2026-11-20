@@ -89,9 +89,12 @@ advances it.
 ## Delivery semantics
 
 - **Durability before ack, both directions.** A deposit is durable when `POST /v1/mail` returns 202:
-  the hub fsyncs before answering. A handover is durable when the bridge has fsynced its own queue;
-  **it MUST NOT ack before that fsync returns.** Otherwise the hub deletes mail the bridge has not
-  written down, and at-least-once becomes at-most-once.
+  the hub fsyncs before answering. A handover is durable when the bridge has fsynced its own queue
+  **and** the row in its delivery ledger saying what it decided about the item; **it MUST NOT ack
+  before both fsyncs return.** Otherwise the hub deletes mail the bridge has not written down, and
+  at-least-once becomes at-most-once. A decision that destroys mail — `duplicate`, `dropped` — is
+  exactly the case where the record is the only remaining evidence, so a bridge that cannot write
+  the ledger acks nothing and lets the page be re-offered.
 - **Deduped on both sides.** The bridge's `seen` table is durable (it lives in `queue.db`), and the
   hub keeps its own `(recipient, messageId)` index so a duplicate deposit does not create a second
   copy. A duplicate deposit returns `202` with the same `messageId` and stores nothing.
