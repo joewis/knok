@@ -362,7 +362,9 @@ def test_a_waiting_retry_is_reported_and_not_recorded(state, capsys):
 
 
 def test_message_id_with_no_notice_is_not_an_error(state, capsys):
-    assert main(["retry", "--message-id", "m-never-sent"]) == 0
+    # An unknown id is a clean terminal exit (4: no retry was performed and none will be),
+    # not a crash and not a success — the caller can tell it from a delivered retry (0).
+    assert main(["retry", "--message-id", "m-never-sent"]) == 4
     assert "no delivery notice for m-never-sent" in capsys.readouterr().err
 
 
@@ -632,7 +634,7 @@ def test_a_budget_spent_retry_reports_not_delivered(state, capsys):
 
 
 def test_json_reports_an_unknown_message_id_as_not_delivered(state, capsys):
-    assert main(["retry", "--json", "--message-id", "m-never-sent"]) == 0
+    assert main(["retry", "--json", "--message-id", "m-never-sent"]) == 4
     out, err = capsys.readouterr()
     outcome = json.loads(out.strip())
     assert outcome["messageId"] == "m-never-sent"
@@ -689,7 +691,146 @@ def test_retry_send_failed_replays_a_failed_send(carl_env, capsys, monkeypatch):
     monkeypatch.setattr(cli_module, "datetime", real_datetime)
     monkeypatch.setenv("KNOK_HUB_URL", hub.url)
 
-    assert main(["retry", "--send-failed", sent["messageId"]]) == 0
+    assert main(["retry", "--send-failed", sent["messageId"], "--send-exit", "3"]) == 0
     line = capsys.readouterr().out.strip()
     assert f"retried {sent['messageId']} (attempt 1): accepted" in line
     assert muse.poll_once()["queued"] == 1
+
+
+#: The four remaining HOLD items (#68, second round): criterion-4 exit codes, the synthetic
+#: --send-failed notice with no time, the hardcoded decide_send(3, ...), and an unreadable
+#: retries.jsonl. Each test below fails on the branch as pushed and passes with the fix.
+
+
+def test_single_message_exit_codes_tell_the_outcomes_apart(state, capsys):
+    """Criterion 4, exit-code half: a budget-exhausted retry, a permanent refusal, an
+    unknown id and a performed retry must not all exit 0. In single-message mode 0 is
+    delivered, 1 is deferred (waiting, or a due retry that could not be performed), and 4
+    is terminal — the reason text says which terminal bound stopped it."""
+    # Budget exhausted.
+    record_notice(state, live_notice("m-50"))
+    write_attempt(state, live_envelope("m-50"))
+    for attempt in (1, 2):
+        assert record_retry(state, {"messageId": "m-50", "decision": "retry", "attempt": attempt})
+    assert main(["retry", "--message-id", "m-50"]) == 4
+    out = capsys.readouterr().out
+    assert "terminal m-50" in out
+    assert "budget" in out
+    # Permanent refusal.
+    record_notice(state, live_notice("m-51", rule="policy"))
+    write_attempt(state, live_envelope("m-51"))
+    assert main(["retry", "--message-id", "m-51"]) == 4
+    assert "terminal m-51" in capsys.readouterr().out
+    # Unknown id.
+    assert main(["retry", "--message-id", "m-never-sent"]) == 4
+    # Waiting is deferred, not terminal: exit 1, try again later.
+    record_notice(state, live_notice("m-52", received_hours_ago=1 / 6))
+    write_attempt(state, live_envelope("m-52"))
+    assert main(["retry", "--message-id", "m-52"]) == 1
+    assert "waiting m-52" in capsys.readouterr().out
+
+
+def test_a_successful_send_failed_retry_is_resolved_not_repeated(carl_env, capsys, monkeypatch):
+    """The synthetic notice is dated from the attempt's sentAt, so a retry the hub accepted
+    resolves it: the next --send-failed reports resolved instead of depositing the same
+    envelope again as the next attempt in the ladder.
+
+    The failed send is dated ten minutes back, so both ladder rungs are due — without the
+    date, the second call would wait rather than re-deposit, and the defect would hide.
+    """
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+
+    real_datetime = cli_module.datetime
+
+    class _Past(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.now(tz) - timedelta(minutes=10)
+
+    monkeypatch.setattr(cli_module, "datetime", _Past)
+    monkeypatch.setenv("KNOK_HUB_URL", "http://127.0.0.1:1")
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 3
+    out, _err = capsys.readouterr()
+    sent = json.loads(out.strip())
+    assert sent["delivered"] is False
+    monkeypatch.setattr(cli_module, "datetime", real_datetime)
+    monkeypatch.setenv("KNOK_HUB_URL", hub.url)
+
+    deposits = _count_deposits(monkeypatch)
+    assert main(["retry", "--send-failed", sent["messageId"], "--send-exit", "3"]) == 0
+    line = capsys.readouterr().out.strip()
+    assert f"retried {sent['messageId']} (attempt 1): accepted" in line
+    assert deposits == [sent["messageId"]]
+    assert muse.poll_once()["queued"] == 1
+
+    # The next call finds the same failure, but the retry already succeeded: resolved.
+    assert main(["retry", "--send-failed", sent["messageId"], "--send-exit", "3"]) == 0
+    line = capsys.readouterr().out.strip()
+    assert f"resolved {sent['messageId']}" in line
+    assert deposits == [sent["messageId"]], "a resolved retry is never deposited again"
+    assert muse.poll_once()["queued"] == 0
+
+
+def test_send_failed_with_exit_2_is_terminal_and_not_replayed(state, capsys, monkeypatch):
+    """A send the hub permanently refused (exit 2) is never replayed: --send-failed must
+    use the exit code the send actually exited with, not assume 3. And without --send-exit
+    the command refuses rather than guessing."""
+    write_attempt(state, live_envelope("m-50"))
+    deposits = _count_deposits(monkeypatch)
+    assert main(["retry", "--send-failed", "m-50", "--send-exit", "2"]) == 4
+    out, _err = capsys.readouterr()
+    assert "terminal m-50" in out
+    assert "permanently refused" in out
+    assert deposits == [], "an exit-2 send is never replayed"
+
+    assert main(["retry", "--send-failed", "m-50"]) == 4
+    out, err = capsys.readouterr()
+    assert "needs --send-exit" in err
+    assert deposits == []
+
+
+def test_send_exit_without_send_failed_is_a_usage_error(state, capsys):
+    assert main(["retry", "--send-exit", "3"]) == 4
+    assert "needs --send-failed" in capsys.readouterr().err
+
+
+def test_a_corrupt_retry_line_does_not_abort_the_scan(state, capsys):
+    """A torn line in the retry ledger (a crash mid-append, a byte that is not valid UTF-8)
+    loses only that line: the scan reads the records it can and completes instead of dying
+    on bookkeeping."""
+    record_notice(state, live_notice("m-50"))
+    write_attempt(state, live_envelope("m-50"))
+    with open(state / RETRY_LEDGER, "wb") as handle:
+        handle.write(b'{"messageId": "m-50", "decision": "retry", "attempt": 1}\n')
+        handle.write(b'\xff\xfe{"messageId": "m-51", "decision": "retry"}\n')
+    assert main(["retry", "--dry-run"]) == 0
+    records = read_retries(state)
+    assert [record["messageId"] for record in records] == ["m-50"], (
+        "the valid record still counts; only the torn line is lost"
+    )
+
+
+def test_an_unreadable_retry_ledger_is_a_warning_not_a_crash(state, capsys):
+    """A retry ledger that cannot be opened at all (here, a directory in its place — the
+    same OSError a permission failure raises) reads as empty and the scan proceeds; the
+    caller is told."""
+    record_notice(state, live_notice("m-50"))
+    write_attempt(state, live_envelope("m-50"))
+    (state / RETRY_LEDGER).mkdir()
+    assert main(["retry", "--dry-run"]) == 0
+    out, err = capsys.readouterr()
+    assert "could not read" in err
+    assert "would retry m-50 (attempt 1)" in out
+
+
+def test_a_corrupt_attempt_ledger_does_not_abort_a_retry(state, capsys, monkeypatch):
+    """The same resilience on the deposit path: a sent.jsonl the reader cannot decode is
+    read as no attempt (exit 4), not as a crash."""
+    write_attempt(state, live_envelope("m-50"))
+    with open(state / SENT_LEDGER, "wb") as handle:
+        handle.write(b'\xff\xfe{"messageId": "m-50"}\n')
+    record_notice(state, live_notice("m-50"))
+    assert main(["retry", "--message-id", "m-50"]) == 4
+    assert "terminal m-50" in capsys.readouterr().out

@@ -77,6 +77,18 @@ Three bounds, and they are the whole policy:
   never mint a fresh ``contextId`` — it replays the stored envelope, so the thread survives —
   and it must never be attempted on an envelope that cannot arrive.
 
+How a caller tells the outcomes apart (criterion 4). A retry that landed, a message that is
+terminally dead, a message that is still waiting and an unknown id must not all look the same.
+Every ``knok retry`` outcome carries ``delivered`` — True only when a retry landed or an
+earlier retry already did — and in single-message mode (``--message-id`` or ``--send-failed``)
+the exit code says the same thing without --json: 0 delivered, 1 deferred (waiting, or a due
+retry that could not be performed — try again later), 2 the retry was performed and the hub
+refused it, 3 the retry was performed and the hub was unreachable, 4 terminal (budget spent,
+a permanent refusal, expired, dead, an unknown id, no stored attempt — no retry was performed
+and none will be). In scan mode the exit code is 0 when the scan completed and 1 when a due
+retry could not be performed; the per-message outcomes in --json carry the detail there. The
+reason text says which terminal bound stopped it; the exit code only says that it stopped.
+
 How attempts are recorded. ``sent.jsonl`` already records every attempt (``messageId``,
 ``contextId``, the signed envelope) before deposit, so a retry is a replay of a record, not a
 rebuild. This module adds ``retries.jsonl``: one fsynced line per retry the adapter *performs*
@@ -199,19 +211,35 @@ def envelope_sent_at(envelope: dict[str, Any] | None) -> datetime | None:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """The dict records in a jsonl file, skipping blank and unreadable lines."""
+    """The dict records in a jsonl file, skipping blank and unreadable lines.
+
+    A torn line (a crash mid-append, or a byte that is not valid UTF-8) loses only
+    that line: each line is decoded on its own, so one bad byte does not take the
+    whole ledger with it. A file that cannot be opened at all (permissions, a
+    missing directory) reads as empty, and the caller is told — the scan proceeds
+    instead of dying on bookkeeping. A record the adapter cannot read is a record
+    it cannot count, so a retry it cannot count is never deposited (the reservation
+    in ``cmd_retry`` fails closed on the same ledger).
+    """
     if not path.exists():
         return []
+    try:
+        handle = open(path, "rb")
+    except OSError as exc:
+        print(f"warning: could not read {path}: {exc}", file=sys.stderr)
+        return []
     records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict):
-            records.append(record)
+    with handle:
+        for raw in handle:
+            line = raw.decode("utf-8", errors="replace")
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
     return records
 
 
