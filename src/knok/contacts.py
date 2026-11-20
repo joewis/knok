@@ -91,11 +91,19 @@ class Contacts:
         )
         #: The audit of owner decisions. "The owner approved this key" has to be distinguishable
         #: from "approved this name before the key was rotated", so the fingerprint is recorded.
+        #: ``fingerprint`` is what was *presented*; ``decided_fingerprint`` is what the owner was
+        #: looking at when they decided (#65). They differ when the peer rotates a key while the
+        #: request sits held, and collapsing the two would make "refused this key" and "refused a
+        #: key that had already rotated away" the same row.
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS approvals (peer TEXT PRIMARY KEY, text TEXT NOT NULL,"
             " fingerprint TEXT NOT NULL, presented TEXT NOT NULL, decision TEXT,"
-            " decided_by TEXT, decided_at TEXT)"
+            " decided_by TEXT, decided_at TEXT, decided_fingerprint TEXT)"
         )
+        # Additive migration: a contacts file created before #65 has no decided_fingerprint.
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(approvals)")}
+        if "decided_fingerprint" not in columns:
+            self._conn.execute("ALTER TABLE approvals ADD COLUMN decided_fingerprint TEXT")
         self._conn.commit()
 
     def close(self) -> None:
@@ -270,27 +278,55 @@ class Contacts:
         if fingerprint and fingerprint != row[0]:
             raise ContactError(f"{peer}: the key shown to the owner is not the key on the request")
         self._conn.execute(
-            "UPDATE approvals SET decision = 'approved', decided_by = ?, decided_at = ? WHERE peer = ?",
-            (decided_by, _ts(moment), peer),
+            "UPDATE approvals SET decision = 'approved', decided_by = ?, decided_at = ?,"
+            " decided_fingerprint = ? WHERE peer = ?",
+            (decided_by, _ts(moment), fingerprint or row[0], peer),
         )
         self._conn.commit()
 
     @_locked
-    def deny(self, peer: str, decided_by: str, now: datetime | None = None) -> None:
-        """Record the owner's refusal. Terminal, and delivered as silence like every refusal."""
+    def deny(self, peer: str, decided_by: str, fingerprint: str = "",
+             now: datetime | None = None) -> None:
+        """Record the owner's refusal. Terminal, and delivered as silence like every refusal.
+
+        ``fingerprint`` is the key the owner was shown at the moment they refused. Unlike
+        ``approve``, a fingerprint that differs from the presented one is **recorded rather than
+        refused**: refusing is safe whatever key is attached, and recording the rotated key is the
+        point — it keeps "the owner refused this key" distinguishable from "the owner refused a key
+        that had already rotated away" (#65).
+        """
         moment = now or datetime.now(timezone.utc)
         row = self._conn.execute(
-            "SELECT decision FROM approvals WHERE peer = ?", (peer,)
+            "SELECT decision, fingerprint FROM approvals WHERE peer = ?", (peer,)
         ).fetchone()
         if row is None or self.local_state(peer, moment) != LOCAL_HELD:
             raise ContactError(f"{peer} has no held request to deny")
         if row[0] is not None:
             raise ContactError(f"{peer} has already been {row[0]}")
         self._conn.execute(
-            "UPDATE approvals SET decision = 'denied', decided_by = ?, decided_at = ? WHERE peer = ?",
-            (decided_by, _ts(moment), peer),
+            "UPDATE approvals SET decision = 'denied', decided_by = ?, decided_at = ?,"
+            " decided_fingerprint = ? WHERE peer = ?",
+            (decided_by, _ts(moment), fingerprint or row[1], peer),
         )
         self._set(peer, "refused", moment)
+
+    @_locked
+    def decision(self, peer: str) -> dict[str, object] | None:
+        """The owner's recorded decision, with both fingerprints (#65).
+
+        ``presented`` is when the request was shown; ``decided_fingerprint`` is the key on screen
+        when the owner answered. They differ only when the peer rotated a key while held.
+        """
+        row = self._conn.execute(
+            "SELECT peer, text, fingerprint, presented, decision, decided_by, decided_at,"
+            " decided_fingerprint FROM approvals WHERE peer = ?",
+            (peer,),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = ("peer", "text", "presented_fingerprint", "presented", "decision",
+                "decided_by", "decided_at", "decided_fingerprint")
+        return dict(zip(keys, row))
 
     @_locked
     def accept(self, peer: str, now: datetime | None = None) -> None:

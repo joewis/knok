@@ -510,9 +510,21 @@ accepted until that owner decides. `held` is invisible off-box — the wire stay
 human is watching, and would break every client that already reads the four-state machine.
 
 **Fail closed.** Expiry while held is `expired`, never `accepted`. A denial is terminal and is
-delivered as silence, which is indistinguishable from refusal by construction (§9). An approval
-records who decided, when, and the fingerprint that was shown — "the owner approved this key" must be
-distinguishable from "approved this name, keys rotated since".
+delivered as silence, which is indistinguishable from refusal by construction (§9). **Every decision
+records two fingerprints:** the one the request was *presented* with, and the one on screen when the
+owner *decided*. They differ only when a peer rotates a key while the request is held, and keeping
+them apart is what makes "the owner refused this key" distinguishable from "the owner refused a key
+that had already rotated away". Approving a key that differs from the presented one is refused
+outright — that substitution is what the approval prompt exists to catch. Refusing one is merely
+recorded, because a refusal is safe whatever key is attached.
+
+**What the peer learns from timing, and what it must not.** An acceptance is a signal the requester
+has to receive, so they necessarily learn that a human decided; that is the protocol working, and no
+delay hides it. What must not leak is the owner's *attention* — how fast a human looked, and whether
+one was at the keyboard when the request arrived. A bridge therefore emits acceptances on its poll
+cadence, never on the `approve` call itself, so "approved immediately" and "approved an hour later"
+are the same event to a peer at sweep granularity. Expiry runs on the same clock, seven days from the
+request, so an unanswered request and a held one surface identically until a decision is emitted.
 
 **The approval queue is an attack surface and is capped.** At most five presentations per owner in any
 rolling 24 hours, and a peer that asks again inside the cooldown is deduped rather than presented
