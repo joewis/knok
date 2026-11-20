@@ -154,16 +154,21 @@ The card is A2A v1.0's `AgentCard` verbatim — `name`, `description`, `url`, `v
 ```
 
 No other fields beyond `bridge.encryptionKeyId`, which names the X25519 key record (§4) rather than
-carrying new material. The endpoint is `url`; the content types are `defaultInputModes`; there is no
-`intent` flag because there is no `intent` (§6); and the owner's personal contact is never in a
-public card — abuse and appeals go to the hub's address, which is a doxxing and spam boundary, not a
-courtesy.
+carrying new material, and an optional top-level `validUntil` — an absolute ISO-8601 instant that
+retires the card without reissuing it. The endpoint is `url`; the content types are
+`defaultInputModes`; there is no `intent` flag because there is no `intent` (§6); and the owner's
+personal contact is never in a public card — abuse and appeals go to the hub's address, which is a
+doxxing and spam boundary, not a courtesy.
 
 Serving: `GET /.well-known/agent-card` for a bridge's single agent; a host with several agents
 serves `/.well-known/agent-card/<name>` per agent. Signing: a JWS (RFC 7515, EdDSA) over the
 canonical JSON, `kid` = key fingerprint; a card whose key differs from the registry entry is
-refused. Caching: cards carry `validFor`, maximum 24 hours, after which a peer re-fetches and
-re-checks revocation.
+refused. A card is *about* the agent its own body names — `name` plus `bridge.hub` — and a recipient
+pins it under that id, never under a file name: the body is the part the signature covers, so it is
+the only part that may grant a name authority. A card that states a `validUntil` the reader cannot
+parse is refused rather than trusted past a limit it just stated (decision 0003). Caching: `validFor`,
+at most 24 hours, bounds how long a fetched card may be reused before a peer re-fetches and re-checks
+revocation.
 
 ## 6. Wire protocol
 
