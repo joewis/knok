@@ -158,6 +158,48 @@ def test_offline_recipient_receives_on_return(deployment):
     assert second["queued"] == 0, "no duplicate may reach the application"
 
 
+def test_a_message_signed_after_the_senders_card_lapsed_is_not_trusted(deployment):
+    """#62 in the loop: the card that was valid when the bridge loaded stops accounting for mail.
+
+    The pinned body is the one ``load_cards`` verified; the expiry is moved into the past here so
+    the card lapses *after* the bridge started — the case a restart used to be the only cure for.
+    """
+    hub, bridges, root = deployment
+    carl, muse = bridges["carl"], bridges["muse"]
+    lapsed = now() - timedelta(minutes=1)
+    carl.state.registry[muse.identity.agent_id]["validUntil"] = iso(lapsed)
+
+    def envelope_for(sent_at, message_id):
+        unsigned = {
+            "envelopeVersion": 1,
+            "seq": 0,
+            "message": {
+                "kind": "message",
+                "messageId": message_id,
+                "contextId": f"c-{message_id}",
+                "role": "agent",
+                "parts": [{"kind": "text", "text": "is the card still good?"}],
+            },
+            "from": muse.identity.agent_id,
+            "to": [carl.identity.agent_id],
+            "sentAt": iso(sent_at),
+            "expiresAt": iso(sent_at + timedelta(hours=72)),
+            "turn": {"expectsReply": True, "closesThread": False},
+        }
+        return sign(unsigned, muse.identity)
+
+    # Signed while the card was valid: it still accounts for that message (decision 0002).
+    before = envelope_for(lapsed - timedelta(hours=1), "m-before-expiry")
+    assert carl._handle(before) == ("queued", "m-before-expiry")
+
+    # Signed after it lapsed: the same pinned body no longer answers for the key.
+    after = envelope_for(lapsed + timedelta(seconds=1), "m-after-expiry")
+    assert carl._handle(after) == ("unhandled", None)
+
+    assert carl.queue.get()["message"]["messageId"] == "m-before-expiry"
+    assert carl.queue.get() is None, "the message signed after the card lapsed must not be queued"
+
+
 def test_kill_between_fetch_and_ack_redelivers_without_duplicating(deployment):
     hub, bridges, root = deployment
     carl, muse = bridges["carl"], bridges["muse"]
