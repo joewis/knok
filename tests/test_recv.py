@@ -256,3 +256,116 @@ def test_recv_does_not_print_mail_from_a_revoked_sender(tmp_path, capsys):
         assert page["messages"] == []
     finally:
         helpers.close_hub(ns)
+
+
+def _closed_policy(state, allow=()):
+    """A policy file that admits nobody we did not name. Returns its path."""
+    path = state.directory / "policy.json"
+    path.write_text(json.dumps({
+        "agent_id": state.agent_id,
+        "contact_policy": "closed",
+        "deployment": "private",
+        "allow": list(allow),
+        "block": [],
+        "limits": {},
+    }))
+    return path
+
+
+def test_a_notice_is_printed_even_when_its_sender_is_not_admitted(agent_state, capsys):
+    """"A notice is a statement about our own message, not mail to be gated (#51).
+
+    ``bridge._handle`` checks ``message.metadata[knok.notice]`` before the gate "so it can never
+    enter a thread or a gate decision"; recv must do the same or a recv-only agent never learns
+    that what it sent was refused or expired.
+    """
+    ns, state = agent_state
+    _closed_policy(state)  # carl is not admitted
+    # Built and signed with the metadata in place: adding it after signing invalidates the
+    # signature, and the hub would answer 403 for a reason that has nothing to do with the test.
+    unsigned = {
+        "envelopeVersion": 1,
+        "seq": 0,
+        "message": {
+            "kind": "message",
+            "messageId": helpers.new_message_id(),
+            "contextId": "c-notice",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "refused: policy"}],
+            "metadata": {"knok.notice": {"reason": "policy"}},
+        },
+        "from": ns.carl_id.agent_id,
+        "to": [ns.muse_id.agent_id],
+        "sentAt": helpers.iso(helpers.now_dt() - timedelta(minutes=1)),
+        "expiresAt": helpers.iso(helpers.now_dt() + timedelta(hours=72)),
+        "turn": {"expectsReply": False, "closesThread": False},
+    }
+    envelope = helpers.sign(unsigned, ns.carl_id)
+    status, _body, _ = helpers.deposit(ns.url, envelope)
+    assert status == 202
+
+    assert recv_once(state, ns.muse_id) == 1
+    printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert printed[0]["message"]["metadata"]["knok.notice"]["reason"] == "policy"
+
+    # And it is acked like any handled item, so it does not re-print.
+    status, page = helpers.fetch_as(ns.url, ns.muse_id)
+    assert page["messages"] == []
+
+
+def test_a_refused_message_prints_the_uniform_reason_and_not_the_internal_rule(
+    agent_state, capsys
+):
+    """``gate.rule`` is an internal category; ``blocked`` is never quoted anywhere (#51)."""
+    ns, state = agent_state
+    _closed_policy(state)
+    deposit(ns, text="let me in")
+
+    assert recv_once(state, ns.muse_id) == 0
+    err = capsys.readouterr().err
+    assert "gate refused" in err
+    # The refusal string is shared by every refusal class, so it must not name the rule.
+    assert "policy" not in err and "blocked" not in err
+
+
+def test_a_sealed_envelope_is_left_at_the_hub_rather_than_acked_away(
+    agent_state, capsys, monkeypatch
+):
+    """recv cannot read form 2, so it must not destroy it either (#51, #70).
+
+    The hub refuses to deposit a sealed envelope today, which is the only reason this cannot be
+    exercised through it. The guard matters for the day that changes: an ack is deletion.
+    """
+    ns, state = agent_state
+    sealed = {
+        "envelopeVersion": 1,
+        "seq": 0,
+        "from": ns.carl_id.agent_id,
+        "to": [ns.muse_id.agent_id],
+        "sentAt": helpers.iso(helpers.now_dt()),
+        "expiresAt": helpers.iso(helpers.now_dt() + timedelta(hours=1)),
+        "messageId": "m-sealed-1",
+        "sealed": {"hpke": {"enc": "x", "ciphertext": "y"}, "recipientKeyId": "z"},
+    }
+    acked = []
+
+    class FakeBody:
+        @staticmethod
+        def get(key, default=None):
+            return [sealed] if key == "messages" else default
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def fetch(self, limit=None):
+            return FakeBody()
+
+        def ack(self, ids):
+            acked.extend(ids)
+
+    monkeypatch.setattr("knok.recv.HubClient", FakeClient)
+
+    assert recv_once(state, ns.muse_id) == 0
+    assert capsys.readouterr().out == ""
+    assert acked == [], "a sealed envelope was acked: that deletes mail recv cannot read"

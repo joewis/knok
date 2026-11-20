@@ -36,7 +36,7 @@ import json
 import sys
 
 from . import policy as policy_mod
-from .bridge import BridgeState
+from .bridge import NOTICE_KEY, BridgeState
 from .contacts import Contacts
 from .gate import Gate, Threads
 from .hubclient import HubClient
@@ -52,9 +52,12 @@ def _gate_for(state: BridgeState) -> tuple[Gate, list]:
     allow-list. That is a private deployment's pre-approval (``provision.py`` writes the same
     allow-list into a policy): the operator pins a card to say these agents may talk, so a card
     removed from the registry revokes the peer for ``recv`` as surely as a policy edit does.
-    Either way the gate is the same object the bridge builds, so a sender the bridge would
-    refuse is refused here too — including one revoked since the mail was queued, because the
-    policy and the registry are read fresh on every call.
+    Without a policy file this is a recv-only fallback, not parity with the bridge: the pinned
+    registry becomes the allow-list, there is no block list and no limits, so a pinned peer is
+    admitted and can only be revoked by removing its card. With a policy file the gate is the
+    object the bridge builds, so a sender the bridge would refuse is refused here too — including
+    one revoked since the mail was queued, because policy and registry are read fresh on every
+    call.
 
     A policy file that cannot be read, or names another agent, is a misconfiguration, not a
     reason to fall back: the call fails loudly rather than silently opening the gate.
@@ -83,6 +86,20 @@ def _gate_for(state: BridgeState) -> tuple[Gate, list]:
     threads = Threads(state.directory / "threads.db")
     gate = Gate(policy, contacts, threads, rates)
     return gate, [rates, contacts, threads]
+
+
+def _is_refusal_notice(envelope: dict) -> bool:
+    """True when this envelope is a notice about one of our own messages.
+
+    Same key the bridge uses (``bridge.NOTICE_KEY``), for the same reason: a notice is not
+    addressed mail, it is a report that something we sent was refused or expired, and it must not
+    be judged as inbound traffic.
+    """
+    message = envelope.get("message")
+    if not isinstance(message, dict):
+        return False
+    metadata = message.get("metadata")
+    return isinstance(metadata, dict) and NOTICE_KEY in metadata
 
 
 def _ack_id(envelope: object) -> str | None:
@@ -123,9 +140,26 @@ def recv_once(state: BridgeState, identity: Identity, limit: int = 20) -> int:
         printed = 0
         message_ids: list[str] = []
         for envelope in envelopes:
-            if isinstance(envelope, dict) and envelope.get("kind") in {"expired", "dead"}:
+            if not isinstance(envelope, dict):
+                continue
+            if envelope.get("kind") in {"expired", "dead"}:
                 # A hub transport frame is not mail: it carries no sender to gate, and the
                 # bridge handles it before the gate for the same reason.
+                sys.stdout.write(json.dumps(envelope, sort_keys=True) + "\n")
+                printed += 1
+            elif "message" not in envelope:
+                # Form 2 (sealed). There is no message for the gate to judge, and where it is
+                # decrypted is still open (#70). Left at the hub rather than acked away: an ack
+                # would destroy mail recv cannot read, and a refusal here would look like a
+                # policy decision rather than a limitation.
+                sys.stderr.write(
+                    "sealed envelope left at the hub: no form 1 message to gate or print\n"
+                )
+                continue
+            elif _is_refusal_notice(envelope):
+                # A notice is a statement about a message we sent, not mail for us: the bridge
+                # handles it before the gate so it can never enter a thread or a decision, and
+                # recv must do the same or a recv-only agent never learns its message died.
                 sys.stdout.write(json.dumps(envelope, sort_keys=True) + "\n")
                 printed += 1
             else:
@@ -142,9 +176,12 @@ def recv_once(state: BridgeState, identity: Identity, limit: int = 20) -> int:
                         message.get("messageId") if isinstance(message, dict) else None
                     )
                     sender = envelope.get("from") if isinstance(envelope, dict) else None
+                    # The refusal string is uniform on purpose: `rule` is an internal category
+                    # that gate.py says never leaves the process, and `blocked` is never quoted
+                    # anywhere. stderr is this operator's, but the contract is the contract.
                     sys.stderr.write(
                         f"gate refused {message_id or '?'} from {sender or '?'}"
-                        f" ({decision.rule or 'refused'})\n"
+                        f" ({decision.reason or 'refused'})\n"
                     )
             ack_id = _ack_id(envelope)
             if ack_id is not None:
