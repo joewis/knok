@@ -41,6 +41,15 @@ def envelope(sender=SENDER, context="c-1"):
     }
 
 
+def deliver(gate, env, now=T0):
+    """The production order: decide, then commit the receipt. The bridge does step 2 inside the
+    queue's insert transaction; here there is no queue, so the threads store commits it itself."""
+    decision = gate.decide(env, now)
+    if decision.allowed:
+        gate.threads.apply_receipt(decision, now)
+    return decision
+
+
 def test_stranger_is_refused_with_the_shared_reason(tmp_path):
     gate, _ = build(tmp_path, CLOSED)
     decision = gate.decide(envelope(sender=STRANGER), T0)
@@ -88,9 +97,26 @@ def test_two_questions_in_one_context_owe_two_answers(tmp_path):
     gate, _ = build(tmp_path, CLOSED)
     gate.threads.note_sent("c-1", expects_reply=True, closes=False, now=T0)
     gate.threads.note_sent("c-1", expects_reply=True, closes=False, now=T0)
-    assert gate.decide(envelope(context="c-1"), T0).allowed is True
-    assert gate.decide(envelope(context="c-1"), T0).allowed is True
-    assert gate.decide(envelope(context="c-1"), T0).allowed is False
+    assert deliver(gate, envelope(context="c-1")).allowed is True
+    assert deliver(gate, envelope(context="c-1")).allowed is True
+    assert deliver(gate, envelope(context="c-1")).allowed is False
+
+
+def test_decide_alone_moves_no_conversation_state(tmp_path):
+    # #69: the answer and the fact are separate until the message is stored. Asking three times
+    # without committing anything must leave the two expectations intact — otherwise a retry of an
+    # already-queued message, or a failed insert, would spend them for nothing.
+    gate, _ = build(tmp_path, CLOSED)
+    gate.threads.note_sent("c-1", expects_reply=True, closes=False, now=T0)
+    gate.threads.note_sent("c-1", expects_reply=True, closes=False, now=T0)
+    for _ in range(3):
+        decision = gate.decide(envelope(context="c-1"), T0)
+        assert decision.allowed is True
+        assert decision.transition is not None and decision.transition.context == "c-1"
+    row = gate.threads._conn.execute(
+        "SELECT expects FROM threads WHERE context = 'c-1'"
+    ).fetchone()
+    assert row[0] == 2
 
 
 def test_closed_thread_refuses_further_traffic(tmp_path):

@@ -80,7 +80,9 @@ def make_bridge(base: Path, name, identities, *, allow):
         "limits": {},
     })
     contacts = Contacts(base / "contacts.db")
-    threads = Threads(base / "threads.db")
+    # Thread state lives in the queue's file: a receipt commits inside the queue's insert
+    # transaction, so the decrement and the message it belongs to cannot diverge (#69).
+    threads = Threads(base / "queue.db")
     queue = Queue(base / "queue.db", identity.agent_id)
     gate = Gate(policy, contacts, threads)
     cards = {

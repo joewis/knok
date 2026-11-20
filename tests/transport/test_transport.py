@@ -31,13 +31,6 @@ from knok.transport import (  # noqa: E402
 )
 
 
-@pytest.fixture
-def pair(tmp_path):
-    pair = make_pair(tmp_path)
-    yield pair
-    close_pair(pair)
-
-
 def _get(url, path):
     parsed = urllib.parse.urlparse(url)
     conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
