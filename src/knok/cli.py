@@ -36,10 +36,17 @@ from .envelope import sign
 from .hubclient import HubClient, HubError, HubRefused
 from .identity import b64url_decode, load as load_identity
 from .recv import recv_once
-
-#: Every attempt this agent deposited, with the signed envelope it deposited. ``--retry-of`` reads
-#: it: only the sender knows which attempt it is repeating, so the sender has to keep the record.
-SENT_LEDGER = "sent.jsonl"
+from .retry import (
+    NOTICE_TIMES,
+    SENT_LEDGER,
+    decide_notice,
+    due,
+    read_attempts,
+    read_notices,
+    read_retries,
+    record_retry,
+    terminal_record,
+)
 
 
 def _iso(moment: datetime) -> str:
@@ -240,6 +247,29 @@ def _find_attempt(state: BridgeState, message_id: str) -> dict[str, Any] | None:
     return found
 
 
+def _retry_envelope(
+    state: BridgeState, identity, message_id: str
+) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+    """Re-deposit a stored attempt, without printing. Returns (status, result, envelope).
+
+    The ``knok retry`` command uses this directly so it can format the outcome itself; the
+    ``send --retry-of`` path keeps its own printing in ``_retry`` below.
+    """
+    envelope = _find_attempt(state, message_id)
+    if envelope is None:
+        print(
+            f"no attempt {message_id} in {_ledger_path(state)}: a retry repeats an attempt this "
+            "agent actually made, and only its own record can say which thread that was",
+            file=sys.stderr,
+        )
+        return 4, None, None
+    if envelope.get("from") != identity.agent_id:
+        print(f"{message_id} was sent by {envelope.get('from')}, not by me", file=sys.stderr)
+        return 4, None, None
+    status, result = _try_deposit(HubClient(state.hub_url, identity), envelope)
+    return status, result, envelope
+
+
 def _retry(state: BridgeState, identity, args: argparse.Namespace) -> int:
     """Re-deposit an earlier attempt verbatim, so its thread survives the retry (#48).
 
@@ -249,19 +279,8 @@ def _retry(state: BridgeState, identity, args: argparse.Namespace) -> int:
     not a rewrite — the hub answers "duplicate" when the first copy is still queued, and the
     recipient's queue dedupes by ``messageId`` when it is not.
     """
-    envelope = _find_attempt(state, args.retry_of)
-    if envelope is None:
-        print(
-            f"no attempt {args.retry_of} in {_ledger_path(state)}: a retry repeats an attempt this "
-            "agent actually made, and only its own record can say which thread that was",
-            file=sys.stderr,
-        )
-        return 4
-    if envelope.get("from") != identity.agent_id:
-        print(f"{args.retry_of} was sent by {envelope.get('from')}, not by me", file=sys.stderr)
-        return 4
-    status, result = _try_deposit(HubClient(state.hub_url, identity), envelope)
-    if result is not None:
+    status, result, envelope = _retry_envelope(state, identity, args.retry_of)
+    if result is not None and envelope is not None:
         message = envelope["message"]
         print(
             json.dumps(
@@ -302,11 +321,6 @@ def cmd_inbox(args: argparse.Namespace) -> int:
 #: Every kind the bridge writes into ``notices.jsonl``, and so every kind this reader can be asked
 #: to select. A filter that cannot name a line the reader prints is a hole in the same file.
 NOTICE_KINDS = ("refused", "expired", "dead", "late", "gap")
-
-#: Each kind dates itself with its own word: a refusal was ``receivedAt`` at the peer's gate, a dead
-#: letter ``deadedAt`` here, a gap release ``releasedAt``. A reader that knew only one or two of
-#: them would print ``?`` where the only copy of a failure should say when it happened.
-NOTICE_TIMES = ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at")
 
 
 def _ranges(seqs: list[Any]) -> str:
@@ -414,6 +428,203 @@ def cmd_notices(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retry_outcome(
+    notice: dict[str, Any],
+    decision: str,
+    reason: str,
+    attempt: int,
+    not_before: datetime | None,
+) -> dict[str, Any]:
+    """One message's retry decision, in the shape ``knok retry`` prints (and --json emits)."""
+    outcome: dict[str, Any] = {
+        "messageId": notice.get("messageId"),
+        "contextId": notice.get("contextId"),
+        "kind": notice.get("kind"),
+        "rule": notice.get("rule"),
+        "decision": decision,
+        "reason": reason,
+        "attempt": attempt,
+        "notBefore": _iso(not_before) if not_before is not None else None,
+    }
+    return outcome
+
+
+def _retry_line(outcome: dict[str, Any]) -> str:
+    """One decision as a line a human can scan."""
+    message_id = outcome.get("messageId")
+    decision = outcome.get("decision")
+    if decision == "retry":
+        if "status" not in outcome:
+            # A dry run, or a retry the command could not perform: the policy said retry,
+            # but no deposit was attempted, so there is no exit code to report.
+            return f"would retry {message_id} (attempt {outcome.get('attempt')})"
+        status = outcome.get("status")
+        result = outcome.get("result")
+        if status == 0 and isinstance(result, dict):
+            word = "accepted" if result.get("accepted") else "duplicate" if result.get("duplicate") else "ok"
+            return f"retried {message_id} (attempt {outcome.get('attempt')}): {word}"
+        return f"retried {message_id} (attempt {outcome.get('attempt')}): failed, exit {status}"
+    if decision == "waiting":
+        return (
+            f"waiting {message_id}: retry due at {outcome.get('notBefore')} "
+            f"(attempt {outcome.get('attempt')})"
+        )
+    return f"terminal {message_id}: {outcome.get('reason')}"
+
+
+def _retry_record(
+    notice: dict[str, Any],
+    decision,
+    now: datetime,
+    status: int | None = None,
+) -> dict[str, Any]:
+    """One line for ``retries.jsonl``: the decision, and, for a performed retry, its result."""
+    record: dict[str, Any] = {
+        "messageId": notice.get("messageId"),
+        "contextId": notice.get("contextId"),
+        "kind": notice.get("kind"),
+        "rule": notice.get("rule"),
+        "attempt": decision.attempt,
+        "at": _iso(now),
+        "decision": decision.action,
+        "reason": decision.reason,
+        "notBefore": _iso(decision.not_before) if decision.not_before is not None else None,
+    }
+    if status is not None:
+        record["status"] = status
+    return record
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    """Apply the adapter's retry policy to the failures the bridge recorded (#48).
+
+    ``knok notices`` reports which messages died; this decides which of them are worth
+    repeating, and repeats the ones that are due. A retry replays the stored envelope verbatim
+    (``send --retry-of``), so the thread survives — the policy never mints a fresh
+    ``contextId``. Decisions are recorded in ``retries.jsonl`` so the budget is enforced and a
+    decided message is not re-decided on every scan; a retry that is not yet due is reported
+    as waiting and re-decided on the next scan.
+
+    The scan runs in two phases. First it decides every message, which needs no hub: a
+    terminal decision is recorded even when a retry elsewhere in the scan cannot be performed.
+    Then it performs the retries that are due, which needs the identity and the hub. A scan
+    that cannot load them still records its terminal decisions and reports the due retries as
+    not performed, instead of dying on the first one.
+
+    With ``--message-id`` it decides for one message; without it, it scans every notice.
+    With ``--dry-run`` it reports decisions without performing retries or recording. With
+    ``--json`` it prints one JSON object per message decided. In scan mode the exit code is 0
+    when the scan completed, 1 when a due retry could not be performed; with ``--message-id``
+    it is the retry's exit code when a retry was performed, else 0.
+    """
+    directory = Path(os.environ.get("KNOK_STATE", "/app/state"))
+    now = datetime.now(timezone.utc)
+    notices = read_notices(directory)
+    attempts = read_attempts(directory)
+    retries = read_retries(directory)
+
+    # Latest notice per messageId, in file order. One messageId dies one death, so the latest
+    # notice is the one that decides it.
+    latest: dict[str, dict[str, Any]] = {}
+    for notice in notices:
+        message_id = notice.get("messageId")
+        if isinstance(message_id, str) and message_id:
+            latest[message_id] = notice
+
+    if args.message_id:
+        notice = latest.get(args.message_id)
+        if notice is None:
+            print(f"no delivery notice for {args.message_id}", file=sys.stderr)
+            return 0
+        targets = [(args.message_id, notice)]
+    else:
+        targets = sorted(latest.items())
+
+    outcomes: list[dict[str, Any]] = []
+    exit_code = 0
+    # Phase one: decide every message. This needs no hub, so a terminal decision is recorded
+    # even when a retry elsewhere in the scan cannot be performed.
+    due_list: list[tuple[str, dict[str, Any], Any]] = []
+    for message_id, notice in targets:
+        # A message already decided terminal stays decided; the decision is stable, so
+        # re-deciding it on every scan is noise.
+        decided = terminal_record(retries, message_id)
+        if decided is not None:
+            outcomes.append(
+                _retry_outcome(
+                    notice,
+                    "terminal",
+                    str(decided.get("reason") or ""),
+                    0,
+                    None,
+                )
+            )
+            continue
+        envelope = attempts.get(message_id)
+        decision = decide_notice(notice, envelope, retries, now)
+        if decision.action == "terminal":
+            outcomes.append(_retry_outcome(notice, "terminal", decision.reason, 0, None))
+            if not args.dry_run:
+                record = _retry_record(notice, decision, now)
+                if record_retry(directory, record):
+                    retries.append(record)
+            continue
+        # A retry. If it is not yet due, report it as waiting and re-decide it on the next
+        # scan; a waiting decision is not recorded.
+        if not due(decision, now):
+            outcomes.append(
+                _retry_outcome(
+                    notice, "waiting", decision.reason, decision.attempt, decision.not_before
+                )
+            )
+            continue
+        if args.dry_run:
+            outcomes.append(
+                _retry_outcome(
+                    notice, "retry", decision.reason, decision.attempt, decision.not_before
+                )
+            )
+            continue
+        due_list.append((message_id, notice, decision))
+
+    # Phase two: perform the retries that are due. The identity and the hub are only needed
+    # here, so a scan that decides nothing (or only waits) never touches them.
+    if due_list:
+        try:
+            state, identity = _state_from_env()
+        except SystemExit as exc:
+            print(f"cannot retry: {exc}", file=sys.stderr)
+            for message_id, notice, decision in due_list:
+                outcomes.append(
+                    _retry_outcome(
+                        notice, "retry", decision.reason, decision.attempt, decision.not_before
+                    )
+                )
+            exit_code = 1
+        else:
+            for message_id, notice, decision in due_list:
+                status, result, _envelope = _retry_envelope(state, identity, message_id)
+                outcome = _retry_outcome(
+                    notice, "retry", decision.reason, decision.attempt, decision.not_before
+                )
+                outcome["status"] = status
+                if result is not None:
+                    outcome["result"] = result
+                outcomes.append(outcome)
+                record = _retry_record(notice, decision, now, status=status)
+                if record_retry(directory, record):
+                    retries.append(record)
+                if args.message_id:
+                    exit_code = status
+
+    for outcome in outcomes:
+        if args.json:
+            print(json.dumps(outcome, sort_keys=True))
+        else:
+            print(_retry_line(outcome))
+    return exit_code
+
+
 def cmd_recv(args: argparse.Namespace) -> int:
     state, identity = _state_from_env()
     count = recv_once(state, identity, limit=args.limit)
@@ -457,6 +668,16 @@ def main(argv: list[str] | None = None) -> int:
     notices.add_argument("--kind", choices=list(NOTICE_KINDS), default=None)
     notices.add_argument("--json", action="store_true")
     notices.set_defaults(func=cmd_notices)
+
+    #: The adapter's retry policy (#48): which failures are worth repeating, and when. A retry
+    #: replays the stored envelope verbatim, so the thread survives; the policy never mints a
+    #: fresh contextId. Without --message-id it scans every notice; with --dry-run it reports
+    #: decisions without performing retries or recording.
+    retry = sub.add_parser("retry", help="retry the failures the bridge recorded, when the policy says to")
+    retry.add_argument("--message-id", default=None, metavar="MESSAGE_ID")
+    retry.add_argument("--dry-run", action="store_true")
+    retry.add_argument("--json", action="store_true")
+    retry.set_defaults(func=cmd_retry)
 
     args = parser.parse_args(argv)
     return args.func(args)
