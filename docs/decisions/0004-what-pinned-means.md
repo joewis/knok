@@ -1,7 +1,7 @@
-# 0003 — A "pinned" card is a signed body, verified for name and deadline at adoption
+# 0004 — A "pinned" card is a signed body, verified for name and deadline at adoption
 
 Date: 2026-11-20
-Status: proposed
+Status: accepted
 Authors: Carl
 Addresses: #62 (a pinned card is never re-verified), #63, #58
 
