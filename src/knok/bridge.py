@@ -34,7 +34,7 @@ from typing import Any
 
 from . import identity as identity_mod
 from . import policy as policy_mod
-from .agentcard import card_valid_until, verify_card
+from .agentcard import CardTimeError, card_agent_id, card_valid_until, verify_card
 from .contacts import Contacts
 from .envelope import sent_at, sign, verify_envelope
 from .gate import Gate, Threads
@@ -107,12 +107,18 @@ class BridgeState:
 
 
 def load_cards(directory: str | Path) -> dict[str, dict[str, Any]]:
-    """Load the operator's registry: one signed card per file, keyed by agent id.
+    """Load the operator's registry: one signed card per file, keyed by the id the card claims.
 
     The directory is the trust anchor in Phase 2 (HUB.md: no dynamic registration), so a card is
     checked for internal consistency — its JWS must verify under the key it itself carries — rather
     than against a separate root. A card that fails is dropped, not fatal: one broken file must not
     stop an agent from receiving mail from everyone else.
+
+    The key is ``name@hub`` **from the signed body**, not the file name. The body is the only thing
+    the signature covers, so it is the only thing that may grant a name authority; a file named
+    ``mallory@…`` holding a card that claims ``carl@…`` pins carl, and pins nothing under mallory
+    (#62). A card that names no agent is dropped rather than pinned under whatever its file is
+    called — a key with no id in its own signature is a key nobody signed for.
     """
     cards: dict[str, dict[str, Any]] = {}
     for path in sorted(Path(directory).glob("*.json")):
@@ -125,7 +131,14 @@ def load_cards(directory: str | Path) -> dict[str, dict[str, Any]]:
         if body is None:
             log.warning("registry: %s does not verify, ignoring", path)
             continue
-        agent_id = body.get("bridge", {}).get("agent") or path.stem
+        agent_id = card_agent_id(body)
+        if agent_id is None:
+            log.warning("registry: %s names no agent (name@hub), ignoring", path)
+            continue
+        if path.stem != agent_id:
+            # Not fatal — the signed body wins — but this is an operator mistake worth seeing,
+            # because the file no longer says who it is about.
+            log.warning("registry: %s holds the card for %s", path, agent_id)
         cards[agent_id] = body
     return cards
 
@@ -275,13 +288,20 @@ class Bridge:
         What this does *not* do is re-verify the signature per message, or consult a ``Registry``
         for revocation: the pinned entry is a body, not a document, and the registry here is the
         legacy dict. Both are named on #62; this answers the expiry question only, which is the
-        one the field actually makes.
+        one the field actually makes. The id binding *is* checked, at adoption: ``load_cards``
+        keys each body by the ``name@hub`` the body itself claims, so a key is only ever pinned
+        under a name it signed for.
         """
         card = self.state.registry.get(agent_id)
         if card is None:
             return None
         instant = at or datetime.now(timezone.utc)
-        valid_until = card_valid_until(card)
+        try:
+            valid_until = card_valid_until(card)
+        except CardTimeError as exc:
+            log.warning("card for %s states a validUntil that cannot be read (%s); not trusting it",
+                        agent_id, exc)
+            return None
         if valid_until is not None and instant >= valid_until:
             log.warning(
                 "card for %s expired at %s; not trusting it at %s",
