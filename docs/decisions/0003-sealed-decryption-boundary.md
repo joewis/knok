@@ -20,7 +20,8 @@ it.
 
 Consequence for the trusted computing base, said plainly: **the bridge process, its host, and
 whoever can read its key material are inside it.** The agent adapter is outside it — it never holds
-a decryption key and never sees ciphertext.
+a decryption key and never sees ciphertext. That last clause holds for the bridge/queue path, where
+the adapter receives what the queue holds; `recv` is a separate path, addressed below.
 
 ## Why
 
@@ -67,9 +68,24 @@ message they came from — to anyone but the key holder, a sealed dead letter is
 Under this decision the live queue holds plaintext, so a dead-lettered message would be plaintext at
 rest for 30 days — which makes that sentence false for sealed mail. The resolution is narrow: the
 dead-letter store keeps the envelope **as it was received** (ciphertext, for a sealed message) while
-the live queue keeps the decrypted form. That keeps §6's claim true, keeps the owner's explicit
-re-offer able to send the original bytes unchanged, and costs one extra field on the dead-letter
-row. It is named here so the follow-on slice implements it rather than discovering it in a review.
+the live queue keeps the decrypted form. That keeps §6's claim true, and costs one extra field on
+the dead-letter row — the row keeps the decrypted form for owner inspection alongside the envelope
+as received, so the owner can still read what died. It does not by itself settle the re-offer: §6's
+re-offer mints a new `messageId` (the old one is in `seen` and would be dropped), so sending the
+original bytes unchanged is not a re-offer. The follow-on slice must define the sealed re-offer
+shape — re-seal the plaintext with a new id, or exempt it — rather than assuming the stored bytes
+are the answer.
+
+## recv is out of scope for sealed mail
+
+`knok recv` fetches straight from the hub and prints each envelope verbatim, so it bypasses the
+bridge — and with it this decision's decrypt step. A sealed envelope fetched via recv reaches the
+adapter as ciphertext, which the adapter cannot read and must not be asked to. Sealed mail is
+therefore bridge-only in Phase 3: an agent that needs it runs a bridge. The follow-on slices must
+decide recv's sealed behaviour — refuse the envelope, or leave it unacked for the bridge — before
+the hub accepts sealed deposits. Until then no sealed mail exists to be fetched either way: the hub
+refuses form 2 at deposit today, and the bridge raises on a sealed envelope before the notice check
+(`KeyError: 'message'`), so the unseal slice must land before the hub's deposit path too.
 
 ## Rejected alternatives
 
@@ -100,6 +116,11 @@ be negotiated later.
 4. An undecryptable sealed message (rotated key, corrupt ciphertext) is a **refusal**,
    indistinguishable from any other, and the sender's copy is retried at the hub until TTL. Whether
    that deserves a metadata-only dead-letter record belongs to the abuse runbook.
+5. recv's sealed behaviour — refuse the envelope, or leave it unacked for the bridge — and the
+   hub's deposit path, which reads `envelope["message"]` today and refuses form 2. Both must land
+   before sealed mail can travel at all.
+6. The sealed dead-letter re-offer shape (re-seal with a new id, or exempt it), and confirming the
+   dead-letter row keeps the decrypted form for owner inspection alongside the as-received envelope.
 
 ## Status
 
