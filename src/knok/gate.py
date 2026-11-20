@@ -89,7 +89,10 @@ class Threads:
         # Same pattern as Queue: the transport serves on its own thread, so
         # the connection must be usable from it, guarded by one lock.
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        # The queue holds its write lock for as long as a durable put takes, so this connection
+        # must wait at least as long: sqlite's 5 s default turned a slow put into a failed
+        # note_sent, and the reply credit was lost with it (#72 review, nit 1).
+        self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30.0)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS threads (context TEXT PRIMARY KEY, expects INTEGER NOT NULL,"
             " closed INTEGER NOT NULL, updated TEXT NOT NULL)"
