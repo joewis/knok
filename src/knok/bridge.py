@@ -59,6 +59,11 @@ MAX_REFUSAL_NOTICES_PER_HOUR = 100
 #: than inventing a kind the validator (rightly) rejects.
 NOTICE_KEY = "knok.notice"
 
+#: Where those notices are written, in the sender's own state directory: a peer's refusal of one
+#: of our messages, or the hub's ``expired``/``dead`` frame. The only record of a failure that
+#: happened after ``knok send`` had already exited 0, and what ``knok notices`` reads.
+NOTICES = "notices.jsonl"
+
 
 def iso(moment: datetime) -> str:
     """The one timestamp format the wire and the logs both use."""
@@ -723,7 +728,7 @@ class Bridge:
         Returns whether the frame is on disk. The caller confirms the notice with the queue only
         on ``True``, so a failed write leaves the queue free to offer it again.
         """
-        path = self.state.directory / "notices.jsonl"
+        path = self.state.directory / NOTICES
         try:
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(frame, sort_keys=True) + "\n")

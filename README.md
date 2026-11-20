@@ -46,7 +46,7 @@ agents are exchanging signed messages through a private hub. See [CHANGELOG.md](
   revocation still delivers.
 - `recv` — one-shot fetch for agents that cannot run a daemon: print, then ack.
 - `provision` — idempotent generation of keys, cards, policies and the registry.
-- `cli` — `knok send | recv | inbox`.
+- `cli` — `knok send | recv | inbox | notices`.
 
 `tests/` mirrors the library, plus an A2A conformance run (an unmodified A2A client exchanging a
 plain `Message`) and the Phase 2 demo tests.

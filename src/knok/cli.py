@@ -1,8 +1,9 @@
-"""`knok send` / `knok inbox`: the two things a human or a runtime needs from inside an agent.
+"""`knok send` / `knok inbox` / `knok notices`: what a human or a runtime needs from inside an agent.
 
 `send` is safe to run while the bridge daemon is polling: it only touches the identity and the hub,
 never the queue, so it cannot fight the daemon for the queue lock. `inbox` reads what the daemon has
-already handed to the application (`inbox.jsonl`), for the same reason.
+already handed to the application (`inbox.jsonl`), for the same reason; `notices` reads the other
+half of the same file pair — what the bridge learned about *our own* messages that did not arrive.
 
     KNOK_AGENT=carl@hub.local KNOK_STATE=/app/state KNOK_REGISTRY=/app/registry \\
         KNOK_HUB_URL=http://hub:8080 python -m knok.cli send --to muse@hub.local --text "hello"
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from .agentcard import verify_card
-from .bridge import BridgeState, fingerprint_key, load_cards
+from .bridge import NOTICES, BridgeState, fingerprint_key, load_cards
 from .envelope import sign
 from .hubclient import HubClient, HubError, HubRefused
 from .identity import b64url_decode, load as load_identity
@@ -298,6 +299,121 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Every kind the bridge writes into ``notices.jsonl``, and so every kind this reader can be asked
+#: to select. A filter that cannot name a line the reader prints is a hole in the same file.
+NOTICE_KINDS = ("refused", "expired", "dead", "late", "gap")
+
+#: Each kind dates itself with its own word: a refusal was ``receivedAt`` at the peer's gate, a dead
+#: letter ``deadedAt`` here, a gap release ``releasedAt``. A reader that knew only one or two of
+#: them would print ``?`` where the only copy of a failure should say when it happened.
+NOTICE_TIMES = ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at")
+
+
+def _ranges(seqs: list[Any]) -> str:
+    """``[3, 4, 5, 9]`` -> ``"3-5,9"``: a gap's column stays readable when it skipped many seqs."""
+    numbers = sorted({int(seq) for seq in seqs if isinstance(seq, int)})
+    if len(numbers) != len(seqs):
+        return ",".join(str(seq) for seq in seqs)
+    if not numbers:
+        return ""
+    parts: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        parts.append(f"{start}-{previous}" if previous != start else str(start))
+        start = previous = number
+    parts.append(f"{start}-{previous}" if previous != start else str(start))
+    return ",".join(parts)
+
+
+def _notice_subject(notice: dict[str, Any]) -> str:
+    """Which message the notice is about. A gap has no single message, so it names the seqs it skipped."""
+    message_id = notice.get("messageId")
+    if message_id:
+        return str(message_id)
+    missing = notice.get("missing")
+    if isinstance(missing, list) and missing:
+        return f"seqs {_ranges(missing)}"
+    return "?"
+
+
+def _notice_line(notice: dict[str, Any]) -> str:
+    """One notice as a line a human can scan: when, who, which message, which thread, what.
+
+    Every shape the bridge records must fill every column: a ``?`` here means the reader dropped a
+    fact the file holds, which is the one thing a failure record must not do.
+    """
+    when = next((str(notice[key]) for key in NOTICE_TIMES if notice.get(key)), "?")
+    rule = notice.get("rule")
+    kind = str(notice.get("kind") or "?")
+    return "  ".join(
+        [
+            when,
+            # A dead letter's frame carries no sender — the queue knows it, the record does not —
+            # so "-" says "not recorded" where "?" would say "the reader failed to find it".
+            str(notice.get("from") or "-"),
+            _notice_subject(notice),
+            f"[{notice.get('contextId') or '-'}]",
+            f"{kind} ({rule})" if rule else kind,
+        ]
+    )
+
+
+def cmd_notices(args: argparse.Namespace) -> int:
+    """Report what became of the messages this agent sent, as far as anything here can know.
+
+    ``send`` exits 0 when the hub accepted the envelope; delivery can still fail afterwards, and
+    the failure lands here — a refusal notice from the peer's gate (#50), the hub's own
+    ``expired``/``dead`` frame, or the receiver's ``gap``/``late`` notice when a stream skipped or
+    reordered messages. The bridge writes them as it learns them and never queues them, so this
+    reads the same ``notices.jsonl`` the operator sees.
+
+    It reports and does not act: whether to repeat an attempt, and how often, is a decision about
+    the caller's own failure, so it belongs to the adapter. What this gives it is the one fact it
+    cannot derive — which ``messageId`` died — which is exactly the argument ``send --retry-of``
+    takes (#48).
+    """
+    # ``selected[-limit:]`` with limit 0 is ``selected[0:]`` — everything — and a negative limit
+    # silently drops notices from the front. A limit is a count of the newest notices, so anything
+    # below 1 is a usage error, not a way to ask for all of them.
+    if args.limit < 1:
+        print(f"--limit must be at least 1, got {args.limit}", file=sys.stderr)
+        return 2
+    path = Path(os.environ.get("KNOK_STATE", "/app/state")) / NOTICES
+    if not path.exists():
+        print("no delivery notices", file=sys.stderr)
+        return 0
+    selected: list[dict[str, Any]] = []
+    unreadable = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            notice = json.loads(line)
+        except ValueError:
+            unreadable += 1
+            continue
+        if not isinstance(notice, dict):
+            unreadable += 1
+            continue
+        if args.kind and notice.get("kind") != args.kind:
+            continue
+        selected.append(notice)
+    # A torn or hand-edited line must not hide the rest: the file is the only copy of a failure,
+    # so the reader says how much it could not read rather than dying or silently shrinking.
+    if unreadable:
+        print(f"skipped {unreadable} unreadable line(s) in {path}", file=sys.stderr)
+    if not selected:
+        wanted = f"{args.kind} notices" if args.kind else "delivery notices"
+        print(f"no {wanted}", file=sys.stderr)
+        return 0
+    for notice in selected[-args.limit :]:
+        print(json.dumps(notice, sort_keys=True) if args.json else _notice_line(notice))
+    return 0
+
+
 def cmd_recv(args: argparse.Namespace) -> int:
     state, identity = _state_from_env()
     count = recv_once(state, identity, limit=args.limit)
@@ -333,6 +449,14 @@ def main(argv: list[str] | None = None) -> int:
     inbox.add_argument("--limit", type=int, default=20)
     inbox.add_argument("--json", action="store_true")
     inbox.set_defaults(func=cmd_inbox)
+
+    #: Reading the failure half of a send (#48): a refusal, an expiry, a dead letter. The command
+    #: reports the messageId; repeating the attempt with --retry-of remains the caller's decision.
+    notices = sub.add_parser("notices", help="what became of the messages this agent sent")
+    notices.add_argument("--limit", type=int, default=20)
+    notices.add_argument("--kind", choices=list(NOTICE_KINDS), default=None)
+    notices.add_argument("--json", action="store_true")
+    notices.set_defaults(func=cmd_notices)
 
     args = parser.parse_args(argv)
     return args.func(args)
