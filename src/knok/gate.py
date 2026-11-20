@@ -80,6 +80,24 @@ class Threads:
             )
             self._conn.commit()
 
+    def check_received(self, context: str, now: datetime) -> Decision:
+        """What receiving a reply in this context would mean — without changing anything.
+
+        The bridge answers this before it stores the message, so a refused reply costs no thread
+        state and a duplicate costs nothing at all (#69). ``note_received`` applies the same rule
+        for real, once the message is durable.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT expects, closed FROM threads WHERE context = ?", (context,)
+            ).fetchone()
+            if row is None:
+                return Decision(True)
+            expects, closed = row[0], bool(row[1])
+            if closed or expects <= 0:
+                return Decision(False, REFUSED, "thread")
+            return Decision(True)
+
     def note_received(self, context: str, now: datetime) -> Decision:
         with self._lock:
             row = self._conn.execute(
@@ -121,7 +139,8 @@ class Gate:
             if contacts.contact_request_daily_limit is None:
                 contacts.contact_request_daily_limit = policy.limits.get("contact_requests_per_day")
 
-    def _within_limits(self, sender: str, moment: datetime) -> bool:
+    def _limits_allow(self, sender: str, moment: datetime) -> bool:
+        """Is this sender inside every budget? Reads only — charging happens in ``_charge_limits``."""
         if self.rates is None:
             return True
         limits = self.policy.limits
@@ -135,10 +154,25 @@ class Gate:
                 continue
             if self.rates.count(scope, key, moment, span) >= limit:
                 return False
+        return True
+
+    def _charge_limits(self, sender: str, moment: datetime) -> None:
+        """Spend the sender's budget. Called only once the message is durably ours (#69).
+
+        A message that fails to store must not consume the sender's quota: the sender will retry,
+        and charging twice for one delivered message is the gate's own amplification vector.
+        """
+        if self.rates is None:
+            return
+        limits = self.policy.limits
+        pairs = [
+            ("messages", "all", limits.get("messages_per_hour"), timedelta(hours=1)),
+            ("sender", sender, limits.get("per_sender_per_hour"), timedelta(hours=1)),
+            ("messages", "all-day", limits.get("messages_per_day"), timedelta(days=1)),
+        ]
         for scope, key, limit, span in pairs:
             if limit is not None:
                 self.rates.hit(scope, key, moment, span)
-        return True
 
     def decide(self, envelope: object, now: datetime | None = None) -> Decision:
         moment = now or datetime.now(timezone.utc)
@@ -165,7 +199,29 @@ class Gate:
         if not isinstance(context, str) or not context:
             return Decision(False, REFUSED, "malformed")
 
-        if not self._within_limits(sender, moment):
+        if not self._limits_allow(sender, moment):
             return Decision(False, REFUSED, "limits")
 
-        return self.threads.note_received(context, moment)
+        return self.threads.check_received(context, moment)
+
+    def confirm(self, envelope: object, now: datetime | None = None) -> None:
+        """Apply the state a successful decision implied. Call only after the message is durable.
+
+        ``decide`` answers; this commits. Splitting them is #69: the reply counter and the rate
+        budget are conversation state, and a message that is merely *offered* — a duplicate, or one
+        whose durable insert failed — must not move it. A caller that forgets to call this
+        under-counts, which fails open (an extra reply is accepted) rather than failing closed (a
+        legitimate reply is refused).
+        """
+        moment = now or datetime.now(timezone.utc)
+        if not isinstance(envelope, dict):
+            return
+        message = envelope.get("message")
+        if not isinstance(message, dict):
+            return
+        sender = envelope.get("from")
+        context = message.get("contextId")
+        if not isinstance(sender, str) or not isinstance(context, str):
+            return
+        self._charge_limits(sender, moment)
+        self.threads.note_received(context, moment)

@@ -438,6 +438,21 @@ class Queue:
 
     # -- public API ------------------------------------------------------
 
+    def seen(self, message_id: str) -> bool:
+        """Has this ``messageId`` been accepted before? Read-only.
+
+        The bridge asks this *before* the gate so a retry after a lost ack is recognised as the
+        duplicate it is, rather than being refused by the thread rule for a reply the agent has
+        already received (#69). Trust the id only after the envelope has been verified.
+        """
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM seen WHERE message_id = ?", (message_id,)
+                ).fetchone()
+                is not None
+            )
+
     def put(self, env: dict[str, Any], now: datetime | None = None) -> str:
         """Store an envelope durably. Returns ``"accepted"`` or ``"duplicate"``.
 

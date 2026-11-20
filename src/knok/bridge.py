@@ -531,8 +531,16 @@ class Bridge:
         if notice is not None:
             return self._handle_refusal_notice(item, sender, notice)
 
-        decision = self.gate.decide(item)
         message_id = item["message"]["messageId"]
+        # Dedupe before the gate (#69). A retry after a lost ack is the *same* message: the thread
+        # rule would otherwise refuse it as a reply to a thread that expects none, and the sender
+        # would get a refusal notice for mail we already delivered. The id is trusted only after
+        # the signature above has been verified.
+        if self.queue.seen(message_id):
+            log.info("duplicate delivery of %s; already have it", message_id)
+            return "queued", message_id
+
+        decision = self.gate.decide(item)
         if not decision.allowed:
             # Recorded as handled: the hub must stop offering it, or a 50-message page that is all
             # refusals never advances (HUB.md, "ack means handled").
@@ -540,8 +548,24 @@ class Bridge:
             self._refuse(item, decision, message_id)
             return "refused", message_id
 
-        result = self.queue.put(item)
-        return ("queued" if result == "accepted" else "queued"), message_id
+        try:
+            result = self.queue.put(item)
+        except ValueError as exc:
+            # The hub accepted it and this queue will not take it. Nothing was committed: the
+            # decision above is read-only since #69, so there is no state to unwind here.
+            log.warning("queue refused %s: %s", message_id, exc)
+            return "unhandled", None
+        except Exception as exc:  # noqa: BLE001 - a failed write must not stop the poll
+            # Disk full, SQLite I/O error. The envelope is still at the hub (we will not ack it),
+            # and no conversation state moved, so the next poll is a clean retry.
+            log.error("queue could not store %s: %s", message_id, exc)
+            return "unhandled", None
+        if result == "accepted":
+            # Only a message that is durably ours moves conversation state (#69). A duplicate
+            # returns "duplicate" and changes nothing, which is the whole point: the retry that
+            # the lost ack provoked must not decrement the reply counter a second time.
+            self.gate.confirm(item)
+        return "queued", message_id
 
     def _handle_frame(self, frame: dict[str, Any]) -> tuple[str, str | None]:
         hub_card = self.state.registry.get(frame.get("from", ""))

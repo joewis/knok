@@ -41,6 +41,19 @@ def envelope(sender=SENDER, context="c-1"):
     }
 
 
+def deliver(gate, env, now=T0):
+    """decide then confirm — the order bridge._handle uses since #69.
+
+    ``decide`` answers without mutating; the thread counter and the rate budget only move once the
+    message is durably ours. A test that wants the old "decide consumed the reply" behaviour has to
+    call confirm, exactly as the bridge does.
+    """
+    decision = gate.decide(env, now)
+    if decision.allowed:
+        gate.confirm(env, now)
+    return decision
+
+
 def test_stranger_is_refused_with_the_shared_reason(tmp_path):
     gate, _ = build(tmp_path, CLOSED)
     decision = gate.decide(envelope(sender=STRANGER), T0)
@@ -88,8 +101,8 @@ def test_two_questions_in_one_context_owe_two_answers(tmp_path):
     gate, _ = build(tmp_path, CLOSED)
     gate.threads.note_sent("c-1", expects_reply=True, closes=False, now=T0)
     gate.threads.note_sent("c-1", expects_reply=True, closes=False, now=T0)
-    assert gate.decide(envelope(context="c-1"), T0).allowed is True
-    assert gate.decide(envelope(context="c-1"), T0).allowed is True
+    assert deliver(gate, envelope(context="c-1")).allowed is True
+    assert deliver(gate, envelope(context="c-1")).allowed is True
     assert gate.decide(envelope(context="c-1"), T0).allowed is False
 
 
@@ -116,11 +129,11 @@ def test_malformed_envelope_is_refused(tmp_path):
 def test_rate_limit_is_enforced(tmp_path):
     doc = {**CLOSED, "limits": {"per_sender_per_hour": 2}}
     gate, _ = build(tmp_path, doc, rates=True)
-    assert gate.decide(envelope(context="c-1"), T0).allowed is True
-    assert gate.decide(envelope(context="c-2"), T0).allowed is True
+    assert deliver(gate, envelope(context="c-1")).allowed is True
+    assert deliver(gate, envelope(context="c-2")).allowed is True
     assert gate.decide(envelope(context="c-3"), T0).allowed is False
     # The next hour starts clean.
-    assert gate.decide(envelope(context="c-4"), T0.replace(hour=6)).allowed is True
+    assert deliver(gate, envelope(context="c-4"), T0.replace(hour=6)).allowed is True
 
 
 def test_a_refused_envelope_does_not_burn_the_rate_budget(tmp_path):
@@ -131,6 +144,6 @@ def test_a_refused_envelope_does_not_burn_the_rate_budget(tmp_path):
     bad = {"from": SENDER, "message": {"kind": "message"}}  # no contextId
     assert gate.decide(bad, T0).allowed is False
     assert gate.decide(bad, T0).allowed is False
-    assert gate.decide(envelope(context="c-1"), T0).allowed is True
-    assert gate.decide(envelope(context="c-2"), T0).allowed is True
+    assert deliver(gate, envelope(context="c-1")).allowed is True
+    assert deliver(gate, envelope(context="c-2")).allowed is True
     assert gate.decide(envelope(context="c-3"), T0).allowed is False
