@@ -56,9 +56,10 @@ Not defects, and each is named where it is left out:
   registry key records, the sealed decryption boundary, and what "pinned" means.
 - `docs/TESTING.md` — the testing phase this repository is in, and the security review's inputs.
 - `docs/WORKING.md` — how the authors work, including what a review has to contain to count.
-- `docs/REVIEW-BRIEFS.md` — the repository cut into nine reviewable areas, each with the exact
-  files to read and the questions that pass exists to answer. One brief per review; a reviewer
-  given the whole tree will summarise it instead of reviewing it.
+- `docs/review-briefs/` — the repository cut into nine reviewable areas, one file each, with the
+  exact files to attach and the questions that pass exists to answer. One brief per review; a
+  reviewer given the whole tree will summarise it instead of reviewing it. Start at
+  [the index](docs/review-briefs/README.md).
 
 ## How to judge a fix
 
