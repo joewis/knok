@@ -139,3 +139,8 @@ review (recv, and the re-offer that reuses a `seen` id) are in this record. Muse
 decision itself: sound; on the first draft: changes requested, fixed here. Item 3 above — removing
 the queue's form 2 refusal — is the next slice, and it starts only after `envelope.unseal` (item 1)
 and the verify → unseal → gate → queue call sites (item 2) exist.
+
+Landed since: item 1 in #84 — `knok.hpke` (base mode, single shot, checked against RFC 9180 A.2 in
+both directions) and `envelope.seal` / `envelope.unseal`, with no caller yet. #83 carries the one
+thing §6 still owes before form 2 can travel at all (what bytes are sealed, and HPKE's `aad`/`info`).
+Items 2–6 are open.
