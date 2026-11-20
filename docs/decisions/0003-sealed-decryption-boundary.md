@@ -81,11 +81,18 @@ are the answer.
 `knok recv` fetches straight from the hub and prints each envelope verbatim, so it bypasses the
 bridge — and with it this decision's decrypt step. A sealed envelope fetched via recv reaches the
 adapter as ciphertext, which the adapter cannot read and must not be asked to. Sealed mail is
-therefore bridge-only in Phase 3: an agent that needs it runs a bridge. The follow-on slices must
-decide recv's sealed behaviour — refuse the envelope, or leave it unacked for the bridge — before
-the hub accepts sealed deposits. Until then no sealed mail exists to be fetched either way: the hub
-refuses form 2 at deposit today, and the bridge raises on a sealed envelope before the notice check
-(`KeyError: 'message'`), so the unseal slice must land before the hub's deposit path too.
+therefore bridge-only in Phase 3: an agent that needs it runs a bridge.
+
+recv's own sealed behaviour is now settled in code rather than left to the follow-on: since #77
+(`2b03de7`) it prints nothing for an envelope with no `message`, writes one line to stderr, and
+**does not ack it**, so the envelope stays at the hub for a bridge to fetch. Refusing would have
+hidden a sealed message as if it were a policy decision, and acking would have deleted mail recv
+cannot read — the two wrong answers were the ones available.
+
+No sealed mail exists today: the hub refuses form 2 at deposit (403), and on this branch
+`bridge._handle` returns `unhandled` for an envelope with no form 1 message rather than raising —
+it used to raise at the notice check, and the guard precedes it now. The unseal slice still has to
+land before either the hub's deposit path or the queue can carry a sealed message.
 
 ## Rejected alternatives
 
@@ -116,14 +123,19 @@ be negotiated later.
 4. An undecryptable sealed message (rotated key, corrupt ciphertext) is a **refusal**,
    indistinguishable from any other, and the sender's copy is retried at the hub until TTL. Whether
    that deserves a metadata-only dead-letter record belongs to the abuse runbook.
-5. recv's sealed behaviour — refuse the envelope, or leave it unacked for the bridge — and the
-   hub's deposit path, which reads `envelope["message"]` today and refuses form 2. Both must land
-   before sealed mail can travel at all.
+5. The hub's deposit path, which reads `envelope["message"]` today and refuses form 2. It must
+   land before sealed mail can travel at all. recv's half is decided (#77): sealed mail is left
+   unacked at the hub, never printed and never deleted.
 6. The sealed dead-letter re-offer shape (re-seal with a new id, or exempt it), and confirming the
    dead-letter row keeps the decrypted form for owner inspection alongside the as-received envelope.
 
 ## Status
 
-Proposed. Muse is asked to confirm one thing on the adapter side: that adapters need no keys and no
-"plaintext before the gate" hook under this boundary, because the adapter receives what the queue
-holds. If that holds, this record moves to `accepted` and item 3 above is the next slice.
+Accepted, 2026-11-20. Muse confirmed the adapter side by reviewing this record against the code:
+adapters need no keys and no "plaintext before the gate" hook on the bridge path, because the
+adapter receives what the queue already holds in plaintext. Item 3 (removing the queue's form 2
+refusal) is the next slice; items 1, 2, 4 and 6 remain unbuilt, and item 5 is the hub's half only.
+
+The boundary as accepted has one known edge, stated here rather than discovered later: a sealed
+message fetched by `recv` is invisible to that agent until a bridge exists to unseal it. That is
+the cost of keeping the key in one process, and it is the right cost for Phase 3.
