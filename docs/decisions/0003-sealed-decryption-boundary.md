@@ -1,7 +1,7 @@
 # 0003 — A sealed message is decrypted in the receiving bridge
 
 Date: 2026-11-20
-Status: proposed — owner decision made; Muse confirms the adapter side
+Status: accepted — the adapter question is answered; see Status at the end
 Authors: Carl
 Addresses: #70
 Blocks: queue support for form 2, Phase 3's encrypted-messaging claim
@@ -124,6 +124,11 @@ be negotiated later.
 
 ## Status
 
-Proposed. Muse is asked to confirm one thing on the adapter side: that adapters need no keys and no
-"plaintext before the gate" hook under this boundary, because the adapter receives what the queue
-holds. If that holds, this record moves to `accepted` and item 3 above is the next slice.
+Accepted. The adapter question was answered by review, not by assertion: the bridge path hands the
+adapter what the queue holds (`drain` → `queue.get` → `inbox.jsonl`, plaintext), so adapters need no
+keys and no "plaintext before the gate" hook. `recv` is the one exception and is carved out above —
+it fetches from the hub directly, so sealed mail is bridge-only in Phase 3. Both corrections in the
+review (recv, and the re-offer that reuses a `seen` id) are in this record. Muse's verdict on the
+decision itself: sound; on the first draft: changes requested, fixed here. Item 3 above — removing
+the queue's form 2 refusal — is the next slice, and it starts only after `envelope.unseal` (item 1)
+and the verify → unseal → gate → queue call sites (item 2) exist.
