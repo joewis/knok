@@ -150,3 +150,25 @@ def test_the_decided_fingerprint_is_readable_after_a_restart(tmp_path):
         assert row is not None
         assert row["decision"] == "approved"
         assert row["decided_fingerprint"] == "SHA256:abc"
+
+
+def test_a_second_decision_supersedes_the_first_even_when_it_is_the_latest_row(tmp_path):
+    """The supersede must not depend on another peer having a newer row.
+
+    A peer that decides, is revoked, and decides again has its first row as the global maximum
+    when the second decision is recorded. Superseding only rows older than that maximum leaves
+    both rows current, so the audit cannot say which decision stands.
+    """
+    with Contacts(tmp_path / "c.db") as store:
+        store.request("peer@hub", now=T0, fingerprint="SHA256:first")
+        store.approve("peer@hub", decided_by="joerg", fingerprint="SHA256:first", now=T0)
+        store.accept("peer@hub", T0)
+        store.revoke("peer@hub", T0)
+        store.request("peer@hub", now=T0, fingerprint="SHA256:second")
+        store.deny("peer@hub", decided_by="joerg", fingerprint="SHA256:second", now=T0)
+        rows = store.decision_history("peer@hub")
+        assert len(rows) == 2
+        assert [r["presented_fingerprint"] for r in rows] == ["SHA256:first", "SHA256:second"]
+        assert rows[0]["superseded_by"] == rows[1]["id"]
+        assert rows[1]["superseded_by"] is None
+        assert store.decision("peer@hub")["id"] == rows[1]["id"]

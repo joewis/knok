@@ -143,11 +143,16 @@ class Contacts:
         presented, and what the owner was looking at when they decided. Equal means the decision
         names the key that asked; different means the peer rotated while the request was held, and
         the decision belongs to the key that was on screen (#65).
+
+        Every earlier un-superseded row for this peer is superseded by the new one. The new row
+        does not exist yet, so there is no row to exclude: superseding only rows older than the
+        global maximum would leave the peer's latest row current whenever it happened to be the
+        most recent decision in the table — the common single-peer case — and the audit would show
+        two rows, neither marked superseded.
         """
         self._conn.execute(
             "UPDATE decisions SET superseded_by = (SELECT COALESCE(MAX(id), 0) + 1 FROM decisions)"
-            " WHERE peer = ? AND superseded_by IS NULL"
-            " AND id < (SELECT COALESCE(MAX(id), 0) FROM decisions)",
+            " WHERE peer = ? AND superseded_by IS NULL",
             (peer,),
         )
         self._conn.execute(
