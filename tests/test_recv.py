@@ -145,3 +145,114 @@ def test_cli_recv_passes_the_limit(monkeypatch):
     assert main(["recv"]) == 0
     assert main(["recv", "--limit", "3"]) == 0
     assert limits == [20, 3]
+
+
+def _write_policy(state_dir, agent_id, *, allow=(), block=()):
+    """A closed private policy for the agent, the way ``provision.py`` writes one."""
+    policy = {
+        "agent_id": agent_id,
+        "contact_policy": "closed",
+        "deployment": "private",
+        "allow": list(allow),
+        "block": list(block),
+        "limits": {},
+    }
+    (state_dir / "policy.json").write_text(json.dumps(policy))
+    return policy
+
+
+def test_recv_does_not_print_mail_from_a_blocked_sender(agent_state, capsys):
+    """Scenario 11 (#51): a blocked sender's queued mail never reaches recv stdout.
+
+    The mail was queued before the block, so the hub accepted it; the receiver's gate is the
+    only thing standing between it and stdout. The refusal is handled, so the hub is clear.
+    """
+    ns, state = agent_state
+    _write_policy(
+        state.directory, ns.muse_id.agent_id,
+        allow=[ns.carl_id.agent_id], block=[ns.mallory_id.agent_id],
+    )
+    blocked = helpers.build_envelope(
+        ns.mallory_id, ns.muse_id.agent_id, text="from mallory", context_id="c-blocked"
+    )
+    status, _, _ = helpers.deposit(ns.url, blocked)
+    assert status == 202
+    allowed = deposit(ns, text="from carl")
+
+    assert recv_once(state, ns.muse_id) == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    assert [json.loads(line) for line in lines] == [allowed]
+
+    status, page = helpers.fetch_as(ns.url, ns.muse_id)
+    assert status == 200
+    assert page["messages"] == []
+
+
+def test_recv_does_not_print_mail_from_a_sender_the_policy_does_not_admit(agent_state, capsys):
+    """Closed by default: a sender in neither the allow-list nor the contacts is refused."""
+    ns, state = agent_state
+    _write_policy(
+        state.directory, ns.muse_id.agent_id, allow=[ns.carl_id.agent_id]
+    )
+    stranger = helpers.build_envelope(
+        ns.mallory_id, ns.muse_id.agent_id, text="from mallory", context_id="c-stranger"
+    )
+    status, _, _ = helpers.deposit(ns.url, stranger)
+    assert status == 202
+    allowed = deposit(ns, text="from carl")
+
+    assert recv_once(state, ns.muse_id) == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    assert [json.loads(line) for line in lines] == [allowed]
+
+    status, page = helpers.fetch_as(ns.url, ns.muse_id)
+    assert status == 200
+    assert page["messages"] == []
+
+
+def test_recv_does_not_print_mail_from_a_revoked_sender(tmp_path, capsys):
+    """Scenario 11, the registry half (#51): a peer whose card was removed is refused.
+
+    Muse's side holds no policy, so the pinned registry is the allow-list: removing a card
+    revokes the peer for recv, and mail queued before the removal is refused, not printed.
+    The hub still accepts the deposit — it has its own registry — so the receiver's gate is
+    the only thing standing between the mail and stdout.
+    """
+    ns = helpers.make_hub(tmp_path)
+    try:
+        registry_dir = tmp_path / "registry"
+        registry_dir.mkdir()
+        # Mallory's card is gone: the operator revoked her by removing it.
+        for agent_id in (ns.carl_id.agent_id, ns.muse_id.agent_id):
+            (registry_dir / f"{agent_id}.json").write_text(json.dumps(ns.cards[agent_id]))
+        state_dir = tmp_path / "muse"
+        ns.muse_id.save(state_dir / "identity.key")
+        state = BridgeState(
+            agent_id=ns.muse_id.agent_id,
+            directory=state_dir,
+            hub_url=ns.url,
+            registry=load_cards(registry_dir),
+        )
+        revoked = helpers.build_envelope(
+            ns.mallory_id, ns.muse_id.agent_id, text="from mallory", context_id="c-revoked"
+        )
+        status, _, _ = helpers.deposit(ns.url, revoked)
+        assert status == 202
+        allowed = helpers.build_envelope(
+            ns.carl_id, ns.muse_id.agent_id, text="from carl", context_id="c-ok"
+        )
+        status, _, _ = helpers.deposit(ns.url, allowed)
+        assert status == 202
+
+        assert recv_once(state, ns.muse_id) == 1
+
+        lines = capsys.readouterr().out.splitlines()
+        assert [json.loads(line) for line in lines] == [allowed]
+
+        status, page = helpers.fetch_as(ns.url, ns.muse_id)
+        assert status == 200
+        assert page["messages"] == []
+    finally:
+        helpers.close_hub(ns)
