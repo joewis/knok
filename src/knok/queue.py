@@ -438,8 +438,27 @@ class Queue:
 
     # -- public API ------------------------------------------------------
 
-    def put(self, env: dict[str, Any], now: datetime | None = None) -> str:
-        """Store an envelope durably. Returns ``"accepted"`` or ``"duplicate"``.
+    def seen(self, message_id: str) -> bool:
+        """Whether this queue has already accepted ``message_id``.
+
+        Durable and read-only, for the caller that must not do any work for a message it already
+        holds (#69): a re-offered envelope after a lost ack is acknowledged and skipped before the
+        gate is consulted, so it cannot move thread state a second time. Only meaningful **after**
+        the envelope's signature and card were verified — a bare id must never be enough to
+        suppress a message, or anyone who learned an id could bury the real one.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM seen WHERE message_id = ?", (message_id,)
+            ).fetchone() is not None
+
+    def put(
+        self,
+        env: dict[str, Any],
+        now: datetime | None = None,
+        transition: Any = None,
+    ) -> str:
+        """Store an envelope durably. Returns ``"accepted"``, ``"late"`` or ``"duplicate"``.
 
         Durable means: ``put`` returns only after the commit has been
         fsynced (``synchronous=FULL`` on a WAL database), so the message
@@ -452,6 +471,16 @@ class Queue:
         decryption, on an envelope not addressed to this queue's owner, and
         on a multi-recipient envelope — the hub does fan-out, this queue
         does not.
+
+        ``transition`` is applied on this queue's own connection inside the
+        insert's transaction (#69): the gate's answer is only half the fact,
+        and the thread state it implies must not outlive a message that was
+        never stored. A duplicate returns before the transaction opens and
+        therefore applies nothing — the first accepted copy already did.
+        The object only has to offer ``apply(conn, now)`` and must write in
+        the same database this queue owns (the bridge opens ``Threads`` on
+        ``queue.db`` for exactly that reason); a table in another file would
+        make the word "together" a lie.
         """
         moment = now or datetime.now(timezone.utc)
         if not isinstance(env, dict) or "message" not in env:
@@ -531,6 +560,10 @@ class Queue:
                         "to": recipient,
                         "detectedAt": _iso(moment),
                     }, moment)
+                if transition is not None:
+                    # Same transaction as the insert: a failure above rolls the thread state back
+                    # with the message, and a success commits both (#69).
+                    transition.apply(self._conn, moment)
                 self._conn.execute("COMMIT")
             except BaseException:
                 self._conn.execute("ROLLBACK")

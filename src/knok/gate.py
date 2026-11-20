@@ -4,6 +4,13 @@ Contract: ``Gate.decide(envelope, now)`` returns a Decision and never raises for
 sealed envelope — it refuses. Every refusal carries the same string, so a caller cannot learn from
 the answer whether an agent exists, whether it blocked you, or whether it had already refused you.
 
+``decide`` does not move conversation state. When it admits a reply, the decrement of the thread's
+``expects`` counter travels with the answer as a :class:`Receipt`, and the queue applies it inside
+the transaction that durably stores the message (#69). Deciding and committing separately let a
+retry after a lost ack decrement twice, and let a failed insert leave the counter spent with no
+message to show for it. The rate window is the one thing ``decide`` still charges, because it lives
+in its own store and a spent slot costs a sender's quota, never the conversation's correctness.
+
 The gate runs **after decryption**. A sealed (form 2) envelope has no ``message`` and therefore no
 ``contextId``; deciding on it here would put every sealed context in one bucket (§6, v0.5).
 """
@@ -22,6 +29,29 @@ from .rates import Rates
 
 
 @dataclass(frozen=True)
+class Receipt:
+    """The thread-state change an admissible reply would make — not yet made.
+
+    ``decide`` hands one to its caller instead of applying it, because the change must commit in
+    the same transaction as the queue insert that caused it (#69). ``Queue.put`` applies it on its
+    own connection, inside its own ``BEGIN IMMEDIATE``, so a failed insert rolls the decrement back
+    with it and a re-offered envelope cannot decrement the same thread twice.
+
+    Applying is deliberately the caller's job, and ``apply`` never commits: the transaction belongs
+    to whoever owns durability, and that is never the gate.
+    """
+
+    context: str
+
+    def apply(self, conn: sqlite3.Connection, now: datetime) -> None:
+        """Decrement ``expects`` for this context on ``conn``; the caller commits."""
+        conn.execute(
+            "UPDATE threads SET expects = expects - 1, updated = ? WHERE context = ?",
+            (now.isoformat(), self.context),
+        )
+
+
+@dataclass(frozen=True)
 class Decision:
     """One answer from the gate: allowed or not, and — for our own records — why.
 
@@ -32,11 +62,15 @@ class Decision:
     ``blocked``, which is never quoted anywhere, because a blocked sender gets no notice at all:
     blocking must look like nonexistence.
     Refusals that name a rule: ``blocked``, ``policy``, ``limits``, ``thread``, ``malformed``.
+
+    ``transition`` is the state change this answer requires, for the caller to commit alongside the
+    message (#69). It is ``None`` for every refusal and for an admission that changes nothing.
     """
 
     allowed: bool
     reason: str = ""
     rule: str = ""
+    transition: Receipt | None = None
 
 
 class Threads:
@@ -44,13 +78,21 @@ class Threads:
 
     The expectation is a **counter**. Two questions sent in one context before either is answered
     owe two replies; a boolean would refuse the second answer as a protocol error.
+
+    This store lives in the queue's database (the bridge opens it on ``queue.db``), because the
+    counter moves in the same transaction as the message that moved it (#69). Opening it elsewhere
+    still works for a bare gate — ``apply_receipt`` commits on its own — but a queue handed a
+    transition needs the ``threads`` table in its own file, or the atomicity is a fiction.
     """
 
     def __init__(self, path: str | Path):
         # Same pattern as Queue: the transport serves on its own thread, so
         # the connection must be usable from it, guarded by one lock.
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        # The queue holds its write lock for as long as a durable put takes, so this connection
+        # must wait at least as long: sqlite's 5 s default turned a slow put into a failed
+        # note_sent, and the reply credit was lost with it (#72 review, nit 1).
+        self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30.0)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS threads (context TEXT PRIMARY KEY, expects INTEGER NOT NULL,"
             " closed INTEGER NOT NULL, updated TEXT NOT NULL)"
@@ -80,7 +122,13 @@ class Threads:
             )
             self._conn.commit()
 
-    def note_received(self, context: str, now: datetime) -> Decision:
+    def receipt(self, context: str) -> Decision:
+        """Answer whether a reply to ``context`` is admissible, and what it would change.
+
+        Read-only: the counter is not touched here. The answer carries a :class:`Receipt` for
+        ``decide``'s caller to commit alongside the message (#69), so asking twice about the same
+        reply cannot spend two expectations.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT expects, closed FROM threads WHERE context = ?", (context,)
@@ -92,12 +140,20 @@ class Threads:
                 # A reply to a message that asked for none, or to a closed thread, is a protocol error.
                 # Dropping it is what stops two agents answering each other forever (§6, §2 goal 4).
                 return Decision(False, REFUSED, "thread")
-            self._conn.execute(
-                "UPDATE threads SET expects = expects - 1, updated = ? WHERE context = ?",
-                (now.isoformat(), context),
-            )
-            self._conn.commit()
-            return Decision(True)
+            return Decision(True, transition=Receipt(context))
+
+    def apply_receipt(self, decision: Decision, now: datetime) -> Decision:
+        """Commit ``decision.transition`` on this store's own connection and return the decision.
+
+        For a gate with no queue in front of it — a unit test, an embedded caller that stores the
+        message itself. The bridge and the transport do **not** call this: they hand the receipt to
+        ``Queue.put`` so the decrement and the insert commit together (#69).
+        """
+        if decision.transition is not None:
+            with self._lock:
+                decision.transition.apply(self._conn, now)
+                self._conn.commit()
+        return decision
 
 
 class Gate:
@@ -141,6 +197,13 @@ class Gate:
         return True
 
     def decide(self, envelope: object, now: datetime | None = None) -> Decision:
+        """Admit or refuse one envelope. Moves no conversation state: see :class:`Receipt`.
+
+        The one store this does write is the rate window, charged only after the envelope passed
+        every validation: a refused envelope must not spend a sender's quota, and a retry of an
+        already-queued message never reaches here (the bridge checks the queue's durable ``seen``
+        set first, #69).
+        """
         moment = now or datetime.now(timezone.utc)
         if not isinstance(envelope, dict):
             return Decision(False, REFUSED, "malformed")
@@ -168,4 +231,4 @@ class Gate:
         if not self._within_limits(sender, moment):
             return Decision(False, REFUSED, "limits")
 
-        return self.threads.note_received(context, moment)
+        return self.threads.receipt(context)
