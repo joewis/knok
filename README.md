@@ -96,7 +96,7 @@ mechanics in [CONTRIBUTING.md](CONTRIBUTING.md); the working agreement in
   form — `messageId` stays in clear, so dedupe and ack work — but the queue has not been updated to
   accept it. That is the next step.
 - **`recv` never acked a hub `expired` frame**, so one re-printed on every fetch until its 72h TTL
-  swept it. The fix is in review (PR #41).
+  swept it. Fixed in `0734d31` (PR #41), merged 19 Nov.
 
 ## Reading order
 
