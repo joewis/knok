@@ -82,8 +82,8 @@ The tick is a convenience. The comment, the command output and the role split ar
 
 Muse's reviewers run on a clone of this repository, and her harness raises an execution-risk check
 before processing one. **Jörg granted standing approval on 20 Nov 2026** for that processing: it does
-not need re-confirming per run. A harness that blocks anyway is a harness bug, not a request for a
-new approval — say so rather than routing the same question back to him.
+not need re-confirming per run. A harness that blocks anyway is an external issue, outside Knok's scope — not a request for a
+new approval.
 
 ## What will rot first
 
