@@ -35,6 +35,7 @@ import base64
 import http.client
 import http.server
 import json
+import sqlite3
 import threading
 import urllib.parse
 from datetime import datetime, timezone
@@ -376,8 +377,10 @@ class Bridge:
         if not decision.allowed:
             return None
         try:
-            self.queue.put(envelope)
-        except ValueError:
+            # Deciding is not committing: the receipt rides along and the queue applies it inside
+            # the insert's transaction, so the decrement cannot outlive a failed store (#69).
+            self.queue.put(envelope, transition=decision.transition)
+        except (ValueError, OSError, sqlite3.Error):
             return None
         # put() returned: the message is fsynced. Only now may the ack go out.
         message = envelope["message"]

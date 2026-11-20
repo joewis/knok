@@ -68,7 +68,9 @@ def make_bridge(tmp_path, name, identities, *, allow=(), cards_for=None):
         "limits": {},
     })
     contacts = Contacts(base / "contacts.db")
-    threads = Threads(base / "threads.db")
+    # Threads shares the queue's file: a receipt is applied inside the queue's insert transaction
+    # (#69), which needs both tables in one database.
+    threads = Threads(base / "queue.db")
     queue = Queue(base / "queue.db", identity.agent_id)
     gate = Gate(policy, contacts, threads)
     registry = registry_for(*identities)

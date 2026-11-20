@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -221,7 +222,9 @@ class Bridge:
         self.queue = Queue(state.directory / "queue.db", state.agent_id)
         self.rates = Rates(state.directory / "rates.db")
         self.contacts = Contacts(state.directory / "contacts.db", rates=self.rates)
-        self.threads = Threads(state.directory / "threads.db")
+        # Thread state shares the queue's file on purpose: the gate's decrement commits inside the
+        # queue's insert transaction, so neither exists without the other (#69).
+        self.threads = Threads(state.directory / "queue.db")
         self.policy = policy_mod.load(state.policy_path)
         if self.policy.agent_id != state.agent_id:
             raise ValueError(
@@ -525,14 +528,35 @@ class Bridge:
             log.warning("refused an unverifiable envelope from %s: %s", sender, reason)
             return "unhandled", None
 
+        message = item.get("message")
+        if not isinstance(message, dict):
+            # Sealed (form 2): its contextId is inside the sealed body, so neither the gate nor the
+            # queue can order it before decryption (and where that decryption happens is #70's
+            # open decision). Left unhandled rather than guessed at.
+            log.warning("no form 1 message in an item from %s; leaving it at the hub", sender)
+            return "unhandled", None
+
         # A peer's answer to our own mailbox is not mail for the agent: it is a statement about a
         # message we sent, and it is handled here so it can never enter a thread or a gate decision.
-        notice = (item["message"].get("metadata") or {}).get(NOTICE_KEY)
+        notice = (message.get("metadata") or {}).get(NOTICE_KEY)
         if notice is not None:
             return self._handle_refusal_notice(item, sender, notice)
 
+        # The message id is trusted for dedupe only after the signature and the card checked out
+        # above: anyone can write an id into an envelope, so the id alone must never be able to
+        # suppress a message.
+        message_id = message.get("messageId")
+        if not isinstance(message_id, str) or not message_id:
+            return "unhandled", None
+
+        # A message already accepted is acknowledged and skipped *before* the gate (#69): the
+        # durable insert and the thread decrement committed together the first time, so a retry
+        # after a lost ack must not decrement the thread a second time.
+        if self.queue.seen(message_id):
+            log.info("re-offered message %s is already queued; acking without gate work", message_id)
+            return "queued", message_id
+
         decision = self.gate.decide(item)
-        message_id = item["message"]["messageId"]
         if not decision.allowed:
             # Recorded as handled: the hub must stop offering it, or a 50-message page that is all
             # refusals never advances (HUB.md, "ack means handled").
@@ -540,8 +564,16 @@ class Bridge:
             self._refuse(item, decision, message_id)
             return "refused", message_id
 
-        result = self.queue.put(item)
-        return ("queued" if result == "accepted" else "queued"), message_id
+        try:
+            # The gate's answer is applied here, by the queue, in the insert's transaction: a
+            # failed insert leaves the thread exactly as it was (#69).
+            self.queue.put(item, transition=decision.transition)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            # Nothing was stored and nothing was committed, so the item stays unacked and the hub
+            # offers it again; the attempt counter bounds a message that can never be stored.
+            log.error("queue refused or failed on %s from %s: %s", message_id, sender, exc)
+            return "unhandled", None
+        return "queued", message_id
 
     def _handle_frame(self, frame: dict[str, Any]) -> tuple[str, str | None]:
         hub_card = self.state.registry.get(frame.get("from", ""))
