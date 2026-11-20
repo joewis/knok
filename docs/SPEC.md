@@ -533,6 +533,31 @@ delivered as silence, which is indistinguishable from refusal by construction (�
 records who decided, when, and the fingerprint that was shown — "the owner approved this key" must be
 distinguishable from "approved this name, keys rotated since".
 
+**The decision record is append-only, and it says what was on screen.** A decision is a row that is
+written once and never updated: what the request presented, what the owner was looking at when they
+decided, who decided, and when. A later decision supersedes the earlier row for the same peer rather
+than overwriting it, so the audit reads the history instead of inferring it from whichever key the
+peer happens to advertise now.
+
+The two fingerprints are equal on the approval path **by construction, not by hope**: `approve`
+requires the key the owner was shown to be the key the request carried, and a mismatch is refused
+rather than recorded. An "approval of a key the owner never saw" therefore does not exist as a row;
+it exists as an error, which is the only place it can be seen. On the refusal path the shown key is
+recorded even when it differs, because refusing is safe whatever key is attached and the difference
+is the fact the audit must keep — "the owner refused this key" and "the owner refused a key that had
+already rotated away" must not be the same row.
+
+Two consequences follow, and both are deliberate:
+
+- An owner shown a rotated key who would have approved must **refuse and let the peer ask again**.
+  Approving this name while a different key is attached is the substitution the prompt exists to
+  prevent, so the system refuses to record it rather than recording it with a footnote.
+- **Rotation while a request is held is visible only on a refusal.** A live request cannot be
+  re-presented — a second request inside one is a protocol error — and a refusal is terminal, so a
+  peer reaches at most two decision rows: one terminal decision, or an earlier row superseded by a
+  decision taken after a revoke. A caller that expects the audit to show a history of rotating
+  presentations will not find one, and should not: the wire has no presentation event to show.
+
 **The approval queue is an attack surface and is capped.** At most five presentations per owner in any
 rolling 24 hours, and a peer that asks again inside the cooldown is deduped rather than presented
 twice. An
