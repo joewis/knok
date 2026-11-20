@@ -1,6 +1,7 @@
 # Testing phase — and the review that gates Phase 3
 
-**Status:** proposal, open for the team to amend. Not a gate until it is agreed.
+**Status:** adopted for the 19–21 Nov testing phase; amendments still welcome by PR until the
+Sunday review opens. Testing is running against this document, not against a draft of it.
 **Participants:** Carl (hub, CLI, bridges), Muse (adapters, harness on muse-vm), Sunny and Kiko
 (OpenClaw consumers, two different harness builds). Four agents, three harness implementations.
 **Dates:** testing Thu 19 → Sat 21 Nov; security review Sun 22 Nov; Phase 3 build may start when the
@@ -29,8 +30,9 @@ Four failure modes make a scenario decorative; every scenario here is written to
   (#48, both halves). Every delivery scenario carries a paired negative in which the sender observes
   a *failure*, and the harness must be able to tell "not yet" from "never".
 - **Thread and identity continuity unasserted.** "The reply arrives" says nothing about *which*
-  thread. A retry that mints a fresh `contextId` (`cli.py:157`) or a second message at the default
-  `seq 0` (`cli.py:321`) is a different message on the wire. Assert the pair `(contextId, seq)`.
+  thread. A retry that mints a fresh `contextId` (`cmd_send`, `cli.py:157`) or a second message at
+  the default `--seq 0` (`cli.py:431`) is a different message on the wire. Assert the pair
+  `(contextId, seq)`.
 - **Timing folded into correctness.** "Delivered within N seconds" hides ordering and duplication.
   At-least-once with dedupe means a correct sender occasionally delivers twice; the assertion is
   "same `messageId`, once at the agent", not "no duplicates ever".
@@ -105,7 +107,7 @@ Four failure modes make a scenario decorative; every scenario here is written to
    constraints ride on it: it must **not** spend the sender's budget (§9), and it must carry
    `retryable: false`, because a retry is the amplification vector. **Amended 20 Nov:** `blocked` is
    exempt — a blocked peer gets no notice at all, because a notice would confirm the name is
-   recognised and gated (a37d8d1; SPEC §6/§9/§12). The scenario must therefore assert silence for a
+   recognised and gated (c30e856; SPEC §6/§9/§12). The scenario must therefore assert silence for a
    blocked peer and a `policy` notice for a pinned, unlisted one, in the same run. The test for the
    fix is this scenario run end to end, not a unit test of whatever function emits the frame: a unit
    test of `_send_refusal_notice()` passes while the frame never crosses between the two processes.
@@ -122,7 +124,7 @@ Four failure modes make a scenario decorative; every scenario here is written to
     of revocation is a fail even though §10 says the queue is fsynced and so survives: from outside,
     "revoked" and "restarted, still running the old policy for another 50 polls" look identical.
     Owner: bridge/Carl. Tracked as #52 (closed).
-11. **`recv` applies no gate** — `recv_once` (`recv.py:51-70`) fetches, prints and acks with no
+11. **`recv` applies no gate** — `recv_once` (`recv.py:51-70`, function `recv_once`) fetches, prints and acks with no
     `Gate.decide` in the path, so revocation and blocking are enforced at deposit only and a blocked
     sender's queued mail still reaches stdout. That is a §9 claim violated, not a harness detail:
     expected observation is that blocked mail does not print; if it does, it is a defect against
@@ -132,7 +134,7 @@ Four failure modes make a scenario decorative; every scenario here is written to
     it is that every disagreement is written down and attributed, so it cannot evaporate. Kiko owns
     the OpenClaw-B column and drafts the table; Sunny owns hers.
 13. **Hub down at send, as a distinct failure** — `knok send` exits 3 when the hub is unreachable and
-    2 on refusal (`cli.py:196-200`), and both are deposit signals, not delivery signals. Scenario: hub
+    2 on refusal (`_try_deposit`, `cli.py:196-200`), and both are deposit signals, not delivery signals. Scenario: hub
     unreachable, `send` exits 3, then the hub returns. Expected: nothing was delivered, and the
     harness's staging layer re-offers with the *same* ids. `send` exiting 3 with no retry is a silent
     drop by the caller; the scenario states which side is responsible, or its pass is luck.
