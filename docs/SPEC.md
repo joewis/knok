@@ -239,7 +239,9 @@ enough for a receiver's `seen` table, but the id also travels in unsigned hub fr
 dead-letter stores shared across senders, so global uniqueness costs nothing and removes the question.
 
 The receiving queue's `seen` table is keyed on `messageId` alone, so a sender that reuses one has its
-later message silently dropped as a duplicate.
+later message dropped as a duplicate. Dropped from the queue is not the same as dropped without a
+trace: the receiving bridge's delivery ledger (below) keeps a `duplicate` row naming it, so the loss
+is a record the operator can read rather than an absence.
 
 **Ordering sealed traffic happens after decryption, at the receiving bridge.** `contextId` is inside
 the sealed body, so nothing before decryption can say which stream a `seq` belongs to. The hub
@@ -313,6 +315,18 @@ message is fsynced to the receiving bridge's queue — **not** when the agent ha
 slow agent never blocks the queue, and per-context FIFO survives because the bridge, not the agent,
 owns ordering. The sender's "delivered" is bridge-ack; "acted on" is a Task state change, which may
 never come.
+
+**Every polled item leaves a delivery record.** One row per item is appended to the bridge's
+`delivery.jsonl` — `at`, `messageId`, `outcome`, plus whatever the item carried for `kind`, `from`,
+`to`, `seq` and `contextId` — and the rows are fsynced **before** the ack. `outcome` names the
+decision: `queued`, `late`, `duplicate`, `refused`, `notices`, `unhandled` (left at the hub) or
+`dropped` (attempt allowance spent). The distinction is load-bearing: `duplicate` means the queue
+stored nothing, and because the ack deletes the hub's only copy it is precisely the case where the
+row is the last evidence the message existed. The ledger is append-only and per-pass, so a re-offer
+is a second row rather than an update — what was offered and what was decided is the history. A
+bridge that cannot write the row acks nothing on that page; a full disk must not become the loss the
+ledger exists to record. A poll's counts use the same names, so `duplicate` is never reported as
+`queued`.
 
 Poison messages: after 5 attempts with exponential backoff (1m, 5m, 30m, 2h, 12h) the message moves
 to a dead-letter store visible to the recipient's owner. Never retry forever, never drop silently.

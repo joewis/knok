@@ -472,11 +472,16 @@ class Bridge:
         return True
 
     def poll_once(self) -> dict[str, int]:
-        """Fetch one page, handle it in order, ack what was handled.
+        """Fetch one page, handle it in order, record it, ack what was handled.
 
         Returns counts. A message counts as handled when it was either queued durably or refused at
         the gate; a message that could not be handled at all (unverifiable sender, unknown card) is
         left unacked so the hub offers it again, because the alternative is silently dropping mail.
+
+        Every fetched item leaves one row in ``delivery.jsonl`` saying what was decided about it,
+        and the rows reach the disk *before* the hub ack that deletes its copy. That ordering is the
+        point: ``duplicate`` and ``dropped`` are decisions that destroy mail, and once the hub has
+        been told to drop it the row is the only evidence the message ever arrived.
         """
         self.reload_policy_if_changed()
         self.reload_registry_if_changed()
@@ -484,11 +489,13 @@ class Bridge:
             page = self.client.fetch(limit=self.batch)
         except HubError as exc:
             log.warning("fetch failed: %s", exc)
-            return {"fetched": 0, "queued": 0, "refused": 0, "notices": 0, "unhandled": 1}
+            return {"fetched": 0, "queued": 0, "duplicate": 0, "late": 0, "refused": 0,
+                    "notices": 0, "unhandled": 1, "dropped": 0}
 
-        counts = {"fetched": 0, "queued": 0, "refused": 0, "notices": 0, "unhandled": 0,
-                  "dropped": 0}
+        counts = {"fetched": 0, "queued": 0, "duplicate": 0, "late": 0, "refused": 0,
+                  "notices": 0, "unhandled": 0, "dropped": 0}
         handled: list[str] = []
+        ledger: list[dict[str, Any]] = []
         for item in page.get("messages", []):
             counts["fetched"] += 1
             outcome, message_id = self._handle(item)
@@ -498,6 +505,7 @@ class Bridge:
                 self._attempts[key] = attempts
                 if attempts < MAX_HANDLE_ATTEMPTS:
                     counts["unhandled"] += 1
+                    ledger.append(self._delivery_record(item, "unhandled", key))
                     continue
                 # Bounded and now exhausted: acknowledge it away so the mailbox can advance, and
                 # leave a record. Re-offering it a sixth time only starves everything behind it.
@@ -506,13 +514,27 @@ class Bridge:
                     # The record is the only evidence this message ever existed. Without it the ack
                     # would erase the message and leave nothing behind, so the drop waits instead.
                     counts["unhandled"] += 1
+                    ledger.append(self._delivery_record(item, "unhandled", key))
                     continue
                 del self._attempts[key]
                 counts["dropped"] += 1
                 handled.append(key)
+                ledger.append(self._delivery_record(item, "dropped", key))
                 continue
             counts[outcome] += 1
             handled.append(message_id)
+            ledger.append(self._delivery_record(item, outcome))
+
+        # Record, then hand the hub permission to forget. If the ledger cannot be written, nothing
+        # on this page is acked: the hub keeps offering these, and a message the queue already
+        # holds comes back as a duplicate it can recognise. Losing one to a full disk would repeat
+        # the failure this file exists to catch.
+        if not self._record_deliveries(ledger):
+            # The counts describe what the hub was told, and it was told nothing: every item on
+            # this page is still its problem, whatever this bridge did with it locally.
+            counts = {"fetched": counts["fetched"], "queued": 0, "duplicate": 0, "late": 0,
+                      "refused": 0, "notices": 0, "unhandled": len(ledger), "dropped": 0}
+            handled = []
 
         if handled:
             try:
@@ -524,6 +546,50 @@ class Bridge:
         if self.deliver:
             counts["delivered"] = self.drain()
         return counts
+
+    def _delivery_record(self, item: Any, outcome: str, key: str | None = None) -> dict[str, Any]:
+        """The row one fetched item leaves in ``delivery.jsonl``.
+
+        ``outcome`` is what ``_handle`` decided plus the two the caller can add (``dropped`` when
+        the attempt allowance is spent, ``unhandled`` when the item is left at the hub). The row
+        carries enough of the envelope to answer "which message, from whom, in which thread, at
+        which seq" without opening the queue — a message that never reaches the inbox has no other
+        place to be found.
+        """
+        record: dict[str, Any] = {
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "messageId": key or item_key(item),
+            "outcome": outcome,
+        }
+        if isinstance(item, dict):
+            message = item.get("message")
+            for field in ("kind", "from", "to", "seq"):
+                if field in item:
+                    record[field] = item[field]
+            if isinstance(message, dict) and isinstance(message.get("contextId"), str):
+                record["contextId"] = message["contextId"]
+        return record
+
+    def _record_deliveries(self, records: list[dict[str, Any]]) -> bool:
+        """Append the page's delivery rows, fsynced, before any of them is acked.
+
+        False when the ledger cannot be written; the caller then acks nothing. One fsync per page,
+        because the guarantee is about what is on disk before the ack, not about how many writes it
+        took to get there.
+        """
+        if not records:
+            return True
+        path = self.state.directory / "delivery.jsonl"
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return True
+        except OSError as exc:
+            log.error("could not write the delivery ledger; acking nothing this pass: %s", exc)
+            return False
 
     def _handle(self, item: Any) -> tuple[str, str | None]:
         """Handle one mailbox item. Returns (outcome, messageId-or-None)."""
@@ -573,8 +639,12 @@ class Bridge:
         # durable insert and the thread decrement committed together the first time, so a retry
         # after a lost ack must not decrement the thread a second time.
         if self.queue.seen(message_id):
+            # Named for what it is: no work was done and nothing new is stored, so reporting this
+            # as "queued" would put a delivery in the counts that never happened. A re-offer after
+            # a lost hub ack is ordinary; a re-offer of an id whose message the queue does *not*
+            # hold is the shape #79 could not see, and it says ``duplicate`` here too.
             log.info("re-offered message %s is already queued; acking without gate work", message_id)
-            return "queued", message_id
+            return "duplicate", message_id
 
         decision = self.gate.decide(item)
         if not decision.allowed:
@@ -587,13 +657,17 @@ class Bridge:
         try:
             # The gate's answer is applied here, by the queue, in the insert's transaction: a
             # failed insert leaves the thread exactly as it was (#69).
-            self.queue.put(item, transition=decision.transition)
+            result = self.queue.put(item, transition=decision.transition)
         except (OSError, sqlite3.Error, ValueError) as exc:
             # Nothing was stored and nothing was committed, so the item stays unacked and the hub
             # offers it again; the attempt counter bounds a message that can never be stored.
             log.error("queue refused or failed on %s from %s: %s", message_id, sender, exc)
             return "unhandled", None
-        return "queued", message_id
+        # ``put`` answers three ways and the difference is mail: ``accepted`` stored it, ``late``
+        # stored it out of order, ``duplicate`` stored *nothing* and the envelope is dropped. The
+        # hub is acked on all three, so flattening this to "queued" is how messages were fetched,
+        # acknowledged and never seen while the poll log said they had arrived (#79).
+        return ("queued" if result == "accepted" else result), message_id
 
     def _handle_frame(self, frame: dict[str, Any]) -> tuple[str, str | None]:
         hub_card = self.state.registry.get(frame.get("from", ""))
