@@ -83,7 +83,10 @@ def _gate_for(state: BridgeState) -> tuple[Gate, list]:
         )
     rates = Rates(state.directory / "rates.db")
     contacts = Contacts(state.directory / "contacts.db", rates=rates)
-    threads = Threads(state.directory / "threads.db")
+    # The same file the queue uses: since #69 a decision and the message it decides on commit
+    # together, and a Threads opened on threads.db reads an empty table - every reply recv judges
+    # looks unsolicited and is refused, while the bridge counts it correctly in the other file.
+    threads = Threads(state.directory / "queue.db")
     gate = Gate(policy, contacts, threads, rates)
     return gate, [rates, contacts, threads]
 
