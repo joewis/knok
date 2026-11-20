@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.3.0 — 2026-11-20 — the hardening sweep
+
+Two days of defects found by review and by running the thing, each closed against code with a
+reproducing test. One theme runs through almost all of them: **a failure recorded as a success**, or
+a success recorded before it happened.
+
+**Delivery and durability**
+
+- The gate's answer commits with the message that moved it (#69). `decide` is read-only; the queue
+  applies the transition inside its own transaction, and a duplicate is recognised before the gate,
+  so a retry after a lost ack is no longer refused as unsolicited.
+- Every fetched item leaves a fsynced `delivery.jsonl` row before the hub may forget it (#79). The
+  bug it closes: a sender that reuses `seq` 0 in an existing context made `put` answer `duplicate`,
+  which `_handle` flattened to `queued`, and the hub acked — 17 messages lost with a counter that
+  said they were fine.
+- The adapter retry policy (#68): a failed send leaves a notice, `knok retry` decides which are
+  worth repeating, and repeats them by replaying the stored envelope verbatim through
+  `send --retry-of` — same id, same context. The budget is enforced by a durable reservation: a
+  retry that cannot be counted is not performed.
+- `knok notices` lets a sender read what its bridge recorded (#48), and the CLI's exit codes now say
+  what happened rather than 0 for every outcome.
+
+**Identity and approval**
+
+- A request is held until the owner approves it (#42): approval is a local precondition, never a
+  wire state, with a five-a-day cap so the owner's prompt cannot be the spam channel.
+- A decision records the key the owner was shown, and decisions are append-only (#65): a rotation
+  between presentation and decision is two rows with one superseded, not one row quietly rewritten.
+  §9 says what that audit can and cannot show.
+- A card is pinned under the name its signed body claims, not its file name (#62): a misfiled card
+  no longer grants a name, and a `validUntil` is enforced at load and per message.
+- A revoked or expired card is judged as of the envelope's own `sentAt` (#63), so a message signed
+  yesterday is not refused by a key that lapsed this morning.
+- Pinned cards follow the registry directory (#54), a changed policy is adopted without a restart
+  (#52), and a newly registered agent's card is learned from the hub (#57).
+
+**Transport and CLI**
+
+- `recv` applies the gate before printing and before acking (#51): a refusal is acked so a blocked
+  sender's mail cannot starve the page, notices are exempted so a recv-only agent still learns its
+  own message died, and a sealed envelope is left unacked rather than deleted.
+- `recv` acks a hub `expired` frame by its top-level id, so it stops re-printing on every fetch
+  (#40). `--reply-to` was removed because it injected a field the validator rejects (#37).
+- A gate refusal reaches the sender as a notice (#50), and delivery is closed by default.
+
+**Sealed messages**
+
+- Decision 0003 settles where a sealed body is decrypted: **the receiving bridge, at admission,
+  before the gate**. The queue only ever sees plaintext, and the agent adapter never holds a key.
+- `knok.hpke` (RFC 9180 base mode) plus `envelope.seal`/`unseal` land with the RFC's own A.2 vectors
+  as tests, in both directions (#70). Sealed mail cannot travel yet: nothing mints one, and the hub
+  refuses form 2 at deposit. #83 names what §6 still owes.
+
+**Documentation and process**
+
+- `docs/REVIEW.md` — the reviewer's guide: what to attack, and what is deliberately missing.
+- `docs/TESTING.md` — the testing phase (19-21 Nov) and the Sunday security review's inputs.
+- `docs/decisions/0004` — what "pinned" means; 0003 is the sealed boundary, renumbered out of a
+  collision with it.
+- The working agreement gains a rule that a merge is not a handoff unless it names what follows and
+  who owns it, and that a review states the command it ran and the count it got.
+
 ## v0.2.1 — 2026-11-18 — the issue sweep
 
 Seven open issues, closed against code rather than discussion. Every one of them was a place where

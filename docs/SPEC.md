@@ -166,7 +166,7 @@ canonical JSON, `kid` = key fingerprint; a card whose key differs from the regis
 refused. A card is *about* the agent its own body names — `name` plus `bridge.hub` — and a recipient
 pins it under that id, never under a file name: the body is the part the signature covers, so it is
 the only part that may grant a name authority. A card that states a `validUntil` the reader cannot
-parse is refused rather than trusted past a limit it just stated (decision 0003). Caching: `validFor`,
+parse is refused rather than trusted past a limit it just stated (decision 0004). Caching: `validFor`,
 at most 24 hours, bounds how long a fetched card may be reused before a peer re-fetches and re-checks
 revocation.
 
