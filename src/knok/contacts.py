@@ -94,9 +94,104 @@ class Contacts:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS approvals (peer TEXT PRIMARY KEY, text TEXT NOT NULL,"
             " fingerprint TEXT NOT NULL, presented TEXT NOT NULL, decision TEXT,"
-            " decided_by TEXT, decided_at TEXT)"
+            " decided_by TEXT, decided_at TEXT, decided_fingerprint TEXT)"
         )
+        # Decisions are APPEND-ONLY (#65). The approvals row above is the *presentation* record:
+        # what the owner was shown, and when. Overwriting it with a decision destroyed the one fact
+        # an audit needs — whether the key on screen had already rotated away — because a rotating
+        # peer re-writes that row and the decision then names whatever key happens to be in it.
+        # A decision row is therefore written once and never updated; a later request supersedes
+        # it rather than replacing it.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " peer TEXT NOT NULL, presented_fingerprint TEXT NOT NULL,"
+            " decided_fingerprint TEXT, decision TEXT NOT NULL, decided_by TEXT NOT NULL,"
+            " decided_at TEXT NOT NULL, superseded_by INTEGER)"
+        )
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring a store created before append-only decisions up to date.
+
+        ``CREATE TABLE IF NOT EXISTS`` does not add a column to an existing table, so the additive
+        column is ALTERed in when absent. Decisions already recorded in the old one-row shape are
+        then copied into ``decisions``: on a legacy row, ``approvals.fingerprint`` as it stood when
+        the decision was written is the only evidence of what was presented. The legacy row is left
+        untouched — this migration adds history, it does not rewrite it.
+        """
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(approvals)")}
+        if "decided_fingerprint" not in columns:
+            self._conn.execute("ALTER TABLE approvals ADD COLUMN decided_fingerprint TEXT")
+        pending = self._conn.execute(
+            "SELECT peer, fingerprint, decision, decided_by, decided_at, decided_fingerprint"
+            " FROM approvals WHERE decision IS NOT NULL AND peer NOT IN"
+            " (SELECT peer FROM decisions)"
+        ).fetchall()
+        for peer, presented, decision, decided_by, decided_at, decided_fp in pending:
+            self._conn.execute(
+                "INSERT INTO decisions (peer, presented_fingerprint, decided_fingerprint,"
+                " decision, decided_by, decided_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (peer, presented or "", decided_fp, decision, decided_by or "", decided_at or ""),
+            )
+
+    def _record_decision(self, peer: str, presented: str, decided: str | None, decision: str,
+                         decided_by: str, moment: datetime) -> None:
+        """Append one decision row, superseding any earlier undecided-by-supersession row.
+
+        The row records two keys because they answer different questions: what the request
+        presented, and what the owner was looking at when they decided. Equal means the decision
+        names the key that asked; different means the peer rotated while the request was held, and
+        the decision belongs to the key that was on screen (#65).
+
+        Every earlier un-superseded row for this peer is superseded by the new one. The new row
+        does not exist yet, so there is no row to exclude: superseding only rows older than the
+        global maximum would leave the peer's latest row current whenever it happened to be the
+        most recent decision in the table — the common single-peer case — and the audit would show
+        two rows, neither marked superseded.
+        """
+        self._conn.execute(
+            "UPDATE decisions SET superseded_by = (SELECT COALESCE(MAX(id), 0) + 1 FROM decisions)"
+            " WHERE peer = ? AND superseded_by IS NULL",
+            (peer,),
+        )
+        self._conn.execute(
+            "INSERT INTO decisions (peer, presented_fingerprint, decided_fingerprint, decision,"
+            " decided_by, decided_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (peer, presented, decided, decision, decided_by, _ts(moment)),
+        )
+
+    @_locked
+    def decision(self, peer: str) -> dict | None:
+        """The latest decision for ``peer``, or ``None`` when the owner has not decided one.
+
+        ``presented_fingerprint`` is the key the request carried, ``decided_fingerprint`` the key
+        on screen when the decision was made. ``None`` decision means the request is still held.
+        Use ``decision_history`` for the full audit including superseded presentations.
+        """
+        row = self._conn.execute(
+            "SELECT id, presented_fingerprint, decided_fingerprint, decision, decided_by,"
+            " decided_at, superseded_by FROM decisions WHERE peer = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (peer,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "peer": peer, "presented_fingerprint": row[1],
+                "decided_fingerprint": row[2], "decision": row[3], "decided_by": row[4],
+                "decided_at": row[5], "superseded_by": row[6]}
+
+    @_locked
+    def decision_history(self, peer: str) -> list[dict]:
+        """Every decision row for ``peer``, oldest first — the audit #65 exists to make readable."""
+        rows = self._conn.execute(
+            "SELECT id, presented_fingerprint, decided_fingerprint, decision, decided_by,"
+            " decided_at, superseded_by FROM decisions WHERE peer = ? ORDER BY id",
+            (peer,),
+        ).fetchall()
+        return [{"id": r[0], "peer": peer, "presented_fingerprint": r[1],
+                 "decided_fingerprint": r[2], "decision": r[3], "decided_by": r[4],
+                 "decided_at": r[5], "superseded_by": r[6]} for r in rows]
 
     def close(self) -> None:
         self._conn.close()
@@ -251,15 +346,19 @@ class Contacts:
         return row[0]
 
     @_locked
-    def approve(self, peer: str, decided_by: str, fingerprint: str = "",
+    def approve(self, peer: str, decided_by: str, fingerprint: str,
                 now: datetime | None = None) -> None:
         """Record the OWNER's approval of a held request. Does not accept it — that is separate.
 
-        ``fingerprint`` is what the owner was shown. If they name one and it is not the one on the
-        request, the approval is refused: approving this name while a different key is attached is
-        the substitution an approval prompt exists to prevent (§9).
+        ``fingerprint`` is what the owner was shown, and it is REQUIRED: an optional argument that
+        defaulted to the presented key let a caller record an approval against a key the owner
+        never saw, which is the same substitution the prompt exists to prevent, happening in the
+        audit instead of at the gate (§9, #65). If it is not the key on the request, the approval
+        is refused — approving this name while a different key is attached is not an approval.
         """
         moment = now or datetime.now(timezone.utc)
+        if not isinstance(fingerprint, str):
+            raise ContactError("the fingerprint shown to the owner is a string")
         row = self._conn.execute(
             "SELECT fingerprint, decision FROM approvals WHERE peer = ?", (peer,)
         ).fetchone()
@@ -267,29 +366,42 @@ class Contacts:
             raise ContactError(f"{peer} has no held request to approve")
         if row[1] is not None:
             raise ContactError(f"{peer} has already been {row[1]}")
-        if fingerprint and fingerprint != row[0]:
+        if fingerprint != row[0]:
             raise ContactError(f"{peer}: the key shown to the owner is not the key on the request")
         self._conn.execute(
             "UPDATE approvals SET decision = 'approved', decided_by = ?, decided_at = ? WHERE peer = ?",
             (decided_by, _ts(moment), peer),
         )
+        self._record_decision(peer, row[0], row[0], "approved", decided_by, moment)
         self._conn.commit()
 
     @_locked
-    def deny(self, peer: str, decided_by: str, now: datetime | None = None) -> None:
-        """Record the owner's refusal. Terminal, and delivered as silence like every refusal."""
+    def deny(self, peer: str, decided_by: str, fingerprint: str = "",
+             now: datetime | None = None) -> None:
+        """Record the owner's refusal. Terminal, and delivered as silence like every refusal.
+
+        ``fingerprint`` is the key on screen when the decision was made. Unlike ``approve`` it is
+        recorded, not checked: refusing is safe whatever key is attached, and the mismatch between
+        the presented key and the one that was shown is precisely the fact the audit must keep
+        rather than reject (#65). Omitted, it falls back to the request's current fingerprint,
+        which is what the prompt shows — an assertion, not a verification, and the docstring says
+        so rather than implying a check that does not happen.
+        """
         moment = now or datetime.now(timezone.utc)
+        if not isinstance(fingerprint, str):
+            raise ContactError("the decided fingerprint is a string, not a moment")
         row = self._conn.execute(
-            "SELECT decision FROM approvals WHERE peer = ?", (peer,)
+            "SELECT fingerprint, decision FROM approvals WHERE peer = ?", (peer,)
         ).fetchone()
         if row is None or self.local_state(peer, moment) != LOCAL_HELD:
             raise ContactError(f"{peer} has no held request to deny")
-        if row[0] is not None:
-            raise ContactError(f"{peer} has already been {row[0]}")
+        if row[1] is not None:
+            raise ContactError(f"{peer} has already been {row[1]}")
         self._conn.execute(
             "UPDATE approvals SET decision = 'denied', decided_by = ?, decided_at = ? WHERE peer = ?",
             (decided_by, _ts(moment), peer),
         )
+        self._record_decision(peer, row[0], fingerprint or row[0], "denied", decided_by, moment)
         self._set(peer, "refused", moment)
 
     @_locked
