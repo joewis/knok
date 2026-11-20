@@ -37,6 +37,7 @@ from .hubclient import HubClient, HubError, HubRefused
 from .identity import b64url_decode, load as load_identity
 from .recv import recv_once
 from .retry import (
+    EXIT_RATE_LIMITED,
     NOTICE_TIMES,
     SENT_LEDGER,
     decide_notice,
@@ -209,7 +210,12 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def _try_deposit(client: HubClient, envelope: dict[str, Any]) -> tuple[int, dict[str, Any] | None]:
-    """Deposit one envelope, retrying the only retryable refusal (429). Returns (exit code, reply)."""
+    """Deposit one envelope, retrying the only retryable refusal (429). Returns (exit code, reply).
+
+    The exit code keeps a 403 and an exhausted 429 apart: a 403 is a permanent refusal (2),
+    an exhausted 429 is rate-limited (5, retryable after the window). The reply carries the
+    refusal's HTTP status, so the caller can tell which it was without decoding the code.
+    """
     for attempt in range(1, 4):
         try:
             return 0, client.deposit(envelope)
@@ -219,7 +225,13 @@ def _try_deposit(client: HubClient, envelope: dict[str, Any]) -> tuple[int, dict
                 time.sleep(2 * attempt)
                 continue
             print(f"hub refused the message: {exc.status}", file=sys.stderr)
-            return 2, None
+            if exc.retryable:
+                # The 429 survived the in-process retries. This is not a permanent refusal:
+                # the window clears, so the adapter retries it after the window (see
+                # decide_send). A distinct exit code, so the caller does not have to guess
+                # whether a 2 was a 403 or a 429 it could have waited out.
+                return EXIT_RATE_LIMITED, {"refusalStatus": exc.status}
+            return 2, {"refusalStatus": exc.status}
         except HubError as exc:
             print(f"cannot reach the hub: {exc}", file=sys.stderr)
             return 3, None
@@ -561,6 +573,14 @@ def _retry_record(
     return record
 
 
+#: How bad a performed retry's status is, for the scan exit code. The hub being
+#: unreachable (3) is worse than a permanent refusal (2), which is worse than a
+#: rate limit (5, transient), which is worse than delivered (0). Numeric order
+#: would put 5 first, so the order is explicit, not max(). An unknown status
+#: counts as a refusal — a failure the caller cannot place is not a success.
+_PERFORMED_SEVERITY = {0: 0, 5: 1, 2: 2, 3: 3}
+
+
 def cmd_retry(args: argparse.Namespace) -> int:
     """Apply the adapter's retry policy to the failures the bridge recorded (#48).
 
@@ -586,18 +606,22 @@ def cmd_retry(args: argparse.Namespace) -> int:
     ``--send-failed`` is the send-time half: a send that failed, by the messageId the failed
     send printed — there is no notice for it, so the decision comes from ``decide_send``.
     ``--send-failed`` needs ``--send-exit``: the exit code the failed send actually exited
-    with. A 2 is a permanent refusal and is never replayed; a 3 is retryable. The command
-    refuses rather than guessing. With ``--dry-run`` it reports decisions without performing
-    retries or recording. With ``--json`` it prints one JSON object per message decided; every
-    outcome carries ``delivered`` — True only when a retry landed, or an earlier retry already
-    did — because a retry that landed and a message that is terminally dead both exit 0 in
-    scan mode. In scan mode the exit code is 0 when the scan completed, 1 when a due retry
-    could not be performed. In single-message mode (``--message-id`` or ``--send-failed``) the
-    exit code says what happened to this message: 0 delivered, 1 deferred (waiting, or a due
-    retry that could not be performed — try again later), 2 the retry was performed and the
-    hub refused it, 3 the retry was performed and the hub was unreachable, 4 terminal (budget
-    spent, a permanent refusal, expired, dead, an unknown id, no stored attempt — no retry was
-    performed and none will be).
+    with. A 2 is a permanent refusal and is never replayed; a 3 is retryable; a 5 is a
+    rate limit the in-process retries could not clear, retryable after the window. The
+    command refuses rather than guessing. With ``--dry-run`` it reports decisions without
+    performing retries or recording. With ``--json`` it prints one JSON object per message
+    decided; every outcome carries ``delivered`` — True only when a retry landed, or an
+    earlier retry already did — because a retry that landed and a message that is terminally
+    dead both exit 0 in scan mode. In scan mode the exit code is 0 when the scan completed
+    and nothing performed failed, 1 when a due retry could not be performed, and the worst
+    performed status (unreachable 3 beats refused 2 beats rate-limited 5) when a performed
+    retry failed — so ``knok retry && echo delivered`` does not lie. In single-message mode
+    (``--message-id`` or ``--send-failed``) the exit code says what happened to this message:
+    0 delivered, 1 deferred (waiting, or a due retry that could not be performed — try again
+    later), 2 the retry was performed and the hub refused it, 3 the retry was performed and
+    the hub was unreachable, 4 terminal (budget spent, a permanent refusal, expired, dead, an
+    unknown id, no stored attempt — no retry was performed and none will be), 5 the retry was
+    performed and the hub rate-limited it.
     """
     directory = Path(os.environ.get("KNOK_STATE", "/app/state"))
     now = datetime.now(timezone.utc)
@@ -685,6 +709,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
     outcomes: list[dict[str, Any]] = []
     unperformed = False
     performed_status: int | None = None
+    # The worst status of any retry this scan performed, by _PERFORMED_SEVERITY. In
+    # single-message mode the one performed status is returned directly; in scan mode
+    # this is what the exit code reports, so a failed retry is not hidden behind a 0.
+    worst_performed: int | None = None
     # Phase one: decide every message. This needs no hub, so a terminal decision is recorded
     # even when a retry elsewhere in the scan cannot be performed.
     due_list: list[tuple[str, dict[str, Any], Any]] = []
@@ -787,6 +815,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
                     continue
                 retries.append(reservation)
                 status, result, _envelope = _retry_envelope(state, identity, message_id)
+                if worst_performed is None or _PERFORMED_SEVERITY.get(
+                    status, 2
+                ) > _PERFORMED_SEVERITY.get(worst_performed, 2):
+                    worst_performed = status
                 outcome = _retry_outcome(
                     notice,
                     "retry",
@@ -835,6 +867,11 @@ def cmd_retry(args: argparse.Namespace) -> int:
         if "waiting" in decisions or unperformed:
             return 1
         return 0
+    if worst_performed is not None and worst_performed != 0:
+        # A performed retry failed: the exit code is the worst of them, so a scan that
+        # performed a failing retry does not exit 0. Unreachable (3) beats refused (2)
+        # beats rate-limited (5); a scan that only delivered exits 0 below.
+        return worst_performed
     return 1 if unperformed else 0
 
 
@@ -892,8 +929,10 @@ def main(argv: list[str] | None = None) -> int:
     #: The send-time half of #48: a send that failed, by the messageId the failed send printed.
     #: There is no notice for it — the deposit never happened — so the decision comes from
     #: decide_send, not from a notice. --send-exit is the exit code the failed send actually
-    #: exited with (2 is a permanent refusal and is never replayed, 3 is retryable); it is
-    #: required with --send-failed, because guessing 3 would replay a permanently refused send.
+    #: exited with (2 is a permanent refusal and is never replayed, 3 is retryable, 5 is a
+    #: rate limit the in-process retries could not clear and is retryable after the window);
+    #: it is required with --send-failed, because guessing 3 would replay a permanently
+    #: refused send, and guessing 2 would lose a rate-limited one.
     send_failed_group.add_argument("--send-failed", default=None, metavar="MESSAGE_ID")
     retry.add_argument(
         "--send-exit",

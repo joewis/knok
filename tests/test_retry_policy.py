@@ -19,9 +19,11 @@ import pytest
 from knok import cli as cli_module
 from knok.bridge import NOTICES, BridgeState
 from knok.cli import SENT_LEDGER, main
+from knok.hubclient import HubRefused
 from knok.retry import (
     BACKOFF_LIMITS,
     BACKOFF_UNREACHABLE,
+    EXIT_RATE_LIMITED,
     MAX_RETRIES,
     RETRY_LEDGER,
     Decision,
@@ -206,6 +208,7 @@ def test_a_gap_has_no_message_id_and_is_not_a_send_retry():
 SEND_TABLE = [
     # exit code, action, attempt, backoff
     (3, "retry", 1, BACKOFF_UNREACHABLE[0]),
+    (EXIT_RATE_LIMITED, "retry", 1, BACKOFF_LIMITS[0]),
     (2, "terminal", 0, None),
     (0, "terminal", 0, None),
     (4, "terminal", 0, None),
@@ -834,3 +837,192 @@ def test_a_corrupt_attempt_ledger_does_not_abort_a_retry(state, capsys, monkeypa
     record_notice(state, live_notice("m-50"))
     assert main(["retry", "--message-id", "m-50"]) == 4
     assert "terminal m-50" in capsys.readouterr().out
+
+
+#: The two remaining HOLD items (#68, third round): the scan exit code must say
+#: what a performed retry did, and an exhausted 429 must not collapse into a 403.
+#: Each test below fails on the branch as pushed and passes with the fix.
+
+
+def test_a_scan_reports_a_performed_retry_the_hub_refused(carl_env, capsys):
+    """Item (a): a performed retry the hub refused exits 2, not 0 — ``knok retry &&
+    echo delivered`` must not lie about a retry that failed."""
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    muse.client.ack([first["messageId"]])
+
+    record_notice(
+        state,
+        {
+            "kind": "refused",
+            "from": f"muse@{DOMAIN}",
+            "receivedAt": _iso(_now() - timedelta(hours=2)),
+            "messageId": first["messageId"],
+            "contextId": first["contextId"],
+            "rule": "limits",
+        },
+    )
+    # Corrupt the stored envelope's signature so the real hub 403s the replay.
+    path = state / SENT_LEDGER
+    record = json.loads(path.read_text().splitlines()[0])
+    record["envelope"]["signature"] = "not-a-signature"
+    path.write_text(json.dumps(record, sort_keys=True) + "\n")
+
+    assert main(["retry"]) == 2
+    out = capsys.readouterr().out
+    assert f"retried {first['messageId']} (attempt 1): failed, exit 2" in out
+
+
+def test_a_scan_reports_a_performed_retry_the_hub_could_not_be_reached(
+    carl_env, capsys, monkeypatch
+):
+    """Item (a): a performed retry the hub could not be reached exits 3, not 0."""
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    muse.client.ack([first["messageId"]])
+
+    record_notice(
+        state,
+        {
+            "kind": "refused",
+            "from": f"muse@{DOMAIN}",
+            "receivedAt": _iso(_now() - timedelta(hours=2)),
+            "messageId": first["messageId"],
+            "contextId": first["contextId"],
+            "rule": "limits",
+        },
+    )
+    monkeypatch.setenv("KNOK_HUB_URL", "http://127.0.0.1:1")
+    assert main(["retry"]) == 3
+    out = capsys.readouterr().out
+    assert f"retried {first['messageId']} (attempt 1): failed, exit 3" in out
+
+
+def _two_due_retries(carl_env, capsys):
+    """Two messages, each with a due limits notice and a stored attempt."""
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+    ids = []
+    for _ in range(2):
+        assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 0
+        first = json.loads(capsys.readouterr().out)
+        ids.append(first["messageId"])
+        muse.client.ack([first["messageId"]])
+        record_notice(
+            state,
+            {
+                "kind": "refused",
+                "from": f"muse@{DOMAIN}",
+                "receivedAt": _iso(_now() - timedelta(hours=2)),
+                "messageId": first["messageId"],
+                "contextId": first["contextId"],
+                "rule": "limits",
+            },
+        )
+    return ids
+
+
+def test_a_scan_reports_the_worst_performed_status(carl_env, capsys, monkeypatch):
+    """Item (a): when a scan performs several retries, the exit code is the worst of
+    them — unreachable (3) beats refused (2)."""
+    ids = _two_due_retries(carl_env, capsys)
+
+    def failing(_client, envelope):
+        if envelope["message"]["messageId"] == ids[0]:
+            return 2, {"refusalStatus": 403}
+        return 3, None
+
+    monkeypatch.setattr(cli_module, "_try_deposit", failing)
+    assert main(["retry"]) == 3
+
+
+def test_a_scan_reports_a_refusal_over_a_delivery(carl_env, capsys, monkeypatch):
+    """Item (a): a refused retry beats a delivered one — the scan exits 2, not 0,
+    when one retry landed and another was refused."""
+    ids = _two_due_retries(carl_env, capsys)
+
+    def mixed(_client, envelope):
+        if envelope["message"]["messageId"] == ids[0]:
+            return 0, {"accepted": True}
+        return 2, {"refusalStatus": 403}
+
+    monkeypatch.setattr(cli_module, "_try_deposit", mixed)
+    assert main(["retry"]) == 2
+
+
+def test_try_deposit_distinguishes_an_exhausted_429_from_a_403(monkeypatch):
+    """Item (b): an exhausted 429 and a 403 must not collapse into one code."""
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    class Refuse:
+        def __init__(self, status):
+            self.status = status
+
+        def deposit(self, envelope):
+            raise HubRefused(self.status, b"refused")
+
+    envelope = {"message": {"messageId": "m-50"}}
+    assert cli_module._try_deposit(Refuse(429), envelope) == (
+        EXIT_RATE_LIMITED,
+        {"refusalStatus": 429},
+    )
+    assert cli_module._try_deposit(Refuse(403), envelope) == (2, {"refusalStatus": 403})
+
+
+def test_a_rate_limited_send_is_retryable_after_the_window(
+    carl_env, capsys, monkeypatch
+):
+    """Item (b): a send the hub rate-limited (exhausted 429) exits 5, not 2 — and
+    ``--send-failed --send-exit 5`` retries it after the window, instead of calling
+    it permanently refused."""
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+
+    real_client = cli_module.HubClient
+    real_datetime = cli_module.datetime
+
+    class _Past(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.now(tz) - timedelta(hours=2)
+
+    class RateLimited:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def deposit(self, envelope):
+            raise HubRefused(429, b"mailbox full")
+
+    monkeypatch.setattr(cli_module, "datetime", _Past)
+    monkeypatch.setattr(cli_module, "HubClient", RateLimited)
+    # The send retries the 429 in-process (3 attempts, ~6s of sleeps); accept it.
+    assert (
+        main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"])
+        == EXIT_RATE_LIMITED
+    )
+    out, _err = capsys.readouterr()
+    sent = json.loads(out.strip())
+    assert sent["delivered"] is False
+    assert sent["status"] == EXIT_RATE_LIMITED
+    assert sent["refusalStatus"] == 429
+    monkeypatch.setattr(cli_module, "datetime", real_datetime)
+    monkeypatch.setattr(cli_module, "HubClient", real_client)
+
+    # The attempt is two hours old, so the limits backoff (1h) is due: the retry lands.
+    assert (
+        main(["retry", "--send-failed", sent["messageId"], "--send-exit", str(EXIT_RATE_LIMITED)])
+        == 0
+    )
+    line = capsys.readouterr().out.strip()
+    assert f"retried {sent['messageId']} (attempt 1): accepted" in line
+    assert muse.poll_once()["queued"] == 1

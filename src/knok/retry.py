@@ -15,8 +15,9 @@ envelope is still valid, the deposit may not have happened, and a replay is idem
 hub dedupes by ``messageId`` and answers "duplicate" when the first copy landed. So the
 adapter retries it, bounded, with a short backoff. A send the hub permanently refused (exit 2:
 unknown sender or recipient, a bad signature, a reused ``messageId``) is not retried: the same
-envelope fails identically. (A 429 over-capacity refusal is already retried in-process by
-``_try_deposit``; exit 2 means it exhausted that, or was never retryable.)
+envelope fails identically. A send the hub rate-limited (exit 5: a 429 the in-process retries
+could not clear) is retried after the window, on the same ladder as a refused/limits notice —
+it is not a permanent refusal, and calling it one would lose a message to a full mailbox.
 
 A message that died *after* the hub accepted it — the kind ``knok notices`` reports — is
 decided by its kind, because a verbatim replay only helps when the failure was transient and
@@ -85,9 +86,12 @@ the exit code says the same thing without --json: 0 delivered, 1 deferred (waiti
 retry that could not be performed — try again later), 2 the retry was performed and the hub
 refused it, 3 the retry was performed and the hub was unreachable, 4 terminal (budget spent,
 a permanent refusal, expired, dead, an unknown id, no stored attempt — no retry was performed
-and none will be). In scan mode the exit code is 0 when the scan completed and 1 when a due
-retry could not be performed; the per-message outcomes in --json carry the detail there. The
-reason text says which terminal bound stopped it; the exit code only says that it stopped.
+and none will be), 5 the retry was performed and the hub rate-limited it (an exhausted 429 —
+retryable after the window, not terminal). In scan mode the exit code is 0 when the scan
+completed and nothing performed failed, 1 when a due retry could not be performed, and the
+worst performed status (unreachable 3 beats refused 2 beats rate-limited 5) when a performed
+retry failed — so ``knok retry && echo delivered`` does not lie. The reason text says which
+terminal bound stopped it; the exit code only says that it stopped.
 
 How attempts are recorded. ``sent.jsonl`` already records every attempt (``messageId``,
 ``contextId``, the signed envelope) before deposit, so a retry is a replay of a record, not a
@@ -134,6 +138,15 @@ SENT_LEDGER = "sent.jsonl"
 #: One fsynced line per retry performed and per terminal decision recorded, in the state
 #: directory next to ``sent.jsonl`` and ``notices.jsonl``.
 RETRY_LEDGER = "retries.jsonl"
+
+#: The exit code a send exits with when the hub kept refusing with 429 after the
+#: in-process retries (``_try_deposit``). It is not a permanent refusal (exit 2): the
+#: rate limit clears, so the adapter retries it after the window — the same ladder
+#: as a refused/limits notice. A distinct code, so the adapter can tell a 429 from
+#: a 403 without guessing: exit 2 is permanent, exit 3 is unreachable, exit 5 is
+#: rate-limited. ``decide_send`` takes it, and ``knok send`` prints it (with the
+#: refusal's HTTP status) so the adapter knows which it was.
+EXIT_RATE_LIMITED = 5
 
 #: Backoff for a ``refused``/``limits`` notice, by retry number (attempt 1, then attempt 2).
 #: The notice carries only the rule, not which window fired, so the ladder covers both: the
@@ -486,7 +499,9 @@ def decide_send(
     """Decide what the adapter does about a ``send`` result, by its exit code.
 
     This is the send-time half of the policy: a deposit that never happened (exit 3) is worth
-    repeating, a deposit the hub permanently refused (exit 2) is not. The adapter calls it
+    repeating, a deposit the hub permanently refused (exit 2) is not, and a deposit the hub
+    rate-limited (exit 5 — an exhausted 429, the window not yet clear) is worth repeating
+    after the window, on the same ladder as a refused/limits notice. The adapter calls it
     after a failed send, with the envelope it tried to deposit (from ``sent.jsonl``) and the
     retry ledger so far. Exit 0 is not a failure and needs no retry.
     """
@@ -497,6 +512,25 @@ def decide_send(
         return _terminal(
             "the hub permanently refused the deposit — an unknown sender or recipient, a bad "
             "signature, a reused messageId — so the same envelope fails identically"
+        )
+    if exit_code == EXIT_RATE_LIMITED:
+        message_id = None
+        if isinstance(envelope, dict):
+            message = envelope.get("message")
+            if isinstance(message, dict):
+                message_id = message.get("messageId")
+        if not isinstance(message_id, str) or not message_id:
+            return _terminal("no messageId to retry; the attempt was never recorded", record=False)
+        base = envelope_sent_at(envelope) or moment
+        return _retryable(
+            message_id,
+            envelope,
+            retries,
+            base,
+            BACKOFF_LIMITS,
+            "the hub rate-limited the deposit (429, mailbox full or window spent) after the "
+            "in-process retries; the window clears, so a replay after it should succeed",
+            moment,
         )
     if exit_code == 3:
         message_id = None
