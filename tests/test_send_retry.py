@@ -107,9 +107,12 @@ def test_a_failed_deposit_is_still_retryable(carl_env, capsys, monkeypatch):
     message_id = recorded[0]["envelope"]["message"]["messageId"]
 
     # The hub is reachable again: the retry lands the same envelope, in the same thread.
+    # The failed send printed its own object first (the messageId the caller needs to retry
+    # it), so the retry's object is the last line.
     monkeypatch.setattr("knok.cli.HubClient", real_client)
     assert main(["send", "--retry-of", message_id]) == 0
-    retried = json.loads(capsys.readouterr().out)
+    lines = capsys.readouterr().out.strip().splitlines()
+    retried = json.loads(lines[-1])
     assert retried["contextId"] == recorded[0]["envelope"]["message"]["contextId"]
 
 
