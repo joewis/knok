@@ -82,7 +82,18 @@ How attempts are recorded. ``sent.jsonl`` already records every attempt (``messa
 rebuild. This module adds ``retries.jsonl``: one fsynced line per retry the adapter *performs*
 and per terminal decision it records, so the budget is enforced and a decided message is not
 re-decided on every scan. A "waiting" decision is not recorded — the next scan re-decides it,
-which is cheap and deterministic.
+which is cheap and deterministic. Three rules keep the ledger honest:
+
+* A decision about a message the adapter never sent is not recorded at all: a missing ledger
+  is an absence, not a decision, so "no stored attempt to replay" stays unrecorded and the
+  next scan re-decides it.
+* A retry is reserved before it is deposited: the reservation is what bounds it, so a retry
+  the adapter cannot count is never deposited. A performed retry leaves two lines — the
+  reservation and the outcome — and the budget counts the attempt once, not the lines.
+* A retry the hub accepted resolves the failure for that notice: the outcome line carries the
+  notice it answered, so a later scan reports the message resolved instead of depositing the
+  same envelope again. A newer notice is a new failure and gets its own retries within the
+  budget.
 """
 
 from __future__ import annotations
@@ -137,13 +148,16 @@ class Decision:
 
     ``action`` is ``"retry"`` or ``"terminal"``. ``reason`` is the one sentence the operator
     (or the adapter's log) gets. ``not_before`` is when a retry is due; ``attempt`` is which
-    retry number this would be (1 or 2). Both are None on a terminal decision.
+    retry number this would be (1 or 2). Both are None on a terminal decision. ``record`` says
+    whether the caller should record the decision: a decision about a message the adapter never
+    sent is an absence, not a decision, so it is never recorded.
     """
 
     action: str
     reason: str
     not_before: datetime | None = None
     attempt: int = 0
+    record: bool = True
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -232,12 +246,26 @@ def read_retries(directory: str | Path) -> list[dict[str, Any]]:
 
 
 def retry_count(retries: list[dict[str, Any]], message_id: str) -> int:
-    """How many retries this adapter already performed for ``message_id``."""
-    return sum(
-        1
+    """How many retries this adapter already performed for ``message_id``.
+
+    Counted by attempt number, not by record: a retry leaves a reservation and an outcome
+    record for the same attempt, and the two together are one retry, not two. A record with no
+    attempt number counts once, so a hand-edited ledger still bounds.
+    """
+    attempts = {
+        record.get("attempt")
         for record in retries
-        if record.get("messageId") == message_id and record.get("decision") == "retry"
+        if record.get("messageId") == message_id
+        and record.get("decision") in ("retry", "reserved")
+        and record.get("attempt") is not None
+    }
+    unnumbered = any(
+        record.get("messageId") == message_id
+        and record.get("decision") in ("retry", "reserved")
+        and record.get("attempt") is None
+        for record in retries
     )
+    return len(attempts) + (1 if unnumbered else 0)
 
 
 def terminal_decided(retries: list[dict[str, Any]], message_id: str) -> bool:
@@ -254,6 +282,30 @@ def terminal_record(
         if record.get("messageId") == message_id and record.get("decision") == "terminal":
             found = record
     return found
+
+
+def resolved_record(
+    retries: list[dict[str, Any]], message_id: str, notice_at: datetime | None
+) -> dict[str, Any] | None:
+    """The retry outcome that already delivered for this notice, or None.
+
+    Resolution is per notice, not per message: the same message can fail again (a newer
+    notice), and that failure gets its own retries within the budget. ``notice_at`` is the
+    notice's own time, as ``notice_time`` reads it; a notice with no time cannot be matched,
+    so it is never reported resolved.
+    """
+    if notice_at is None:
+        return None
+    stamp = _iso(notice_at)
+    for record in reversed(retries):
+        if (
+            record.get("messageId") == message_id
+            and record.get("decision") == "retry"
+            and record.get("status") == 0
+            and record.get("noticeAt") == stamp
+        ):
+            return record
+    return None
 
 
 def record_retry(directory: str | Path, record: dict[str, Any]) -> bool:
@@ -274,8 +326,8 @@ def record_retry(directory: str | Path, record: dict[str, Any]) -> bool:
         return False
 
 
-def _terminal(reason: str) -> Decision:
-    return Decision(action="terminal", reason=reason)
+def _terminal(reason: str, record: bool = True) -> Decision:
+    return Decision(action="terminal", reason=reason, record=record)
 
 
 def _retryable(
@@ -295,7 +347,12 @@ def _retryable(
     bound stopped it.
     """
     if envelope is None:
-        return _terminal("no stored attempt to replay; nothing in sent.jsonl carries this id")
+        # Not a decision about this message — the ledger holds no attempt to replay — so it
+        # is never recorded: a missing ledger is an absence, and recording it would claim a
+        # decision the adapter never made.
+        return _terminal(
+            "no stored attempt to replay; nothing in sent.jsonl carries this id", record=False
+        )
     done = retry_count(retries, message_id)
     if done >= MAX_RETRIES:
         return _terminal(
@@ -420,7 +477,7 @@ def decide_send(
             if isinstance(message, dict):
                 message_id = message.get("messageId")
         if not isinstance(message_id, str) or not message_id:
-            return _terminal("no messageId to retry; the attempt was never recorded")
+            return _terminal("no messageId to retry; the attempt was never recorded", record=False)
         base = envelope_sent_at(envelope) or moment
         return _retryable(
             message_id,

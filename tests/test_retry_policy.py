@@ -16,7 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from knok.bridge import NOTICES
+from knok import cli as cli_module
+from knok.bridge import NOTICES, BridgeState
 from knok.cli import SENT_LEDGER, main
 from knok.retry import (
     BACKOFF_LIMITS,
@@ -27,9 +28,12 @@ from knok.retry import (
     decide_notice,
     decide_send,
     due,
+    notice_time,
+    read_attempts,
     read_notices,
     read_retries,
     record_retry,
+    resolved_record,
     retry_count,
     terminal_decided,
 )
@@ -222,6 +226,14 @@ def test_decide_send(status, action, attempt, backoff):
         assert decision.not_before == NOW + backoff
 
 
+def test_decide_send_with_no_stored_attempt_is_terminal_and_unrecorded():
+    # The send-time half of the missing-ledger rule: a send whose attempt was never recorded
+    # is terminal, and the decision is not a decision — it must not be recorded.
+    decision = decide_send(3, None, [], NOW)
+    assert decision.action == "terminal"
+    assert decision.record is False
+
+
 def test_an_unreachable_send_backs_off_like_the_poison_ladder():
     record = envelope("m-50")
     record["envelope"]["sentAt"] = _iso(NOW)
@@ -316,7 +328,7 @@ def test_a_scan_that_cannot_retry_still_records_its_terminal_decisions(state, ca
     assert main(["retry"]) == 1
     out, err = capsys.readouterr()
     assert "terminal m-50" in out
-    assert "would retry m-51 (attempt 1)" in out
+    assert "could not retry m-51 (attempt 1): cannot retry:" in out
     assert "cannot retry" in err
     records = read_retries(state)
     assert len(records) == 1, "only the terminal decision is recorded; the retry never ran"
@@ -427,10 +439,17 @@ def test_a_rate_limit_refusal_is_retried_when_the_window_clears(carl_env, capsys
     assert f"retried {first['messageId']} (attempt 1): accepted" in line
 
     records = read_retries(state)
-    assert len(records) == 1
-    assert records[0]["decision"] == "retry"
+    assert len(records) == 2, "a performed retry leaves a reservation and its outcome"
+    assert records[0]["decision"] == "reserved"
     assert records[0]["attempt"] == 1
-    assert records[0]["rule"] == "limits"
+    assert records[1]["decision"] == "retry"
+    assert records[1]["attempt"] == 1
+    assert records[1]["status"] == 0
+    assert records[1]["delivered"] is True
+    assert records[1]["rule"] == "limits"
+    assert retry_count(read_retries(state), first["messageId"]) == 1, (
+        "the reservation and the outcome are one retry, not two"
+    )
 
     assert muse.poll_once()["queued"] == 1
     delivered = muse.queue.get()
@@ -439,3 +458,238 @@ def test_a_rate_limit_refusal_is_retried_when_the_window_clears(carl_env, capsys
 
     attempts = [json.loads(line) for line in (state / SENT_LEDGER).read_text().splitlines()]
     assert len(attempts) == 1, "a retry is not a new attempt; it must not grow the ledger"
+
+
+#: The five HOLD defects (#68): one family — a bookkeeping failure becomes a message failure.
+#: Each test below fails on the branch as pushed and passes with the fix.
+
+
+def test_a_newer_notice_gets_its_own_retries_after_a_resolution():
+    """Resolution is per notice, not per message: a failure after a successful retry is new.
+
+    The first notice was retried and accepted; a second, later notice for the same message is
+    a second failure, and the policy gives it the second retry in the budget — not a
+    re-deposit of the first, and not a refusal.
+    """
+    first = notice("m-50")
+    second = notice("m-50", receivedAt=_iso(NOW))
+    retries = [
+        {
+            "messageId": "m-50",
+            "decision": "retry",
+            "attempt": 1,
+            "status": 0,
+            "delivered": True,
+            "noticeAt": _iso(NOW - timedelta(hours=2)),
+        }
+    ]
+    assert resolved_record(retries, "m-50", notice_time(first)) is not None
+    assert resolved_record(retries, "m-50", notice_time(second)) is None
+    decision = decide_notice(second, envelope("m-50")["envelope"], retries, NOW)
+    assert decision.action == "retry"
+    assert decision.attempt == 2
+
+
+def test_a_missing_ledger_is_not_recorded_as_terminal(state, capsys):
+    """A notice for a message this agent never sent must not leave a terminal record.
+
+    The decision is terminal (there is nothing to replay) but the ledger holds no attempt, so
+    recording it would claim a decision about a message the adapter never sent — and the next
+    scan would replay the stored terminal instead of re-deciding. A missing ledger is not a
+    decision; it is an absence.
+    """
+    record_notice(state, live_notice("m-50"))
+    assert main(["retry"]) == 0
+    assert "terminal m-50" in capsys.readouterr().out
+    assert not (state / RETRY_LEDGER).exists(), "a missing ledger must not record a decision"
+
+    # The next scan re-decides it instead of replaying a stored terminal.
+    assert main(["retry"]) == 0
+    assert "terminal m-50" in capsys.readouterr().out
+    assert not (state / RETRY_LEDGER).exists()
+
+
+def _count_deposits(monkeypatch):
+    """Count every deposit the CLI attempts, and let it through. Returns the list."""
+    deposits: list[str] = []
+    original = cli_module._try_deposit
+
+    def counting(client, envelope):
+        deposits.append(envelope["message"]["messageId"])
+        return original(client, envelope)
+
+    monkeypatch.setattr(cli_module, "_try_deposit", counting)
+    return deposits
+
+
+def test_a_successful_retry_is_resolved_not_repeated(carl_env, capsys, monkeypatch):
+    """A retry the hub accepted resolves the failure; the next scan must not deposit again.
+
+    The notice is two days old, so the second retry would be due a day after it — without a
+    resolution the adapter would deposit the same envelope again, a day later, for a failure
+    that is already fixed.
+    """
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    muse.client.ack([first["messageId"]])
+
+    state = root / "agents" / "carl"
+    record_notice(
+        state,
+        {
+            "kind": "refused",
+            "from": f"muse@{DOMAIN}",
+            "receivedAt": _iso(_now() - timedelta(days=2)),
+            "messageId": first["messageId"],
+            "contextId": first["contextId"],
+            "rule": "limits",
+        },
+    )
+    deposits = _count_deposits(monkeypatch)
+
+    assert main(["retry", "--json"]) == 0
+    out, _err = capsys.readouterr()
+    outcome = json.loads(out.strip())
+    assert outcome["decision"] == "retry"
+    assert outcome["delivered"] is True
+    assert deposits == [first["messageId"]]
+    assert muse.poll_once()["queued"] == 1
+
+    # The next scan finds the same notice, but the retry already succeeded: resolved, not a
+    # second deposit a day later.
+    assert main(["retry", "--json"]) == 0
+    out, _err = capsys.readouterr()
+    outcome = json.loads(out.strip())
+    assert outcome["decision"] == "resolved"
+    assert outcome["delivered"] is True
+    assert deposits == [first["messageId"]], "a resolved retry is never deposited again"
+    assert muse.poll_once()["queued"] == 0
+
+
+def test_a_retry_that_cannot_be_counted_is_not_deposited(carl_env, capsys, monkeypatch):
+    """The bound is enforced by the ledger write: when it cannot be written, do not deposit.
+
+    With the ledger unwritable, three scans must produce no deposit at all — not three. A
+    retry the adapter cannot count is a retry it cannot bound, so it fails closed.
+    """
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    muse.client.ack([first["messageId"]])
+
+    state = root / "agents" / "carl"
+    record_notice(
+        state,
+        {
+            "kind": "refused",
+            "from": f"muse@{DOMAIN}",
+            "receivedAt": _iso(_now() - timedelta(hours=2)),
+            "messageId": first["messageId"],
+            "contextId": first["contextId"],
+            "rule": "limits",
+        },
+    )
+    deposits = _count_deposits(monkeypatch)
+    monkeypatch.setattr(cli_module, "record_retry", lambda directory, record: False)
+
+    for _ in range(3):
+        assert main(["retry"]) == 1, "a due retry that cannot be counted is not performed"
+    assert deposits == [], "three scans, no deposit: the bound holds when the ledger fails"
+    assert muse.poll_once()["queued"] == 0
+
+
+def test_json_outcomes_carry_a_delivered_field(state, capsys):
+    """Every outcome says whether the message was delivered, so a caller can tell a retry
+    that landed from a message that is terminally dead — both exit 0 in scan mode."""
+    record_notice(state, live_notice("m-50", rule="policy"))
+    record_notice(state, live_notice("m-51", kind="expired", rule=None))
+    write_attempt(state, live_envelope("m-50"))
+    write_attempt(state, live_envelope("m-51"))
+    assert main(["retry", "--json"]) == 0
+    out, _err = capsys.readouterr()
+    outcomes = [json.loads(line) for line in out.splitlines()]
+    assert len(outcomes) == 2
+    assert all("delivered" in outcome for outcome in outcomes)
+    assert all(outcome["delivered"] is False for outcome in outcomes)
+
+
+def test_a_budget_spent_retry_reports_not_delivered(state, capsys):
+    record_notice(state, live_notice("m-50"))
+    write_attempt(state, live_envelope("m-50"))
+    for attempt in (1, 2):
+        assert record_retry(state, {"messageId": "m-50", "decision": "retry", "attempt": attempt})
+    assert main(["retry", "--json"]) == 0
+    out, _err = capsys.readouterr()
+    outcome = json.loads(out.strip())
+    assert outcome["decision"] == "terminal"
+    assert "budget" in outcome["reason"]
+    assert outcome["delivered"] is False
+
+
+def test_json_reports_an_unknown_message_id_as_not_delivered(state, capsys):
+    assert main(["retry", "--json", "--message-id", "m-never-sent"]) == 0
+    out, err = capsys.readouterr()
+    outcome = json.loads(out.strip())
+    assert outcome["messageId"] == "m-never-sent"
+    assert outcome["decision"] == "unknown"
+    assert outcome["delivered"] is False
+    assert "no delivery notice for m-never-sent" in err
+
+
+def test_a_failed_send_prints_its_message_id(monkeypatch, tmp_path, identity, capsys):
+    """A send that never reached the hub still names the message: the adapter needs the id
+    to retry it, and the attempt is already recorded in sent.jsonl for exactly that."""
+    state = BridgeState(
+        agent_id=identity.agent_id,
+        directory=tmp_path,
+        hub_url="http://127.0.0.1:1",
+        registry={"muse@bridge.example": {}},
+    )
+    monkeypatch.setattr("knok.cli._state_from_env", lambda: (state, identity))
+    assert main(["send", "--to", "muse@bridge.example", "--text", "hello"]) == 3
+    out, _err = capsys.readouterr()
+    printed = json.loads(out.strip())
+    assert printed["messageId"].startswith("m-")
+    assert printed["delivered"] is False
+    assert printed["status"] == 3
+    assert printed["messageId"] in read_attempts(tmp_path)
+
+
+def test_retry_send_failed_replays_a_failed_send(carl_env, capsys, monkeypatch):
+    """The send-time half has a CLI path: a send that exited 3 is retryable by messageId.
+
+    The send ran against a dead hub (exit 3) two minutes ago, so the poison-ladder backoff is
+    already due; the retry replays the stored envelope verbatim against the live hub.
+    """
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+
+    # Date the failed send two minutes back, by holding the clock the CLI reads for sentAt.
+    real_datetime = cli_module.datetime
+
+    class _Past(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.now(tz) - timedelta(minutes=2)
+
+    monkeypatch.setattr(cli_module, "datetime", _Past)
+    monkeypatch.setenv("KNOK_HUB_URL", "http://127.0.0.1:1")
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 3
+    out, _err = capsys.readouterr()
+    sent = json.loads(out.strip())
+    assert sent["delivered"] is False
+    # Restore the clock and the hub by hand: monkeypatch.undo() would also undo the
+    # fixture's own env vars (one shared monkeypatch per test), leaving KNOK_STATE unset.
+    monkeypatch.setattr(cli_module, "datetime", real_datetime)
+    monkeypatch.setenv("KNOK_HUB_URL", hub.url)
+
+    assert main(["retry", "--send-failed", sent["messageId"]]) == 0
+    line = capsys.readouterr().out.strip()
+    assert f"retried {sent['messageId']} (attempt 1): accepted" in line
+    assert muse.poll_once()["queued"] == 1
