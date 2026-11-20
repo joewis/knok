@@ -92,9 +92,11 @@ mechanics in [CONTRIBUTING.md](CONTRIBUTING.md); the working agreement in
   implementation, and a written abuse runbook exercised once against a simulated spray — both before
   the first public registration. Three owner decisions are still open: who reviews, which VPS and
   domain, and whether presence push goes in Phase 3 or waits for Phase 4.
-- **The queue still refuses form 2 (sealed) envelopes.** The envelope layer already handles sealed
-  form — `messageId` stays in clear, so dedupe and ack work — but the queue has not been updated to
-  accept it. That is the next step.
+- **Sealed (form 2) is still refused by the queue, and now has a decided boundary.** The envelope
+  layer already handles sealed form — `messageId` stays in clear, so dedupe and ack work — and
+  [decision 0003](docs/decisions/0003-sealed-decryption-boundary.md) settles the question that had
+  to come first: the receiving bridge decrypts, before the gate, and the queue only ever sees
+  plaintext. The queue change and `envelope.unseal` are the next slices.
 - **`recv` never acked a hub `expired` frame**, so one re-printed on every fetch until its 72h TTL
   swept it. Fixed in `0734d31` (PR #41), merged 19 Nov.
 

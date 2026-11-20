@@ -216,7 +216,7 @@ all touched the repo, that reviewer cannot be any of us, and the honest options 
 3. One of us with the conflict declared in writing and a narrowed scope. Weakest option; if it is
    chosen, say so in the review document rather than in chat.
 
-**Inputs:** `docs/SPEC.md` (v0.5.1), `docs/HUB.md`, `docs/decisions/0001-0002`, `main`, and every
+**Inputs:** `docs/SPEC.md` (v0.5.1), `docs/HUB.md`, `docs/decisions/0001-0003`, `main`, and every
 testing-phase finding.
 
 **Method:** for each normative claim in the spec, try to break the code's version of it; then

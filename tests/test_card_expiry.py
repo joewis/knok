@@ -70,7 +70,14 @@ def test_without_an_instant_the_question_is_asked_about_now(peer):
     assert live.public_key_of(peer.agent_id) is not None
 
 
-def test_an_unreadable_valid_until_means_no_stated_limit(peer):
-    """``verify_card`` already answers this way: a field it cannot read is no field."""
+def test_an_unreadable_valid_until_refuses_the_card(peer):
+    """A stated deadline that cannot be read is a refusal, not an absent deadline (#62).
+
+    ``None`` from ``card_valid_until`` means "the card states no limit". A card that says
+    ``validUntil: "the end of days"`` states a limit this code cannot honour, so the only safe
+    reading is that the card does not account for any instant — trusting it would make the field
+    decoration precisely where it was meant to bind.
+    """
     bridge = bridge_with({peer.agent_id: pinned(peer, validUntil="the end of days")})
-    assert bridge.public_key_of(peer.agent_id) is not None
+    assert bridge.public_key_of(peer.agent_id) is None
+    assert bridge.public_key_of(peer.agent_id, at=datetime.now(timezone.utc)) is None
