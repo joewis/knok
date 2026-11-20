@@ -511,8 +511,23 @@ human is watching, and would break every client that already reads the four-stat
 
 **Fail closed.** Expiry while held is `expired`, never `accepted`. A denial is terminal and is
 delivered as silence, which is indistinguishable from refusal by construction (§9). An approval
-records who decided, when, and the fingerprint that was shown — "the owner approved this key" must be
-distinguishable from "approved this name, keys rotated since".
+records who decided, when, the fingerprint the request presented, and the fingerprint that was on
+screen when the decision was made. The last two are separate fields because they can differ: a peer
+may rotate its key while a request sits held, and an audit that recorded only the presented key would
+attribute a refusal to a key that no longer belongs to anyone. When they differ, the row says so —
+the request presented one key, the owner refused another — and it does not claim the owner saw a key
+they never saw.
+
+**Approval timing is not uniform, and this document does not pretend it is.** The held state is
+invisible as a *state*; it is not hidden as a *delay*. Acceptance is a reply message sent when the
+owner approves, so the interval a peer observes is the owner's decision latency plus the bridge's
+poll interval — a prompt answered in two minutes reads, correctly, as someone having been at the
+screen. The converse stays unreadable: silence looks the same whether the owner refused at once or
+never saw the request, because both reach the peer as `expired` on the seventh day. Uniformity would
+require holding every acceptance to a fixed cadence, delaying legitimate contacts to conceal a fact
+the state transition already reveals; this protocol chooses the honest sentence over the illusion.
+What the wire must keep hidden — that a request is being *held*, i.e. that a prompt is on someone's
+screen — it still hides; what it can reveal is only that a decision happened, and roughly when.
 
 **The approval queue is an attack surface and is capped.** At most five presentations per owner in any
 rolling 24 hours, and a peer that asks again inside the cooldown is deduped rather than presented

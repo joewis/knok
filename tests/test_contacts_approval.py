@@ -93,3 +93,74 @@ def test_approve_twice_is_refused(tmp_path):
         store.approve("muse@hub", decided_by="joerg", now=T0)
         with pytest.raises(ContactError, match="already been approved"):
             store.approve("muse@hub", decided_by="joerg", now=T0)
+
+
+def test_an_approval_names_the_key_the_owner_saw(tmp_path):
+    """#65: the audit answers "which key did the owner approve", not just "a request was held"."""
+    with Contacts(tmp_path / "c.db") as store:
+        store.request("muse@hub", now=T0, fingerprint="SHA256:abc")
+        store.approve("muse@hub", decided_by="joerg", fingerprint="SHA256:abc", now=T0)
+        row = store.decision("muse@hub")
+        assert row is not None
+        assert row["fingerprint"] == "SHA256:abc"
+        assert row["decided_fingerprint"] == "SHA256:abc"
+        assert row["decision"] == "approved"
+        assert row["decided_by"] == "joerg"
+
+
+def test_a_refusal_names_the_key_on_screen_not_the_one_that_rotated_away(tmp_path):
+    """#65: a rotation while the request is held must not make two different facts one row.
+
+    The request carried A. By the time the owner decides, the peer's key is B. Both are recorded:
+    the presented fingerprint says what asked, the decided fingerprint says what was refused. The
+    refusal is still terminal for the peer — the audit changes, not the wire.
+    """
+    with Contacts(tmp_path / "c.db") as store:
+        store.request("rotator@hub", now=T0, fingerprint="SHA256:old")
+        store.deny("rotator@hub", decided_by="joerg", fingerprint="SHA256:new", now=T0)
+        row = store.decision("rotator@hub")
+        assert row is not None
+        assert row["fingerprint"] == "SHA256:old"
+        assert row["decided_fingerprint"] == "SHA256:new"
+        assert row["fingerprint"] != row["decided_fingerprint"]
+        assert row["decision"] == "denied"
+        assert store.state("rotator@hub", T0) == "refused"
+
+
+def test_a_denial_without_a_named_key_records_the_presented_one(tmp_path):
+    with Contacts(tmp_path / "c.db") as store:
+        store.request("spammer@hub", now=T0, fingerprint="SHA256:abc")
+        store.deny("spammer@hub", decided_by="joerg", now=T0)
+        row = store.decision("spammer@hub")
+        assert row is not None
+        assert row["decided_fingerprint"] == row["fingerprint"] == "SHA256:abc"
+
+
+def test_a_store_from_before_the_decision_fingerprint_still_decides(tmp_path):
+    """The migration, not the fresh schema: an approvals table without the column is upgraded.
+
+    A live bridge keeps its contacts.db across upgrades, so ``CREATE TABLE IF NOT EXISTS`` alone
+    would leave every existing store unable to record a decision fingerprint.
+    """
+    import sqlite3
+
+    path = tmp_path / "c.db"
+    legacy = sqlite3.connect(str(path))
+    legacy.execute(
+        "CREATE TABLE contacts (peer TEXT PRIMARY KEY, state TEXT NOT NULL, updated TEXT NOT NULL,"
+        " requests INTEGER NOT NULL DEFAULT 0, last_request TEXT)"
+    )
+    legacy.execute(
+        "CREATE TABLE approvals (peer TEXT PRIMARY KEY, text TEXT NOT NULL,"
+        " fingerprint TEXT NOT NULL, presented TEXT NOT NULL, decision TEXT,"
+        " decided_by TEXT, decided_at TEXT)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    with Contacts(path) as store:
+        store.request("muse@hub", now=T0, fingerprint="SHA256:abc")
+        store.deny("muse@hub", decided_by="joerg", fingerprint="SHA256:def", now=T0)
+        row = store.decision("muse@hub")
+        assert row is not None
+        assert row["decided_fingerprint"] == "SHA256:def"
