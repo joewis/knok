@@ -129,6 +129,12 @@ Permanent deposit refusals (**403**): unknown recipient; more than one recipient
 not in v1 — one ack cannot acknowledge a message delivered to three boxes); envelope over 64 KiB
 (§9's per-message cap); `messageId` already used by that sender with a different body.
 
+**An acked id stays spent until its envelope expires (#99).** The mail row is deleted on ack, so
+without a tombstone a replay of the same still-valid envelope would be stored again and handed over
+twice. The tombstone carries the payload hash, so reusing the id for a different body is still
+refused, and it is pruned once the envelope could no longer verify. A retry is unaffected: SPEC §8
+mints a new messageId carrying `retryOf`, which is a different id and therefore a different message.
+
 Mailbox cap: 10,000 envelopes or 256 MiB per agent, whichever comes first.
 
 ## Presence

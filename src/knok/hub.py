@@ -122,6 +122,19 @@ CREATE TABLE IF NOT EXISTS mail (
     UNIQUE (recipient, sender, message_id, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_mail_recipient ON mail (recipient, id);
+-- The tombstone an ack leaves behind (#99). The mail row is gone, but the id it
+-- carried must stay spent: without this, replaying a still-valid envelope after
+-- its ack re-stores it and the recipient is handed the same message twice.
+CREATE TABLE IF NOT EXISTS mail_seen (
+    recipient      TEXT NOT NULL,
+    sender         TEXT NOT NULL,
+    message_id     TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    expires_at     REAL NOT NULL,
+    acked_at       REAL NOT NULL,
+    PRIMARY KEY (recipient, sender, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_seen_expiry ON mail_seen (expires_at);
 CREATE INDEX IF NOT EXISTS idx_mail_lookup ON mail (recipient, message_id);
 CREATE TABLE IF NOT EXISTS nonces (
     agent    TEXT NOT NULL,
@@ -154,6 +167,11 @@ def _parse_iso(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _sha256_text(text: str) -> str:
+    """Hex digest used to tell a replayed payload from a different body (#99)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _iso(moment: datetime) -> str:
@@ -809,6 +827,19 @@ class Hub:
                 if stored == envelope:
                     return "duplicate", message_id
                 raise _Refused("messageId already used by that sender with a different body")
+            # An acked id stays spent (#99): the mail row is deleted on ack, so
+            # without the tombstone a replay of the same still-valid envelope is
+            # stored again and handed over a second time. A retry is unaffected
+            # because it mints a new messageId (SPEC §8).
+            tombstone = self._conn.execute(
+                "SELECT payload_sha256 FROM mail_seen WHERE recipient = ?"
+                " AND sender = ? AND message_id = ?",
+                (recipient, sender, message_id),
+            ).fetchone()
+            if tombstone is not None:
+                if tombstone[0] == _sha256_text(json.dumps(envelope, sort_keys=True)):
+                    return "duplicate", message_id
+                raise _Refused("messageId already used by that sender with a different body")
             if self._at_cap(recipient, size):
                 raise _OverCapacity()
             expires = _parse_iso(envelope["expiresAt"])
@@ -867,16 +898,38 @@ class Hub:
         Scoped to the caller's own box: foreign ids are ignored rather than
         refused, and a duplicate ack is idempotent (second call returns 0).
         """
+        moment = datetime.now(timezone.utc)
         with self._lock:
             deleted = 0
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 for message_id in message_ids:
+                    # Read the rows before deleting them: the tombstone has to
+                    # carry each sender and the hash of the payload the recipient
+                    # actually acknowledged, or a later replay cannot be told
+                    # apart from a different body reusing the id (#99).
+                    rows = self._conn.execute(
+                        "SELECT sender, payload_json, expires_at FROM mail"
+                        " WHERE recipient = ? AND message_id = ?",
+                        (agent, message_id),
+                    ).fetchall()
                     cursor = self._conn.execute(
                         "DELETE FROM mail WHERE recipient = ? AND message_id = ?",
                         (agent, message_id),
                     )
                     deleted += cursor.rowcount
+                    for sender, payload, expires in rows:
+                        self._conn.execute(
+                            "INSERT INTO mail_seen (recipient, sender, message_id,"
+                            " payload_sha256, expires_at, acked_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)"
+                            " ON CONFLICT(recipient, sender, message_id) DO UPDATE SET"
+                            " payload_sha256 = excluded.payload_sha256,"
+                            " expires_at = excluded.expires_at,"
+                            " acked_at = excluded.acked_at",
+                            (agent, sender, message_id, _sha256_text(payload),
+                             expires, _ts(moment)),
+                        )
                 self._conn.execute("COMMIT")
             except BaseException:
                 self._conn.execute("ROLLBACK")
@@ -943,6 +996,11 @@ class Hub:
                     )
                 cutoff = _ts(moment) - NONCE_WINDOW_SECONDS
                 self._conn.execute("DELETE FROM nonces WHERE seen_at <= ?", (cutoff,))
+                # A tombstone only matters while its envelope could still verify;
+                # past that the signature check refuses a replay on its own.
+                self._conn.execute(
+                    "DELETE FROM mail_seen WHERE expires_at <= ?", (_ts(moment),)
+                )
                 self._conn.execute("COMMIT")
             except BaseException:
                 self._conn.execute("ROLLBACK")
