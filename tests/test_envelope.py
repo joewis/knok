@@ -1,4 +1,5 @@
 import copy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -18,6 +19,37 @@ def sealed_factory(envelope_factory, **overrides):
     }
     envelope.update(overrides)
     return envelope
+
+
+def test_expires_at_is_capped_at_thirty_days(envelope_factory):
+    """#107: SPEC §6 allows up to 30 days, and the queue's retention is sized
+    around that bound; a longer lifetime is a different contract."""
+    envelope = envelope_factory()
+    sent = datetime.strptime(envelope["sentAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+    envelope["expiresAt"] = (sent + timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reason = validate(envelope, now=sent)
+    assert reason is not None and "30 days" in reason
+
+    envelope["expiresAt"] = (sent + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert validate(envelope, now=sent) is None
+
+
+def test_turn_rejects_an_unknown_field(envelope_factory):
+    """#108: an unknown turn field is a sender expecting behaviour that does
+    not exist, and nothing downstream would notice."""
+    envelope = envelope_factory()
+    envelope["turn"]["forceClose"] = True
+    assert validate(envelope) == "turn carries an unknown field: forceClose"
+
+
+def test_turn_cannot_expect_a_reply_and_close_the_thread(envelope_factory):
+    """#108: the gate refuses a reply to a closed thread, so the two flags
+    together ask for a reply the message has already forbidden."""
+    envelope = envelope_factory()
+    envelope["turn"] = {"expectsReply": True, "closesThread": True}
+    reason = validate(envelope)
+    assert reason is not None and "close the thread" in reason
 
 
 def test_valid_form_2_validates(identity, envelope_factory):

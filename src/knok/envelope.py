@@ -28,7 +28,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import hpke
@@ -50,6 +50,12 @@ REQUIRED = {
 FORM_FIELDS = {"message", "sealed", "messageId"}
 OPTIONAL = {"signature"}
 MAX_RECIPIENTS = 32
+#: A message may set expiresAt up to 30 days out (SPEC §6) — the bound the queue's
+#: retention and the dead-letter window are both sized around.
+MAX_LIFETIME = timedelta(days=30)
+#: The only fields ``turn`` carries. An unknown one is a sender expecting a
+#: behaviour this implementation does not have.
+TURN_FIELDS = frozenset({"expectsReply", "closesThread"})
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -195,14 +201,28 @@ def validate(envelope: Any, now: datetime | None = None) -> str | None:
         return "expiresAt must be an ISO-8601 timestamp"
     if expires <= sent:
         return "expiresAt must be after sentAt"
+    if expires - sent > MAX_LIFETIME:
+        # SPEC §6 allows up to 30 days. Beyond that the hub stores a row for the
+        # lifetime of the process, and the queue's 30-day retention no longer
+        # describes the mail it is holding.
+        return "expiresAt must be no more than 30 days after sentAt"
     moment = now or datetime.now(timezone.utc)
     if moment >= expires:
         return "envelope has expired"
 
     turn = envelope["turn"]
-    if not isinstance(turn, dict) or not isinstance(turn.get("expectsReply"), bool) \
+    if not isinstance(turn, dict):
+        return "turn must be an object"
+    unknown = set(turn) - TURN_FIELDS
+    if unknown:
+        return f"turn carries an unknown field: {sorted(unknown)[0]}"
+    if not isinstance(turn.get("expectsReply"), bool) \
             or not isinstance(turn.get("closesThread"), bool):
         return "turn must carry boolean expectsReply and closesThread"
+    if turn["expectsReply"] and turn["closesThread"]:
+        # The gate refuses a reply to a closed thread, so a message that asks for
+        # one and closes it in the same breath asks for something it has forbidden.
+        return "turn cannot both expect a reply and close the thread"
     return None
 
 

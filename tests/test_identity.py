@@ -43,6 +43,25 @@ def test_load_refuses_a_key_that_is_not_the_registered_one(tmp_path, identity, p
         load(identity.agent_id, path, peer.fingerprint)
 
 
+def test_save_leaves_no_temporary_file_behind(tmp_path, identity):
+    """#110: the key is written beside the target and linked into place, so the
+    staging file must not survive a successful save."""
+    path = identity.save(tmp_path / "carl.key")
+    assert sorted(p.name for p in tmp_path.iterdir()) == [path.name]
+
+
+def test_load_refuses_a_group_readable_key(tmp_path, identity):
+    """#109: the mode is checked at load, not only at creation — a key copied or
+    restored from a backup is compromised whoever wrote it."""
+    path = identity.save(tmp_path / "carl.key")
+    os.chmod(path, 0o644)
+    with pytest.raises(IdentityError, match="0600"):
+        load(identity.agent_id, path, identity.fingerprint)
+
+    os.chmod(path, 0o600)
+    assert load(identity.agent_id, path, identity.fingerprint).fingerprint == identity.fingerprint
+
+
 def test_fingerprint_is_stable(identity):
     assert identity.fingerprint.startswith("SHA256:")
     assert identity.fingerprint == fingerprint(identity.public_key)
