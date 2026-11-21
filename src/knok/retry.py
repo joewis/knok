@@ -1,7 +1,7 @@
 """The adapter's retry policy: when a failed message is worth repeating (#48).
 
 The wire half (#56) gives the adapter a way to repeat an attempt — ``send --retry-of``
-re-deposits the stored envelope verbatim, so the thread survives — and the read half (#64)
+mints a new envelope for the stored attempt, so the thread survives — and the read half (#64)
 gives it the fact it needs to decide — ``knok notices`` reports which ``messageId`` died, and
 under which rule. What neither gives it is the decision: *when* is a repeat worth it, and how
 often? That is the adapter's policy, and it lives here, not in the CLI's send path and not in
@@ -11,16 +11,16 @@ whether the message is still worth sending.
 Two failure domains, two answers.
 
 A send that never reached the hub (``send`` exits 3, unreachable) is a transport failure: the
-envelope is still valid, the deposit may not have happened, and a replay is idempotent — the
-hub dedupes by ``messageId`` and answers "duplicate" when the first copy landed. So the
-adapter retries it, bounded, with a short backoff. A send the hub permanently refused (exit 2:
+envelope is still valid, the deposit may not have happened, and the retry mints a new envelope
+for the same thread and seq — the original seq was never consumed, so the peer sees the one
+message the first attempt meant to send. A send the hub permanently refused (exit 2:
 unknown sender or recipient, a bad signature, a reused ``messageId``) is not retried: the same
-envelope fails identically. A send the hub rate-limited (exit 5: a 429 the in-process retries
+message fails identically. A send the hub rate-limited (exit 5: a 429 the in-process retries
 could not clear) is retried after the window, on the same ladder as a refused/limits notice —
 it is not a permanent refusal, and calling it one would lose a message to a full mailbox.
 
 A message that died *after* the hub accepted it — the kind ``knok notices`` reports — is
-decided by its kind, because a verbatim replay only helps when the failure was transient and
+decided by its kind, because a retry only helps when the failure was transient and
 the envelope is still valid:
 
 ===========  ========  ========  ==============================================
@@ -28,7 +28,7 @@ kind         rule      decision  why
 ===========  ========  ========  ==============================================
 refused      limits    RETRY     A rate limit is transient: the hourly window
                                  clears at the next hour, the daily window at
-                                 midnight. A replay after the window passes
+                                 midnight. A retry after the window passes
                                  should succeed.
 refused      policy    TERMINAL  A gate policy decision. The adapter cannot
                                  know whether the policy changed, so it must
@@ -36,24 +36,20 @@ refused      policy    TERMINAL  A gate policy decision. The adapter cannot
                                  re-send explicitly.
 refused      thread    TERMINAL  A thread rule (a closed thread, or no reply
                                  owed). The thread state does not change by
-                                 waiting; a replay hits the same rule.
-refused      malformed TERMINAL  The message itself is broken; a verbatim
-                                 replay fails identically.
+                                 waiting; a retry hits the same rule.
+refused      malformed TERMINAL  The message itself is broken; the same parts
+                                 in a new envelope fail identically.
 refused      blocked   TERMINAL  Blocked senders get no notice at all (§9),
                                  so this should never appear; if it does,
                                  never retry.
 refused      (other)   TERMINAL  An unknown refusal rule; do not guess.
-expired      —         TERMINAL  The envelope is past its TTL. A verbatim
-                                 replay is accepted by the hub (202) but
-                                 immediately dropped with another expired
-                                 frame, so it buys nothing. A re-offer — a
-                                 new envelope, a fresh TTL, the same
-                                 context, a ``retryOf`` marker — is a
-                                 separate explicit action, not a replay.
+expired      —         TERMINAL  The envelope is past its TTL, and its TTL was
+                                 the message's lifetime: a retry would
+                                 resurrect a message its own TTL killed. A
+                                 re-offer is a separate explicit action, not
+                                 a retry.
 dead         —         TERMINAL  The spec forbids it: "A dead letter is never
                                  retried automatically, and never silently."
-                                 The ``messageId`` is in ``seen``, so a
-                                 replay would be dropped by dedupe anyway.
                                  An explicit owner re-offer is the remedy.
 gap / late   —         NO        These are about inbound streams — messages
                                  sent *to* us that are missing or late. They
@@ -73,10 +69,13 @@ Three bounds, and they are the whole policy:
   minute, then five minutes, after the attempt — the spec's poison ladder start. A retry that
   is not yet due is "waiting", not "failed": the next scan re-decides it.
 * **TTL.** A retry is only valid while the original envelope has not expired. The policy reads
-  the envelope's ``expiresAt`` from ``sent.jsonl``; if there is no stored attempt to replay,
+  the envelope's ``expiresAt`` from ``sent.jsonl``; if there is no stored attempt to retry,
   or the envelope expires before the retry is due, the decision is terminal. A retry must
-  never mint a fresh ``contextId`` — it replays the stored envelope, so the thread survives —
-  and it must never be attempted on an envelope that cannot arrive.
+  never mint a fresh ``contextId`` — it mints a new envelope in the same thread, with the same
+  ``seq`` (the original seq was never consumed, so ``seq+1`` would open an unfillable gap),
+  the same turn, role and parts, a ``retryOf`` marker naming the original, and a fresh
+  ``sentAt``/``expiresAt`` (now plus the original envelope's TTL duration) — and it must
+  never be attempted on an envelope that cannot arrive.
 
 How a caller tells the outcomes apart (criterion 4). A retry that landed, a message that is
 terminally dead, a message that is still waiting and an unknown id must not all look the same.
@@ -94,29 +93,33 @@ retry failed — so ``knok retry && echo delivered`` does not lie. The reason te
 terminal bound stopped it; the exit code only says that it stopped.
 
 How attempts are recorded. ``sent.jsonl`` already records every attempt (``messageId``,
-``contextId``, the signed envelope) before deposit, so a retry is a replay of a record, not a
-rebuild. This module adds ``retries.jsonl``: one fsynced line per retry the adapter *performs*
+``contextId``, the signed envelope) before deposit, so a retry is minted from a record, not
+rebuilt from scratch. This module adds ``retries.jsonl``: one fsynced line per retry the adapter *performs*
 and per terminal decision it records, so the budget is enforced and a decided message is not
 re-decided on every scan. A "waiting" decision is not recorded — the next scan re-decides it,
 which is cheap and deterministic. Three rules keep the ledger honest:
 
 * A decision about a message the adapter never sent is not recorded at all: a missing ledger
-  is an absence, not a decision, so "no stored attempt to replay" stays unrecorded and the
+  is an absence, not a decision, so "no stored attempt to retry" stays unrecorded and the
   next scan re-decides it.
 * A retry is reserved before it is deposited: the reservation is what bounds it, so a retry
   the adapter cannot count is never deposited. A performed retry leaves two lines — the
   reservation and the outcome — and the budget counts the attempt once, not the lines.
 * A retry the hub accepted resolves the failure for that notice: the outcome line carries the
-  notice it answered, so a later scan reports the message resolved instead of depositing the
-  same envelope again. A newer notice is a new failure and gets its own retries within the
-  budget.
+  notice it answered, so a later scan reports the message resolved instead of depositing
+  again — and it carries ``retriedMessageId``, the new envelope the retry deposited, so the
+  audit trail names both ids. The outcome line keeps ``messageId`` as the original id, so
+  ``resolved_record`` still matches the notice. A newer notice is a new failure and gets its
+  own retries within the budget.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -132,7 +135,7 @@ MAX_RETRIES = 2
 #: Every attempt this agent deposited, with the signed envelope it deposited. ``--retry-of``
 #: reads it: only the sender knows which attempt it is repeating, so the sender has to keep
 #: the record. The CLI writes this file; the policy reads it to find the envelope a retry
-#: would replay, and to check the envelope has not expired.
+#: is minted from, and to check the envelope has not expired.
 SENT_LEDGER = "sent.jsonl"
 
 #: One fsynced line per retry performed and per terminal decision recorded, in the state
@@ -162,7 +165,7 @@ BACKOFF_UNREACHABLE = (timedelta(minutes=1), timedelta(minutes=5))
 #: the backoff from; a notice with no parseable time is dated from now instead.
 NOTICE_TIMES = ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at")
 
-#: The one refusal rule a replay can outlast. Every other rule is a decision about this
+#: The one refusal rule a retry can outlast. Every other rule is a decision about this
 #: message, not about this moment.
 RETRYABLE_RULE = "limits"
 
@@ -265,7 +268,8 @@ def read_attempts(directory: str | Path) -> dict[str, dict[str, Any]]:
     """The last stored envelope per ``messageId`` this agent sent.
 
     ``sent.jsonl`` records every attempt before deposit; a message that was retried is in
-    there once per deposit, and the last record is the one a replay would repeat.
+    there once per deposit — the original under its id, each retry under its own new id —
+    and the last record for an id is the envelope a retry of that id is minted from.
     """
     attempts: dict[str, dict[str, Any]] = {}
     for record in _read_jsonl(Path(directory) / SENT_LEDGER):
@@ -309,18 +313,35 @@ def retry_count(retries: list[dict[str, Any]], message_id: str) -> int:
     return len(attempts) + (1 if unnumbered else 0)
 
 
-def terminal_decided(retries: list[dict[str, Any]], message_id: str) -> bool:
-    """Whether a terminal decision for ``message_id`` is already on record."""
-    return terminal_record(retries, message_id) is not None
+def terminal_decided(
+    retries: list[dict[str, Any]], message_id: str, notice_at: datetime | None = None
+) -> bool:
+    """Whether a terminal decision for this notice is already on record."""
+    return terminal_record(retries, message_id, notice_at) is not None
 
 
 def terminal_record(
-    retries: list[dict[str, Any]], message_id: str
+    retries: list[dict[str, Any]],
+    message_id: str,
+    notice_at: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """The latest terminal decision recorded for ``message_id``, or None."""
+    """The latest terminal decision recorded for this notice, or None.
+
+    Terminal is per notice, not per message, like resolution: a terminal decision for an old
+    notice must not mask a newer notice for the same message. ``notice_at`` is the notice's
+    own time, as ``notice_time`` reads it; a record matches when its ``noticeAt`` is the same
+    stamp. A notice with no time cannot be matched to a record that has one, and a record
+    with no ``noticeAt`` (a hand-written one, or one recorded before the stamp existed)
+    matches only a notice that also has no time — the same rule as ``resolved_record``.
+    """
+    stamp = _iso(notice_at) if notice_at is not None else None
     found: dict[str, Any] | None = None
     for record in retries:
-        if record.get("messageId") == message_id and record.get("decision") == "terminal":
+        if (
+            record.get("messageId") == message_id
+            and record.get("decision") == "terminal"
+            and record.get("noticeAt") == stamp
+        ):
             found = record
     return found
 
@@ -353,7 +374,9 @@ def record_retry(directory: str | Path, record: dict[str, Any]) -> bool:
     """Append one fsynced retry record. False (and loud) when it cannot be written.
 
     A record the adapter cannot write is a retry it cannot count, so the caller is told: the
-    decision stands, but the budget is not enforced for it.
+    decision stands, but the budget is not enforced for it. The append itself takes no lock —
+    the reservation path holds :func:`retry_ledger_lock` around its re-read and its append,
+    which is what makes the reservation atomic against a concurrent scan.
     """
     path = Path(directory) / RETRY_LEDGER
     try:
@@ -365,6 +388,31 @@ def record_retry(directory: str | Path, record: dict[str, Any]) -> bool:
     except OSError as exc:
         print(f"warning: could not record the retry in {path}: {exc}", file=sys.stderr)
         return False
+
+
+@contextmanager
+def retry_ledger_lock(directory: str | Path):
+    """Hold an exclusive lock on the retry ledger while the caller re-reads and reserves.
+
+    Two scans that decided the same retry from the same ledger must not spend one budget
+    slot: the lock serialises the re-read and the reservation, so the second scan sees the
+    first's reservation and takes the next attempt number — or a terminal decision when the
+    budget is spent. The lock lives on its own file, not on the ledger: closing the ledger's
+    own file descriptor after an append would drop a flock held on it, so the lock file is
+    separate and only this context manager opens it. Raises OSError when the lock file
+    cannot be opened; the caller treats that like a ledger write failure and does not
+    deposit.
+    """
+    path = Path(directory) / (RETRY_LEDGER + ".lock")
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _terminal(reason: str, record: bool = True) -> Decision:
@@ -388,11 +436,11 @@ def _retryable(
     bound stopped it.
     """
     if envelope is None:
-        # Not a decision about this message — the ledger holds no attempt to replay — so it
+        # Not a decision about this message — the ledger holds no attempt to retry — so it
         # is never recorded: a missing ledger is an absence, and recording it would claim a
         # decision the adapter never made.
         return _terminal(
-            "no stored attempt to replay; nothing in sent.jsonl carries this id", record=False
+            "no stored attempt to retry; nothing in sent.jsonl carries this id", record=False
         )
     done = retry_count(retries, message_id)
     if done >= MAX_RETRIES:
@@ -404,10 +452,14 @@ def _retryable(
     not_before = base + backoff[attempt - 1]
     expires = envelope_expires_at(envelope)
     if expires is not None and expires <= now:
-        return _terminal("the envelope already expired; a replay would be dropped at once")
+        return _terminal(
+            "the original envelope already expired; its TTL was the message's lifetime, "
+            "so a retry would resurrect it"
+        )
     if expires is not None and expires <= not_before:
         return _terminal(
-            "the envelope expires before the retry is due; a replay would be dropped at once"
+            "the original envelope expires before the retry is due; its TTL was the "
+            "message's lifetime, so a retry would resurrect it"
         )
     return Decision(
         action="retry",
@@ -452,7 +504,7 @@ def decide_notice(
                 retries,
                 base,
                 BACKOFF_LIMITS,
-                "a rate limit is transient; the window clears, so a replay after it should succeed",
+                "a rate limit is transient; the window clears, so a retry after it should succeed",
                 moment,
             )
         if rule == "policy":
@@ -463,12 +515,12 @@ def decide_notice(
         if rule == "thread":
             return _terminal(
                 "the peer's gate refused this on a thread rule; the thread state does not change "
-                "by waiting, so a replay hits the same rule"
+                "by waiting, so a retry hits the same rule"
             )
         if rule == "malformed":
             return _terminal(
                 "the peer's gate refused this as malformed; the message itself is broken, so a "
-                "verbatim replay fails identically"
+                "retry carrying the same parts fails identically"
             )
         if rule == "blocked":
             return _terminal(
@@ -478,14 +530,13 @@ def decide_notice(
         return _terminal(f"unknown refusal rule {rule!r}; do not guess")
     if kind == "expired":
         return _terminal(
-            "the envelope is past its TTL; a verbatim replay is accepted by the hub but "
-            "immediately dropped with another expired frame, so it buys nothing — a re-offer is "
-            "a separate explicit action, not a replay"
+            "the envelope is past its TTL; its TTL was the message's lifetime, so a retry "
+            "would resurrect it — a re-offer is a separate explicit action, not a retry"
         )
     if kind == "dead":
         return _terminal(
-            "a dead letter is never retried automatically, and the messageId is in seen, so a "
-            "replay would be dropped by dedupe — an explicit owner re-offer is the remedy"
+            "a dead letter is never retried automatically, and never silently — an explicit "
+            "owner re-offer is the remedy"
         )
     return _terminal(f"unknown notice kind {kind!r}; do not guess")
 
@@ -511,7 +562,7 @@ def decide_send(
     if exit_code == 2:
         return _terminal(
             "the hub permanently refused the deposit — an unknown sender or recipient, a bad "
-            "signature, a reused messageId — so the same envelope fails identically"
+            "signature, a reused messageId — so the same message fails identically"
         )
     if exit_code == EXIT_RATE_LIMITED:
         message_id = None
@@ -529,7 +580,7 @@ def decide_send(
             base,
             BACKOFF_LIMITS,
             "the hub rate-limited the deposit (429, mailbox full or window spent) after the "
-            "in-process retries; the window clears, so a replay after it should succeed",
+            "in-process retries; the window clears, so a retry after it should succeed",
             moment,
         )
     if exit_code == 3:
@@ -547,8 +598,8 @@ def decide_send(
             retries,
             base,
             BACKOFF_UNREACHABLE,
-            "the hub was unreachable, so the deposit may not have happened; a replay is "
-            "idempotent, the hub dedupes by messageId",
+            "the hub was unreachable, so the deposit may not have happened; the retry mints a "
+            "new envelope for the same thread and seq, so it is the first copy the peer sees",
             moment,
         )
     if exit_code == 4:

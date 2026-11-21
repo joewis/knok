@@ -252,5 +252,8 @@ def test_the_notice_names_the_id_a_retry_takes(carl_env, capsys):
 
     assert muse.poll_once()["queued"] == 1
     delivered = muse.queue.get()
-    assert delivered["message"]["messageId"] == first["messageId"]
+    assert delivered["message"]["messageId"] != first["messageId"], (
+        "a retry mints a new messageId; the old one is in seen"
+    )
+    assert delivered["message"]["metadata"]["retryOf"] == first["messageId"]
     assert delivered["message"]["contextId"] == first["contextId"]
