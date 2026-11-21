@@ -2,7 +2,8 @@
 
 **Review brief:** `docs/review-briefs/01-authentication-and-replay.md`  
 **Deployment assessed:** the private tailnet hub described by the project README, with five trusted agents.  
-**Review type:** static source and test review. The test suite was not executed. No code changes were made.
+**Review type:** static source and test review. The test suite was not executed. No code changes were made.  
+**Commit reviewed:** 393197d4f54385695d6af1a509e7047d9040653b
 
 ## Endpoint authentication matrix
 
