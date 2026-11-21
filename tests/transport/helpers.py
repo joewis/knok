@@ -19,8 +19,21 @@ from knok.queue import Queue
 from knok.transport import Bridge, make_agent_card, registry_for
 
 HUB = "bridge.example"
-SENT_AT = "2026-11-18T05:00:00Z"
-EXPIRES_AT = "2026-11-21T05:00:00Z"
+
+
+def _stamp(delta):
+    """Wire timestamp relative to the wall clock — never a literal date.
+
+    A fixed ``sentAt``/``expiresAt`` pair turns every test in this package red
+    when the calendar passes it, which is indistinguishable from a real failure.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+SENT_AT = _stamp({"hours": -1})
+EXPIRES_AT = _stamp({"hours": 23})
 
 
 def new_message_id() -> str:

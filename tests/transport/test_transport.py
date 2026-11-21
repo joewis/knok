@@ -198,20 +198,23 @@ def test_tampered_ack_does_not_verify(pair):
 
 def test_a_message_is_verified_against_the_key_at_its_own_sent_time(pair):
     """#23: a key revoked this morning still validates a message signed yesterday."""
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
 
     from knok.registry import KeyRecord, Registry
 
+    # Anchored to the wall clock: a fixed revocation date silently changes the
+    # verdict once the calendar passes it.
+    now = datetime.now(timezone.utc)
+    revoked_at = now - timedelta(hours=2)
     carl = pair.carl_id
-    revoked_at = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
     pair.muse.bridge.registry = Registry([
         KeyRecord(
             agent_id=carl.agent_id,
             key_type="ed25519",
             public_key=carl.public_b64(),
             fingerprint=carl.fingerprint,
-            not_before=datetime(2026, 11, 1, tzinfo=timezone.utc),
-            not_after=datetime(2026, 12, 1, tzinfo=timezone.utc),
+            not_before=now - timedelta(days=30),
+            not_after=now + timedelta(days=30),
             revoked_at=revoked_at,
         )
     ])
@@ -219,14 +222,16 @@ def test_a_message_is_verified_against_the_key_at_its_own_sent_time(pair):
     # Signed before the revocation: accepted, even though it arrives after it.
     signed_earlier = build_envelope(
         carl, pair.muse_id.agent_id, context_id="c-before",
-        sent_at="2026-11-18T05:00:00Z", expires_at="2026-11-21T05:00:00Z",
+        sent_at=(now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        expires_at=(now + timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     assert pair.muse.bridge.deliver(signed_earlier) is not None
 
     # Signed after the revocation: refused, with the same refusal as everything else.
     signed_later = build_envelope(
         carl, pair.muse_id.agent_id, context_id="c-after",
-        sent_at="2026-11-18T07:00:00Z", expires_at="2026-11-21T05:00:00Z",
+        sent_at=(now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        expires_at=(now + timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     assert pair.muse.bridge.deliver(signed_later) is None
 
