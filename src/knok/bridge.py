@@ -71,6 +71,46 @@ def iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+#: The longest a peer-supplied protocol identifier may be (#123). Identifiers minted here are a
+#: few dozen characters; anything far longer is not an id, it is a payload aimed at a log.
+MAX_PROTOCOL_ID_LENGTH = 256
+#: A gate rule is one short category word (``policy``, ``limits``, ``thread``, ``malformed``).
+MAX_RULE_LENGTH = 64
+
+
+def _is_protocol_id(value: Any, *, limit: int = MAX_PROTOCOL_ID_LENGTH) -> bool:
+    """True when ``value`` is a string safe to carry into a log line or a terminal row.
+
+    A peer-controlled identifier that is not printable — a newline, a tab, a bell — makes one
+    event print as several, including text that resembles a second event. Length is bounded for
+    the same reason: a log line must stay a line. Unicode that prints is accepted; only control
+    characters and overlong values are refused.
+    """
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= limit
+        and all(ch.isprintable() for ch in value)
+    )
+
+
+def safe_log_text(value: Any, *, limit: int = MAX_PROTOCOL_ID_LENGTH) -> str:
+    """Render an untrusted value as one safe token for a log line or terminal row (#123).
+
+    Every character that is not printable is replaced by its ``\\uXXXX`` escape, so the value stays
+    readable and stays on one line; the result is truncated past ``limit`` characters. This is the
+    second half of the notice-boundary validation: a value that arrives through a path the
+    validator never sees (a hub frame, a re-offered id) is still escaped where a human reads it.
+    ``None`` renders ``-``; anything else is stringified first.
+    """
+    if value is None:
+        return "-"
+    text = value if isinstance(value, str) else str(value)
+    rendered = "".join(ch if ch.isprintable() else f"\\u{ord(ch):04x}" for ch in text)
+    if len(rendered) > limit:
+        rendered = rendered[:limit] + "…"
+    return rendered
+
+
 def item_key(item: Any) -> str:
     """A stable id for a mailbox item, including one that is too broken to have a messageId."""
     if isinstance(item, dict):
@@ -509,7 +549,8 @@ class Bridge:
                     continue
                 # Bounded and now exhausted: acknowledge it away so the mailbox can advance, and
                 # leave a record. Re-offering it a sixth time only starves everything behind it.
-                log.error("dropping an unhandleable item after %d attempts: %s", attempts, key)
+                log.error("dropping an unhandleable item after %d attempts: %s", attempts,
+                          safe_log_text(key))
                 if not self._record_drop(item, key):
                     # The record is the only evidence this message ever existed. Without it the ack
                     # would erase the message and leave nothing behind, so the drop waits instead.
@@ -607,11 +648,13 @@ class Bridge:
         # signed yesterday, and must not account for one signed after it lapsed.
         public_key = self.public_key_of(sender, at=sent_at(item))
         if public_key is None:
-            log.warning("no trusted card for sender %s; leaving the message at the hub", sender)
+            log.warning("no trusted card for sender %s; leaving the message at the hub",
+                        safe_log_text(sender))
             return "unhandled", None
         ok, reason = verify_envelope(item, public_key)
         if not ok:
-            log.warning("refused an unverifiable envelope from %s: %s", sender, reason)
+            log.warning("refused an unverifiable envelope from %s: %s", safe_log_text(sender),
+                        safe_log_text(reason))
             return "unhandled", None
 
         message = item.get("message")
@@ -643,14 +686,16 @@ class Bridge:
             # as "queued" would put a delivery in the counts that never happened. A re-offer after
             # a lost hub ack is ordinary; a re-offer of an id whose message the queue does *not*
             # hold is the shape #79 could not see, and it says ``duplicate`` here too.
-            log.info("re-offered message %s is already queued; acking without gate work", message_id)
+            log.info("re-offered message %s is already queued; acking without gate work",
+                     safe_log_text(message_id))
             return "duplicate", message_id
 
         decision = self.gate.decide(item)
         if not decision.allowed:
             # Recorded as handled: the hub must stop offering it, or a 50-message page that is all
             # refusals never advances (HUB.md, "ack means handled").
-            log.info("gate refused %s from %s: %s", message_id, sender, decision.reason)
+            log.info("gate refused %s from %s: %s", safe_log_text(message_id),
+                     safe_log_text(sender), safe_log_text(decision.reason))
             self._refuse(item, decision, message_id)
             return "refused", message_id
 
@@ -661,7 +706,8 @@ class Bridge:
         except (OSError, sqlite3.Error, ValueError) as exc:
             # Nothing was stored and nothing was committed, so the item stays unacked and the hub
             # offers it again; the attempt counter bounds a message that can never be stored.
-            log.error("queue refused or failed on %s from %s: %s", message_id, sender, exc)
+            log.error("queue refused or failed on %s from %s: %s", safe_log_text(message_id),
+                      safe_log_text(sender), safe_log_text(exc))
             return "unhandled", None
         # ``put`` answers three ways and the difference is mail: ``accepted`` stored it, ``late``
         # stored it out of order, ``duplicate`` stored *nothing* and the envelope is dropped. The
@@ -681,9 +727,9 @@ class Bridge:
         message_id = frame.get("messageId")
         log.info(
             "notice: %s expired at %s (context %s)",
-            message_id,
-            frame.get("expiredAt"),
-            frame.get("contextId"),
+            safe_log_text(message_id),
+            safe_log_text(frame.get("expiredAt")),
+            safe_log_text(frame.get("contextId")),
         )
         self._record_notice(frame)
         return "notices", message_id if isinstance(message_id, str) else None
@@ -770,7 +816,8 @@ class Bridge:
         except HubError as exc:
             # Not fatal and not retried here: the refusal already has a durable local record, and
             # retrying inside the poll would let one unreachable peer stall every other message.
-            log.error("could not tell %s that %s was refused: %s", sender, message_id, exc)
+            log.error("could not tell %s that %s was refused: %s", safe_log_text(sender),
+                      safe_log_text(message_id), safe_log_text(exc))
             return False
 
     def _handle_refusal_notice(self, item: dict[str, Any], sender: str, notice: Any):
@@ -783,7 +830,22 @@ class Bridge:
         message_id = item["message"]["messageId"]
         moment = datetime.now(timezone.utc)
         if not isinstance(notice, dict) or not isinstance(notice.get("messageId"), str):
-            log.warning("ignoring a malformed refusal notice from %s", sender)
+            log.warning("ignoring a malformed refusal notice from %s", safe_log_text(sender))
+            return "refused", message_id
+        if (
+            not _is_protocol_id(notice.get("messageId"))
+            or (notice.get("contextId") is not None
+                and not _is_protocol_id(notice.get("contextId")))
+            or (notice.get("rule") is not None
+                and not _is_protocol_id(notice.get("rule"), limit=MAX_RULE_LENGTH))
+        ):
+            # A notice is a peer-controlled string that lands in our logs and terminal. A field
+            # that is not printable or not bounded is not a refusal to record, it is a forgery
+            # aimed at the reader (#123) — acked like any malformed notice, never stored.
+            log.warning(
+                "ignoring a refusal notice from %s with an unprintable or overlong field",
+                safe_log_text(sender),
+            )
             return "refused", message_id
         if (
             self.rates.count("notice", sender, moment, timedelta(hours=1))
@@ -791,7 +853,8 @@ class Bridge:
         ):
             # A pinned peer can still flood us: a notice is handled before the gate, so §9's
             # message counters never see it. Bound our own log rather than the sender's mailbox.
-            log.error("too many refusal notices from %s; not recording %s", sender, message_id)
+            log.error("too many refusal notices from %s; not recording %s",
+                      safe_log_text(sender), safe_log_text(message_id))
             return "refused", message_id
         frame = {
             "kind": "refused",
@@ -803,9 +866,9 @@ class Bridge:
         }
         log.warning(
             "%s refused our message %s at its gate (%s)",
-            sender,
-            notice["messageId"],
-            notice.get("rule"),
+            safe_log_text(sender),
+            safe_log_text(notice["messageId"]),
+            safe_log_text(notice.get("rule")),
         )
         if not self._record_notice(frame):
             # The notice is the only evidence the message died. Without it on disk, leave the frame

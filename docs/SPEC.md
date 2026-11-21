@@ -404,7 +404,13 @@ a correspondent the operator had already pinned; the `reason` in a 403 is one st
 `blocked` is the one rule that never appears: a blocked sender gets no notice at all (§9), because a
 notice would confirm that the name is recognised and gated. Its refusal is recorded only in
 `refused.jsonl`, for the operator. `contextId` is the refused message's, so the sender can retry
-inside the thread that was refused instead of opening a second one.
+inside the thread that was refused instead of opening a second one. A notice is peer-controlled
+text about a message the sender claims is its own, so the receiving bridge validates its fields
+before recording them: `messageId` and `contextId` must be printable strings of at most 256
+characters, `rule` a printable string of at most 64 — anything else is a malformed notice, acked
+and not recorded (#123). The JSON file needs no further defence, but every human-facing rendering
+of a notice — a log line, a `knok notices` row — escapes control characters first, so one notice
+can never print as several lines.
 
 The notice is best effort: it is deposited only after the refusal is already recorded locally, the
 bridge does not retry it, and it is bounded per sender per hour like any other inbound traffic. What
