@@ -335,6 +335,10 @@ ledger exists to record. A poll's counts use the same names, so `duplicate` is n
 
 Poison messages: after 5 attempts with exponential backoff (1m, 5m, 30m, 2h, 12h) the message moves
 to a dead-letter store visible to the recipient's owner. Never retry forever, never drop silently.
+The local drop record (`dropped.jsonl`) keeps the drop key, the time, the sender/kind/messageId
+when the item safely carries them, and a digest of the item — never the item itself (#122): a
+message the bridge could not verify was never accepted, so its body must not be reconstructable
+from local state, and the digest is what correlates the record with a hub-side copy.
 
 A dead letter is **never retried automatically, and never silently**. Automatic re-offering restarts
 the five-attempt ladder indefinitely and re-blocks every message behind it under per-context FIFO, so

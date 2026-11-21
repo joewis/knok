@@ -156,7 +156,9 @@ def test_the_attempt_allowance_is_spent_and_the_drop_is_recorded(deployment):
     assert outcomes[: MAX_HANDLE_ATTEMPTS - 1] == ["unhandled"] * (MAX_HANDLE_ATTEMPTS - 1)
     assert outcomes[-1] == "dropped", "the last attempt destroys it, and the ledger names it"
     assert muse.client.fetch()["messages"] == [], "a dropped item is acknowledged away"
-    assert (muse.state.directory / "dropped.jsonl").exists(), "the full item is still kept"
+    dropped = (muse.state.directory / "dropped.jsonl").read_text().splitlines()
+    assert dropped, "the drop must still be recorded"
+    assert "item" not in json.loads(dropped[0]), "the drop record is metadata only (#122)"
 
 
 def test_a_ledger_that_cannot_be_written_acks_nothing(deployment):
