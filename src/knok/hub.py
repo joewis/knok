@@ -227,6 +227,36 @@ def _decode_cursor(cursor: str) -> int:
         raise ValueError(f"bad cursor: {cursor!r}") from exc
 
 
+def sign_delivered_frame(
+    identity: Identity,
+    *,
+    message_id: str,
+    context_id: str,
+    recipient_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Sign the HUB.md ``delivered`` frame with the hub's own key (#93).
+
+    The ack is the *recipient's* commitment to the hub; it is not visible to the sender, whose
+    only positive signal was the 202 at deposit. This frame is what turns that silence into an
+    answer: the hub saw the message leave its store because a bridge took it. ``from`` is the
+    hub, ``to`` is the sender of the envelope that was acked. Like ``expired`` it is not a
+    ``Message`` and never enters a thread, so it cannot be mistaken for a reply.
+    """
+    moment = now or datetime.now(timezone.utc)
+    frame = {
+        "kind": "delivered",
+        "messageId": message_id,
+        "contextId": context_id,
+        "deliveredAt": _iso(moment),
+        "from": identity.agent_id,
+        "to": [recipient_id],
+    }
+    signed = dict(frame)
+    signed["signature"] = identity.sign(canonical_bytes(frame))
+    return signed
+
+
 def sign_expired_frame(
     identity: Identity,
     *,
@@ -254,21 +284,30 @@ def sign_expired_frame(
     return signed
 
 
+#: Each frame kind dates itself with its own word, and that word is what the reader reports.
+#: ``expired`` says the message died at the hub; ``delivered`` says a bridge took it (#93).
+FRAME_TIMES = {"expired": "expiredAt", "delivered": "deliveredAt"}
+
+
 def verify_frame(frame: Any, public_key) -> bool:
     """Verify a hub-signed transport frame. Never raises.
 
-    Only ``expired`` frames exist in v1: HUB.md names ``dead`` frames too but
-    defines no hub event that produces one, so this slice emits none and a
-    ``dead`` frame does not verify here.
+    Two kinds exist: ``expired``, which the sweep emits when a message dies at the hub, and
+    ``delivered``, which an ack emits so the sender learns its message left the store (#93).
+    HUB.md names ``dead`` frames too but defines no hub event that produces one, so a ``dead``
+    frame does not verify here.
     """
-    if not isinstance(frame, dict) or frame.get("kind") != "expired":
+    if not isinstance(frame, dict):
         return False
-    for field in ("messageId", "contextId", "expiredAt", "from", "to"):
+    time_field = FRAME_TIMES.get(frame.get("kind"))
+    if time_field is None:
+        return False
+    for field in ("messageId", "contextId", time_field, "from", "to"):
         if not frame.get(field):
             return False
     if not isinstance(frame.get("to"), list) or len(frame["to"]) != 1:
         return False
-    if _parse_iso(frame.get("expiredAt")) is None:
+    if _parse_iso(frame.get(time_field)) is None:
         return False
     signature = frame.get("signature")
     if not isinstance(signature, str):
@@ -577,7 +616,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if len(body["messageIds"]) > MAX_ACK_IDS:
             self._refuse()
             return
-        acked = hub.ack(agent, body["messageIds"])
+        undelivered = body.get("undelivered")
+        if undelivered is None:
+            undelivered = []
+        if not isinstance(undelivered, list) or not all(
+            isinstance(item, str) for item in undelivered
+        ):
+            self._refuse()
+            return
+        acked = hub.ack(agent, body["messageIds"], undelivered=undelivered)
         self._send(200, json.dumps({"acked": acked}, sort_keys=True).encode("ascii"))
 
     def _presence(self, hub: "Hub", target: str) -> None:
@@ -1112,12 +1159,25 @@ class Hub:
             next_cursor = _encode_cursor(page[-1][0]) if len(rows) > limit else None
             return [json.loads(payload) for _id, payload in page], next_cursor
 
-    def ack(self, agent: str, message_ids: list[str]) -> int:
+    def ack(
+        self,
+        agent: str,
+        message_ids: list[str],
+        *,
+        undelivered: list[str] | None = None,
+    ) -> int:
         """Delete the caller's ids from the caller's mailbox; return how many.
 
         Scoped to the caller's own box: foreign ids are ignored rather than
         refused, and a duplicate ack is idempotent (second call returns 0).
+
+        ``undelivered`` names ids the bridge took custody of but did not hand to the
+        application — a gate refusal, or a message it gave up on. Those are acked like
+        everything else (the hub must stop offering them) but they must not produce a
+        ``delivered`` frame to the sender (#93): the sender already gets a refusal or a
+        drop record, and telling it both "delivered" and "refused" is worse than silence.
         """
+        skip = set(undelivered or ())
         moment = datetime.now(timezone.utc)
         with self._lock:
             deleted = 0
@@ -1129,7 +1189,7 @@ class Hub:
                     # actually acknowledged, or a later replay cannot be told
                     # apart from a different body reusing the id (#99).
                     rows = self._conn.execute(
-                        "SELECT sender, payload_json, expires_at FROM mail"
+                        "SELECT sender, payload_json, expires_at, kind FROM mail"
                         " WHERE recipient = ? AND message_id = ?",
                         (agent, message_id),
                     ).fetchall()
@@ -1138,7 +1198,7 @@ class Hub:
                         (agent, message_id),
                     )
                     deleted += cursor.rowcount
-                    for sender, payload, expires in rows:
+                    for sender, payload, expires, kind in rows:
                         self._conn.execute(
                             "INSERT INTO mail_seen (recipient, sender, message_id,"
                             " payload_sha256, expires_at, acked_at)"
@@ -1149,6 +1209,21 @@ class Hub:
                             " acked_at = excluded.acked_at",
                             (agent, sender, message_id, _sha256_text(payload),
                              expires, _ts(moment)),
+                        )
+                        # The sender learns nothing from our ack: we are the recipient, and the
+                        # hub deletes the row either way. Queue the frame that says this message
+                        # left the hub's store (#93). Frames are not messages — acking one must
+                        # not mint another — and an id the bridge says it could not deliver gets
+                        # no such claim. A contextId we cannot read still gets a frame; the id is
+                        # what the sender correlates on.
+                        if kind != "envelope" or message_id in skip:
+                            continue
+                        try:
+                            context_id = json.loads(payload)["message"]["contextId"]
+                        except (ValueError, KeyError, TypeError):
+                            context_id = ""
+                        self._queue_delivered_frame(
+                            sender, message_id, context_id, moment, _locked=True
                         )
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -1236,22 +1311,52 @@ class Hub:
         *,
         _locked: bool = False,
     ) -> bool:
-        """Store a hub-signed ``expired`` frame in the sender's mailbox.
+        """Store a hub-signed ``expired`` frame in the sender's mailbox."""
+        return self._queue_frame(
+            "expired", sender, message_id, context_id, moment, _locked=_locked
+        )
+
+    def _queue_delivered_frame(
+        self,
+        sender: str,
+        message_id: str,
+        context_id: str,
+        moment: datetime,
+        *,
+        _locked: bool = False,
+    ) -> bool:
+        """Store a hub-signed ``delivered`` frame in the sender's mailbox (#93)."""
+        return self._queue_frame(
+            "delivered", sender, message_id, context_id, moment, _locked=_locked
+        )
+
+    def _queue_frame(
+        self,
+        kind: str,
+        sender: str,
+        message_id: str,
+        context_id: str,
+        moment: datetime,
+        *,
+        _locked: bool = False,
+    ) -> bool:
+        """Store a hub-signed transport frame in the sender's mailbox.
 
         Returns False when the sender's box is at cap: the drop is counted
-        (and surfaced by health) instead of failing the sweep or the deposit
-        that triggered it. Callers hold ``self._lock`` when ``_locked``.
+        (and surfaced by health) instead of failing the sweep, the deposit or
+        the ack that triggered it. Callers hold ``self._lock`` when ``_locked``.
         """
-        frame = sign_expired_frame(
+        signer = sign_expired_frame if kind == "expired" else sign_delivered_frame
+        frame = signer(
             self.identity, message_id=message_id, context_id=context_id,
             recipient_id=sender, now=moment,
         )
         raw = json.dumps(frame, sort_keys=True)
         if self._at_cap(sender, len(raw.encode("utf-8"))):
             log.warning(
-                "hub could not queue expired frame for %s: mailbox at cap;"
+                "hub could not queue %s frame for %s: mailbox at cap;"
                 " messageId %s dropped from the frame queue",
-                sender, message_id,
+                kind, sender, message_id,
             )
             self._conn.execute(
                 "INSERT INTO dropped_frames (owner, count, last_at) VALUES (?, 1, ?)"

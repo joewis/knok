@@ -421,7 +421,7 @@ def cmd_inbox(args: argparse.Namespace) -> int:
 
 #: Every kind the bridge writes into ``notices.jsonl``, and so every kind this reader can be asked
 #: to select. A filter that cannot name a line the reader prints is a hole in the same file.
-NOTICE_KINDS = ("refused", "expired", "dead", "late", "gap")
+NOTICE_KINDS = ("refused", "expired", "dead", "delivered", "late", "gap")
 
 
 def _ranges(seqs: list[Any]) -> str:

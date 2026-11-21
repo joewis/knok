@@ -82,7 +82,7 @@ LEDGER_FILES: dict[str, tuple[str, ...]] = {
     "delivery.jsonl": ("at",),
     "refused.jsonl": ("at",),
     "dropped.jsonl": ("at",),
-    NOTICES: ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at"),
+    NOTICES: ("receivedAt", "expiredAt", "deadedAt", "deliveredAt", "detectedAt", "releasedAt", "at"),
 }
 #: Every file a bridge appends JSON lines to. A crash mid-append can leave a torn final line in
 #: any of them; all five are repaired the same way (#114).
@@ -754,6 +754,7 @@ class Bridge:
         counts = {"fetched": 0, "queued": 0, "duplicate": 0, "late": 0, "refused": 0,
                   "notices": 0, "unhandled": 0, "dropped": 0}
         handled: list[str] = []
+        undelivered: list[str] = []
         ledger: list[dict[str, Any]] = []
         for item in page.get("messages", []):
             counts["fetched"] += 1
@@ -779,10 +780,19 @@ class Bridge:
                 del self._attempts[key]
                 counts["dropped"] += 1
                 handled.append(key)
+                if isinstance(key, str):
+                    # Giving up is custody taken without delivery: ack it so the hub stops
+                    # offering it, but never tell the sender it arrived (#93).
+                    undelivered.append(key)
                 ledger.append(self._delivery_record(item, "dropped", key))
                 continue
             counts[outcome] += 1
             handled.append(message_id)
+            if outcome in {"refused", "dropped"} and isinstance(message_id, str):
+                # Custody was taken but the application never saw it. The hub still has to stop
+                # offering it, so it is acked — but it must not produce a delivered frame to the
+                # sender, which already gets the refusal or the drop record (#93).
+                undelivered.append(message_id)
             ledger.append(self._delivery_record(item, outcome))
 
         # Record, then hand the hub permission to forget. If the ledger cannot be written, nothing
@@ -795,10 +805,11 @@ class Bridge:
             counts = {"fetched": counts["fetched"], "queued": 0, "duplicate": 0, "late": 0,
                       "refused": 0, "notices": 0, "unhandled": len(ledger), "dropped": 0}
             handled = []
+            undelivered = []
 
         if handled:
             try:
-                self.client.ack(handled)
+                self.client.ack(handled, undelivered)
             except HubError as exc:
                 # Not fatal: the hub will offer these again and the queue dedupes them.
                 log.warning("ack failed (%d ids): %s", len(handled), exc)
@@ -868,7 +879,7 @@ class Bridge:
         if not isinstance(item, dict):
             return "unhandled", None
 
-        if item.get("kind") in {"expired", "dead"}:
+        if item.get("kind") in {"expired", "dead", "delivered"}:
             return self._handle_frame(item)
 
         sender = item.get("from")
@@ -956,10 +967,13 @@ class Bridge:
             log.warning("dropped a transport frame that is not hub-signed: %r", frame.get("kind"))
             return "unhandled", None
         message_id = frame.get("messageId")
+        kind = frame.get("kind")
+        when = frame.get("expiredAt") or frame.get("deliveredAt")
         log.info(
-            "notice: %s expired at %s (context %s)",
+            "notice: %s %s at %s (context %s)",
             safe_log_text(message_id),
-            safe_log_text(frame.get("expiredAt")),
+            safe_log_text(kind),
+            safe_log_text(when),
             safe_log_text(frame.get("contextId")),
         )
         if not self._record_notice(frame):

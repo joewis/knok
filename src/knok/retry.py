@@ -163,7 +163,7 @@ BACKOFF_UNREACHABLE = (timedelta(minutes=1), timedelta(minutes=5))
 
 #: Each notice kind dates itself with its own word. The policy needs the notice's time to date
 #: the backoff from; a notice with no parseable time is dated from now instead.
-NOTICE_TIMES = ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at")
+NOTICE_TIMES = ("receivedAt", "expiredAt", "deadedAt", "deliveredAt", "detectedAt", "releasedAt", "at")
 
 #: The one refusal rule a retry can outlast. Every other rule is a decision about this
 #: message, not about this moment.
@@ -537,6 +537,11 @@ def decide_notice(
         return _terminal(
             "a dead letter is never retried automatically, and never silently — an explicit "
             "owner re-offer is the remedy"
+        )
+    if kind == "delivered":
+        return _terminal(
+            "the peer's bridge took this message; there is nothing left to retry, and the "
+            "notice is the positive answer silence used to leave ambiguous (#93)"
         )
     return _terminal(f"unknown notice kind {kind!r}; do not guess")
 

@@ -167,6 +167,10 @@ SHAPES = {
         "kind": "gap", "from": f"muse@{DOMAIN}", "to": f"carl@{DOMAIN}",
         "contextId": "c-5", "missing": [3, 4, 5, 9], "releasedAt": "2026-11-20T00:00:00Z",
     },
+    "delivered": {
+        "kind": "delivered", "from": f"hub@{DOMAIN}", "to": f"carl@{DOMAIN}",
+        "messageId": "m-54", "contextId": "c-6", "deliveredAt": "2026-11-20T01:00:00Z",
+    },
 }
 
 
