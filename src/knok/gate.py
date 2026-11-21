@@ -51,6 +51,12 @@ class Receipt:
         )
 
 
+#: The refusal rules a gate may name (#50), and the only rules a refusal notice may carry
+#: (#120): a notice naming any other rule is not a gate answer, so the receiver drops it
+#: instead of recording it.
+REFUSAL_RULES = frozenset({"blocked", "policy", "limits", "thread", "malformed"})
+
+
 @dataclass(frozen=True)
 class Decision:
     """One answer from the gate: allowed or not, and — for our own records — why.

@@ -47,6 +47,55 @@ def notices_of(root, name):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def record_sent_attempt(root, name, message_id, recipient_id):
+    """Seed one ``sent.jsonl`` attempt: ``name`` sent ``message_id`` to ``recipient_id``.
+
+    The ``send`` helper in ``test_phase2`` deposits straight through the hub client, the way
+    the wire does — it does not do the CLI's bookkeeping (``_remember_attempt``), so a test
+    that needs the sender to have a stored attempt writes it explicitly.
+    """
+    envelope = {
+        "envelopeVersion": 1,
+        "seq": 0,
+        "message": {
+            "kind": "message",
+            "messageId": message_id,
+            "contextId": "c-sent",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "hi"}],
+        },
+        "from": f"{name}@{DOMAIN}",
+        "to": [recipient_id],
+        "sentAt": "2026-11-21T00:00:00Z",
+        "expiresAt": "2026-11-24T00:00:00Z",
+    }
+    record_attempt(root, name, envelope)
+
+
+def record_attempt(root, name, envelope):
+    """Append one attempt record, in the shape ``_remember_attempt`` writes."""
+    path = root / "agents" / name / "sent.jsonl"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"recordedAt": "2026-11-21T00:00:00Z", "envelope": envelope}) + "\n"
+        )
+
+
+def notice_item(sender_id, notice, message_id="r-notice"):
+    """One mailbox item carrying a refusal notice, the way the peer's bridge deposits it."""
+    return {
+        "from": sender_id,
+        "message": {
+            "kind": "message",
+            "messageId": message_id,
+            "contextId": "c-notice",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "refused"}],
+            "metadata": {NOTICE_KEY: notice},
+        },
+    }
+
+
 def test_a_refused_message_reaches_the_sender_as_a_notice(deployment):
     """The core claim: hub acked it, gate refused it, and the sender is told anyway.
 
@@ -60,7 +109,13 @@ def test_a_refused_message_reaches_the_sender_as_a_notice(deployment):
     rewrite(root, "muse", block=[], allow=[])
     apply_policy(muse, policy_path(root, "muse"))
 
-    send(carl, muse.identity.agent_id, "are you there?", context=context, message_id="m-50")
+    _, envelope = send(
+        carl, muse.identity.agent_id, "are you there?", context=context, message_id="m-50"
+    )
+    # The CLI records every attempt in sent.jsonl before deposit; this helper deposits
+    # directly, so the test does that bookkeeping — without a stored attempt addressed to
+    # muse, the notice has no provenance and is dropped (#120).
+    record_attempt(root, "carl", envelope)
     refused = muse.poll_once()
     assert refused["refused"] == 1, "the gate must refuse an unlisted sender"
     assert muse.queue.get() is None, "and nothing reaches the application"
@@ -122,7 +177,9 @@ def test_a_notice_is_not_a_message_in_a_thread(deployment):
 
     rewrite(root, "muse", block=[], allow=[])
     apply_policy(muse, policy_path(root, "muse"))
-    send(carl, muse.identity.agent_id, "one", context="c-quiet", message_id="m-quiet")
+    _, envelope = send(carl, muse.identity.agent_id, "one", context="c-quiet", message_id="m-quiet")
+    # As above: the notice muse sends back needs a stored attempt to correlate with (#120).
+    record_attempt(root, "carl", envelope)
     muse.poll_once()
     assert carl.poll_once()["notices"] == 1
 
@@ -209,10 +266,59 @@ def test_the_public_reason_is_identical_for_every_rule(deployment):
     assert (blocked.rule, unlisted.rule) == ("blocked", "policy")
 
 
+def test_a_notice_must_name_a_message_sent_to_the_peer_who_refused_it(deployment):
+    """#120: a pinned peer must not inject failure records for messages we never sent it.
+
+    A notice is a statement about one of our messages, so the receiver correlates it with its
+    own ``sent.jsonl`` before recording it: the named id must be an attempt this agent made,
+    addressed to the peer the notice came from, and the rule must be one the gate defines.
+    """
+    hub, bridges, root = deployment
+    carl, muse = bridges["carl"], bridges["muse"]
+    muse_id = muse.identity.agent_id
+
+    # Carl really did send m-real to muse — and m-other-peer to someone else entirely.
+    record_sent_attempt(root, "carl", "m-real", muse_id)
+    record_sent_attempt(root, "carl", "m-other-peer", f"kiko@{DOMAIN}")
+
+    def handle(message_id, rule="policy", frame_id="r-notice"):
+        item = notice_item(
+            muse_id, {"kind": "refused", "messageId": message_id, "rule": rule}, frame_id
+        )
+        return carl._handle_refusal_notice(
+            item, muse_id, item["message"]["metadata"][NOTICE_KEY]
+        )
+
+    # A notice for a message carl never sent is dropped, and the frame is still acked.
+    assert handle("m-never-sent") == ("refused", "r-notice")
+    assert notices_of(root, "carl") == [], "an unprovenanced notice must not be recorded"
+
+    # A notice for a message sent to a different peer is dropped too: the attempt exists,
+    # but it was not addressed to the peer the notice came from.
+    assert handle("m-other-peer") == ("refused", "r-notice")
+    assert notices_of(root, "carl") == []
+
+    # A notice with a rule the gate never defines is dropped, even for a real message.
+    assert handle("m-real", rule="nonsense") == ("refused", "r-notice")
+    assert notices_of(root, "carl") == []
+
+    # A notice naming a message carl did send to muse, under a defined rule, is recorded.
+    assert handle("m-real", rule="policy") == ("notices", "r-notice")
+    recorded = notices_of(root, "carl")
+    assert len(recorded) == 1
+    assert recorded[0]["messageId"] == "m-real"
+    assert recorded[0]["from"] == muse_id
+    assert recorded[0]["rule"] == "policy"
+
+
 def test_a_notice_flood_is_bounded(deployment):
     """A notice is handled before the gate, so it needs a bound of its own."""
     hub, bridges, root = deployment
     carl, muse = bridges["carl"], bridges["muse"]
+
+    # The flood is about the cap, not provenance: the notice names a message carl really
+    # sent to muse, so the provenance check passes and the cap is what bounds it (#120).
+    record_sent_attempt(root, "carl", "m-x", muse.identity.agent_id)
 
     item = {
         "from": muse.identity.agent_id,

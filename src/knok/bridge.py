@@ -37,7 +37,7 @@ from . import policy as policy_mod
 from .agentcard import CardTimeError, card_agent_id, card_valid_until, verify_card
 from .contacts import Contacts
 from .envelope import sent_at, sign, verify_envelope
-from .gate import Gate, Threads
+from .gate import Gate, REFUSAL_RULES, Threads
 from .hub import verify_frame
 from .hubclient import HubClient, HubError, HubRefused
 from .identity import Identity, fingerprint
@@ -1056,12 +1056,32 @@ class Bridge:
                       safe_log_text(message_id), safe_log_text(exc))
             return False
 
+    def _sent_to(self, message_id: str, recipient: str) -> bool:
+        """Whether this agent recorded sending ``message_id`` to ``recipient`` (#120).
+
+        Correlates a refusal notice with ``sent.jsonl`` via ``read_attempts``: the stored
+        envelope for the named id must exist, and its ``to`` must name this peer. The import
+        is local because ``retry`` imports ``NOTICES`` from this module, so a top-level
+        import would be circular.
+        """
+        from .retry import read_attempts
+
+        attempt = read_attempts(self.state.directory).get(message_id)
+        return isinstance(attempt, dict) and recipient in (attempt.get("to") or [])
+
     def _handle_refusal_notice(self, item: dict[str, Any], sender: str, notice: Any):
         """Record a peer's refusal of one of our messages, then let the hub drop it.
 
         This is the receiving half of #50: the sender learns, in its own ``notices.jsonl``, that
         its message was refused and under which rule — instead of waiting forever for a reply that
         cannot come.
+
+        A notice is a statement about one of our messages, so it is recorded only when it proves
+        it: the named ``messageId`` must be an attempt this agent recorded in ``sent.jsonl``
+        addressed to this peer, and the rule must be one the gate defines (SPEC §9: nothing in
+        a notice may describe anyone but the sender's own message). Anything else is dropped —
+        a pinned peer must not be able to inject false failure records for messages we never
+        sent it (#120). A dropped notice is still acked, so it cannot wedge the mailbox.
         """
         message_id = item["message"]["messageId"]
         moment = datetime.now(timezone.utc)
@@ -1081,6 +1101,25 @@ class Bridge:
             log.warning(
                 "ignoring a refusal notice from %s with an unprintable or overlong field",
                 safe_log_text(sender),
+            )
+            return "refused", message_id
+        if notice.get("rule") not in REFUSAL_RULES:
+            # A notice naming a rule the gate never defines is not a gate answer (#120).
+            log.warning(
+                "ignoring a refusal notice from %s with unknown rule %r",
+                safe_log_text(sender),
+                notice.get("rule"),
+            )
+            return "refused", message_id
+        if not self._sent_to(notice["messageId"], sender):
+            # SPEC §9: a notice may describe only the sender's own message. Without a stored
+            # attempt addressed to this peer, the notice is an unverified claim about a message
+            # we may never have sent — recording it would let a pinned peer inject false
+            # failures into notices.jsonl and mislead the retry CLI (#120).
+            log.warning(
+                "ignoring a refusal notice from %s for %s: no sent attempt to that peer",
+                safe_log_text(sender),
+                safe_log_text(notice["messageId"]),
             )
             return "refused", message_id
         if (
