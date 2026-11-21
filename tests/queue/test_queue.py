@@ -17,7 +17,8 @@ from pathlib import Path
 import pytest
 
 from knok.identity import IdentityError
-from knok.queue import (BACKOFF_SECONDS, NOTICE_BACKOFF_SECONDS, Queue,
+from knok.queue import (BACKOFF_SECONDS, MAX_QUEUE_BYTES, MAX_QUEUE_MESSAGES,
+                        NOTICE_BACKOFF_SECONDS, Queue, QueueFullError,
                         QueueLockedError)
 
 T0 = datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc)
@@ -490,3 +491,65 @@ def test_pending_notices_do_not_starve_due_messages(queue, envelope_factory):
     assert queue.get(T0)["kind"] == "late"
     assert queue.get(T0)["kind"] == "late"
     assert queue.get(T0) is None
+
+
+def test_the_local_cap_mirrors_the_hub_mailbox_cap():
+    """The bound is HUB.md's, applied locally: 10,000 envelopes or 256 MiB per
+    agent, whichever comes first (issue #116)."""
+    assert MAX_QUEUE_MESSAGES == 10_000
+    assert MAX_QUEUE_BYTES == 256 * 1024 * 1024
+
+
+def test_put_refuses_when_the_message_cap_is_reached(tmp_path, envelope_factory):
+    """At cap a new message is refused, not stored — the local queue cannot grow
+    while the application is stalled (issue #116)."""
+    with Queue(tmp_path / "q.sqlite", OWNER, max_messages=2) as q:
+        assert q.put(
+            _env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0
+        ) == "accepted"
+        assert q.put(
+            _env(envelope_factory, seq=1, message={"messageId": "m-1"}), T0
+        ) == "accepted"
+        with pytest.raises(QueueFullError):
+            q.put(_env(envelope_factory, seq=2, message={"messageId": "m-2"}), T0)
+        assert q.depth() == 2
+        # A re-offer of an id already held is still a duplicate, not a refusal:
+        # the bridge may ack it away.
+        assert q.put(
+            _env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0
+        ) == "duplicate"
+        q.ack("m-0", T0)
+        assert q.put(
+            _env(envelope_factory, seq=2, message={"messageId": "m-2"}), T0
+        ) == "accepted"
+
+
+def test_put_refuses_when_the_byte_cap_is_reached(tmp_path, envelope_factory):
+    """The byte half of the cap: one envelope fits, two do not (issue #116)."""
+    with Queue(tmp_path / "probe.sqlite", OWNER) as probe:
+        probe.put(_env(envelope_factory), T0)
+        one = probe.usage()["bytes"]
+    assert one > 0
+    with Queue(tmp_path / "q.sqlite", OWNER, max_bytes=one) as q:
+        assert q.put(
+            _env(envelope_factory, message={"messageId": "m-0"}), T0
+        ) == "accepted"
+        with pytest.raises(QueueFullError):
+            q.put(_env(envelope_factory, seq=1, message={"messageId": "m-1"}), T0)
+    # Nothing at all fits in a one-byte queue.
+    with Queue(tmp_path / "tiny.sqlite", OWNER, max_bytes=1) as q:
+        with pytest.raises(QueueFullError):
+            q.put(_env(envelope_factory), T0)
+
+
+def test_usage_reports_count_and_bytes(queue, envelope_factory):
+    """``usage`` is the cap's meter: live messages and the bytes they occupy."""
+    first = _env(envelope_factory, seq=0, message={"messageId": "m-0"})
+    second = _env(envelope_factory, seq=1, message={"messageId": "m-1"})
+    queue.put(first, T0)
+    queue.put(second, T0)
+    expected = len(json.dumps(first, sort_keys=True).encode("utf-8")) + len(
+        json.dumps(second, sort_keys=True).encode("utf-8")
+    )
+    assert queue.usage() == {"messages": 2, "bytes": expected}
+    assert queue.depth() == 2
