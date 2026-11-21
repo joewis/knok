@@ -115,9 +115,16 @@ private-network display name.
   accepted; nothing in v1 compares `sentAt` against the receiver's clock, and the hub's five-minute
   freshness bound (§7) is applied to the request, not to the envelope. Sent-time verification is
   therefore protection for a message you already hold — an audit of what was valid when it was
-  received — not proof about a deposit made now. A receiver that needs the latter applies its own
-  freshness window before trusting `sentAt`, and a hub that offers one must say so in its
-  description rather than leave it to the spec.
+  received — not proof about a deposit made now. The mitigation is not a receiver-side freshness
+  window (decision 0005): a window short enough to bound revocation silently refuses honest mail
+  whenever a bridge has been down longer than it, and a window long enough to preserve
+  store-and-forward bounds nothing. Instead a hub **MUST refuse a deposit from a sender whose key
+  is not valid at the instant of the deposit** — revoked, superseded, expired or not yet valid —
+  answering 403 with a distinct body naming the sender's key rather than the uniform refusal,
+  since that answer describes the depositor's own key and never whether a recipient exists.
+  Verification at `sentAt` is unchanged, so mail deposited before a revocation remains deliverable
+  after it. A receiver that still needs a freshness bound on top of this applies its own, and a
+  hub that offers one must say so in its description rather than leave it to the spec.
 - **Publication:** the public key is registered with the hub, which pins it and serves it over TLS.
   Peers verify the **hub's signature on the registry entry** — in Phase 3, when the registry is
   published. Today a registry is handed over out of band and trusted because of the channel that
