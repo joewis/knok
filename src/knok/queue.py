@@ -33,6 +33,13 @@ make that promise survive a crash:
   fan-out is the hub's job, and silently keying a two-recipient message to
   its first addressee would deliver it nowhere else. ``get`` returns the
   envelope unchanged — it never rewrites ``to``.
+* **The local queue is capped.** ``put`` refuses past 10,000 envelopes or
+  256 MiB per agent — HUB.md's mailbox numbers, applied locally (issue
+  #116) — because the hub copy is deleted on ack and an undrained local
+  queue would otherwise grow without limit. A refusal raises
+  :class:`QueueFullError`, a ``ValueError`` the bridge already treats as
+  "leave it at the hub"; a duplicate is still answered ``"duplicate"`` at
+  cap. :meth:`Queue.usage` reports the count and the bytes.
 * **Poison messages dead-letter.** Five delivery attempts with backoff
   (1m, 5m, 30m, 2h, 12h), then the message moves to a dead-letter store
   visible to the owner via :meth:`Queue.dead_letter`. Nothing retries
@@ -74,8 +81,9 @@ from typing import Any
 from . import envelope as _envelope
 from .identity import validate_agent_id
 
-__all__ = ["Queue", "QueueLockedError", "BACKOFF_SECONDS", "DEFAULT_CONTEXT_TTL",
-           "SEEN_RETENTION"]
+__all__ = ["Queue", "QueueLockedError", "QueueFullError", "BACKOFF_SECONDS",
+           "DEFAULT_CONTEXT_TTL", "SEEN_RETENTION", "MAX_QUEUE_MESSAGES",
+           "MAX_QUEUE_BYTES"]
 
 #: Delivery attempts, then dead-letter (§6). Backoff between attempts.
 BACKOFF_SECONDS = (60, 300, 1800, 7200, 43200)
@@ -91,6 +99,13 @@ SEEN_RETENTION = timedelta(days=30)
 #: bridge confirms only after the frame is fsynced into its own log, so a crash in between must
 #: not lose it — and the retry must be long enough not to spin inside one drain loop.
 NOTICE_BACKOFF_SECONDS = 60
+#: The local queue is bounded by the same numbers as the hub mailbox (HUB.md, "Mailbox cap"):
+#: 10,000 envelopes or 256 MiB per agent, whichever comes first (issue #116). The hub cap alone
+#: does not bound the recipient: once the bridge acks the hub the hub copy is gone and its
+#: capacity is freed, so an undrained local queue would grow without limit. ``put`` refuses past
+#: these bounds instead of storing.
+MAX_QUEUE_MESSAGES = 10_000
+MAX_QUEUE_BYTES = 256 * 1024 * 1024
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -156,6 +171,15 @@ class QueueLockedError(RuntimeError):
     """A second process tried to open a queue that is already owned."""
 
 
+class QueueFullError(ValueError):
+    """``put`` refused a message: the local queue is at its cap.
+
+    A ``ValueError`` on purpose: the bridge already catches ``ValueError``
+    from ``put`` and leaves the item unacked at the hub, so a refused message
+    is re-offered instead of acked away (issue #116).
+    """
+
+
 def _parse_iso(value: str) -> datetime:
     text = value[:-1] + "+00:00" if value.endswith("Z") else value
     parsed = datetime.fromisoformat(text)
@@ -183,11 +207,18 @@ class Queue:
         path: str | Path,
         agent_id: str,
         context_ttl: timedelta = DEFAULT_CONTEXT_TTL,
+        max_messages: int = MAX_QUEUE_MESSAGES,
+        max_bytes: int = MAX_QUEUE_BYTES,
     ) -> None:
         validate_agent_id(agent_id)
         self.agent_id = agent_id
         self.path = Path(path)
         self.context_ttl = context_ttl
+        # The local cap (issue #116): HUB.md's numbers, overridable per
+        # deployment and per test. A message past either bound is refused by
+        # ``put`` with :class:`QueueFullError`, never stored.
+        self.max_messages = max_messages
+        self.max_bytes = max_bytes
         self._lock = threading.RLock()
         self._closed = False
 
@@ -452,6 +483,20 @@ class Queue:
                 "SELECT 1 FROM seen WHERE message_id = ?", (message_id,)
             ).fetchone() is not None
 
+    def _usage_locked(self) -> tuple[int, int]:
+        """Live messages held and the bytes they occupy. Caller holds the lock.
+
+        Bytes are the stored envelope JSON as bytes — the same
+        ``json.dumps(env, sort_keys=True)`` ``put`` stores, measured with
+        ``LENGTH(CAST(... AS BLOB))`` so multibyte text counts as bytes,
+        not characters.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(envelope_json AS BLOB))), 0)"
+            " FROM messages"
+        ).fetchone()
+        return row[0], row[1]
+
     def put(
         self,
         env: dict[str, Any],
@@ -481,6 +526,12 @@ class Queue:
         the same database this queue owns (the bridge opens ``Threads`` on
         ``queue.db`` for exactly that reason); a table in another file would
         make the word "together" a lie.
+
+        Raises :class:`QueueFullError` when the local queue is at its cap
+        (issue #116): the message is refused, nothing is stored, and no
+        thread state is applied — the caller leaves it at the hub to be
+        re-offered. Duplicates are still answered ``"duplicate"`` at cap,
+        so a re-offered id is acked away rather than refused forever.
         """
         moment = now or datetime.now(timezone.utc)
         if not isinstance(env, dict) or "message" not in env:
@@ -529,6 +580,20 @@ class Queue:
                     (message_id, context_id, _ts(moment)),
                 )
                 return "duplicate"
+            # The local cap (issue #116), checked after the duplicate answers
+            # so a re-offer at cap is still a duplicate: the hub cap alone
+            # does not bound this queue, because the hub copy is deleted on
+            # ack and an undrained local queue would otherwise grow without
+            # limit. Under the lock, with a single owner, the check and the
+            # insert below cannot interleave.
+            count, stored_bytes = self._usage_locked()
+            new_bytes = len(json.dumps(env, sort_keys=True).encode("utf-8"))
+            if count >= self.max_messages or stored_bytes + new_bytes > self.max_bytes:
+                raise QueueFullError(
+                    f"local queue at cap: {count} messages, {stored_bytes} bytes"
+                    f" stored (cap {self.max_messages} messages or"
+                    f" {self.max_bytes} bytes)"
+                )
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
@@ -848,6 +913,13 @@ class Queue:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()
             return row[0]
+
+    def usage(self) -> dict[str, int]:
+        """Live messages held and the bytes they occupy. Read-only; the cap's
+        meter — see :meth:`put` and issue #116."""
+        with self._lock:
+            count, stored_bytes = self._usage_locked()
+            return {"messages": count, "bytes": stored_bytes}
 
     def dead_letter(self) -> list[dict[str, Any]]:
         """List dead-lettered messages, oldest first, for the owner."""
