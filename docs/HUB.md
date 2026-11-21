@@ -104,6 +104,13 @@ advances it.
   envelopes past `expiresAt` and queuing a signed `expired` frame for the **sender**. An envelope
   already expired at deposit is accepted (`202`), dropped immediately, and produces the same frame —
   accepting it and silently discarding it would make the sender's ack a lie.
+- **The lifetime cap bounds the envelope, not our storage.** `expiresAt` may be at most 30 days after
+  the envelope's own `sentAt`, and `sentAt` is asserted by the sender (§4), so the cap is a statement
+  about the envelope the sender signed, not about how long this hub will hold a row for it. A sender
+  that backdates can still set `expiresAt` past the horizon the queue's retention is sized around;
+  that residual is #90, and closing it needs a clock the hub trusts rather than another check on a
+  field the sender writes. Reading this cap as a retention guarantee would be wrong in exactly that
+  case.
 - **Frames are hub-signed and have their own retention.** An `expired` or `dead` frame sits in the
   sender's mailbox under the same 72-hour TTL as mail and counts against the cap; if it cannot be
   queued (sender's box at cap) the hub logs it and the health endpoint reports the drop for that

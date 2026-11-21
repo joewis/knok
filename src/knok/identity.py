@@ -11,6 +11,8 @@ import base64
 import hashlib
 import os
 import re
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,15 +86,36 @@ class Identity:
         return base64.b64encode(raw).decode("ascii")
 
     def save(self, path: str | Path) -> Path:
-        """Write the private key as PEM with mode 0600, refusing to overwrite."""
+        """Write the private key as PEM with mode 0600, refusing to overwrite.
+
+        The key is written to a temporary file in the destination directory,
+        fsynced, then linked into place. A crash mid-write leaves a stray temp
+        file rather than a truncated key at the path the bridge loads, and
+        ``link(2)`` refuses to replace an existing key without the check-then-
+        write race that ``exists()`` alone leaves open.
+        """
         target = Path(path)
         if target.exists():
             raise IdentityError(f"refusing to overwrite existing key {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         pem = self.private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(pem)
+        fd, temp = tempfile.mkstemp(dir=target.parent, prefix=".key-", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(pem)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temp, target)
+            except FileExistsError:
+                raise IdentityError(f"refusing to overwrite existing key {target}") from None
+            _fsync_directory(target.parent)
+        finally:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
         return target
 
 
@@ -103,6 +126,37 @@ def generate(name: str, hub: str) -> Identity:
     return Identity(f"{name}@{hub}", Ed25519PrivateKey.generate())
 
 
+#: Permission bits that must not be set on a private key: group and other.
+_LOOSE_MODE_BITS = 0o077
+
+
+def _refuse_loose_key(path: Path) -> None:
+    """Refuse a private key any other user can read.
+
+    Checked at load rather than only at create: the file may have been copied,
+    restored from a backup, or written by a build that predates this check, and
+    a key another user can read is compromised whoever wrote it.
+    """
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        raise IdentityError(f"cannot stat {path}: {exc}") from exc
+    if mode & _LOOSE_MODE_BITS:
+        raise IdentityError(
+            f"{path} is mode {mode:04o}; a private key must be 0600 (not readable by group or other)"
+        )
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make the link durable: without this the rename survives the process but
+    not necessarily a power loss."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def load(agent_id: str, path: str | Path, expected_fingerprint: str) -> Identity:
     """Load a PKCS8 PEM private key and bind it to an id.
 
@@ -111,7 +165,9 @@ def load(agent_id: str, path: str | Path, expected_fingerprint: str) -> Identity
     Alice. Callers take the fingerprint from the registry, the only party that knows the binding.
     """
     validate_agent_id(agent_id)
-    key = load_pem_private_key(Path(path).read_bytes(), password=None)
+    path = Path(path)
+    _refuse_loose_key(path)
+    key = load_pem_private_key(path.read_bytes(), password=None)
     if not isinstance(key, Ed25519PrivateKey):
         raise IdentityError(f"{path} does not contain an Ed25519 private key")
     loaded = Identity(agent_id, key)

@@ -377,8 +377,14 @@ def test_a_late_arrival_is_not_reported_as_a_duplicate(queue, envelope_factory):
 def test_seen_is_pruned_after_retention_and_live_messages_are_kept(
     tmp_path, envelope_factory
 ):
-    """Dedupe memory must not grow forever, but must never forget a live message (issue #13)."""
-    far = "2027-01-30T05:00:00Z"  # inside the 30-day bound used by the retention window
+    """Dedupe memory must not grow forever, but must never forget a live message (issue #13).
+
+    The horizon is 31 days because the envelope lifetime is capped at 30
+    (SPEC §6), so a message can never still be queued past that: the live half
+    is asserted before the jump, and the forgetting half after it.
+    """
+    # _env dates sentAt an hour before T0, so the 30-day cap lands an hour before T0+30d.
+    far = (T0 + timedelta(days=30) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with Queue(tmp_path / "q.sqlite", OWNER, context_ttl=timedelta(seconds=60)) as q:
         q.put(_env(envelope_factory, seq=0, message={"messageId": "m-gone"},
                    expiresAt=far), T0)
@@ -386,16 +392,23 @@ def test_seen_is_pruned_after_retention_and_live_messages_are_kept(
         q.put(_env(envelope_factory, seq=1, message={"messageId": "m-live"},
                    expiresAt=far), T0)  # still live in the queue
 
-        later = T0 + timedelta(days=31)
-        assert q.expire(later) == []  # nothing expired; the prune runs anyway
-
-        # The old id is forgotten, so a fresh message may reuse it...
-        assert q.put(_env(envelope_factory, seq=5, message={"messageId": "m-gone"},
-                          expiresAt=far), later) == "accepted"
-        # ...while a live message's id is still defended, and re-putting it is a
+        # While the message is live its id is defended, and re-putting it is a
         # clean duplicate rather than a primary-key collision.
-        assert q.put(_env(envelope_factory, seq=6, message={"messageId": "m-live"},
-                          expiresAt=far), later) == "duplicate"
+        assert q.put(_env(envelope_factory, seq=2, message={"messageId": "m-live"},
+                          expiresAt=far), T0) == "duplicate"
+
+        later = T0 + timedelta(days=31)
+        # Past the 30-day cap it expires, and the expiry is framed for its sender.
+        frames = q.expire(later)
+        assert [f["messageId"] for f in frames] == ["m-live"]
+
+        # The acked id is past retention, so a fresh message may reuse it.
+        fresh = {
+            "sentAt": (later - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expiresAt": (later + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        assert q.put(_env(envelope_factory, seq=5, message={"messageId": "m-gone"},
+                          **fresh), later) == "accepted"
 
 
 def test_a_notice_is_re_offered_until_the_bridge_confirms_it(tmp_path, envelope_factory):
