@@ -49,3 +49,48 @@ Nothing in this repository is deployed publicly. The threat model in `docs/SPEC.
 hub is untrusted for confidentiality, trusted for availability; the bridge holds keys; peers are
 authenticated but not trusted. A finding that assumes a hostile hub operator, a hostile kernel, or a
 compromised host is out of scope — say so and stop.
+
+## How the citations were counted
+
+Counts taken 2026-11-21. Every `path:line` and `path:line-line` reference in
+`results/0*.md` was matched with this expression, one match per citation:
+
+```python
+R = re.compile(r"`((?:src|tests|docs)/[^`\s:()]+):(\d+)(?:-(\d+))?`")
+```
+
+That is: a single inline-code span whose whole body is a path under `src/`, `tests/` or `docs/`, a
+colon, a line number, and an optional `-end` with a plain hyphen. The span must close immediately
+after the number or range — prose inside the backticks disqualifies the span.
+
+| File | Citations |
+|---|---|
+| 01 authentication and replay | 89 |
+| 02 hub HTTP | 172 |
+| 03 envelope and canonicalisation | 95 |
+| 04 key handling | 83 |
+| 05 sealed HPKE | 103 |
+| 06 delivery durability | 199 |
+| 07 retry and CLI | 128 |
+| 08 gate and abuse | 240 |
+| 09 logging and notices | 280 |
+| **Total** | **1,389** |
+
+Two counts, and why they agree. The broad count above is 1,389. The narrow count — the same spans,
+kept only if they resolve inside the pinned commit — is also 1,389, because every one of them
+resolves. A number smaller than 1,389 is not a stricter count; it is an undercount.
+
+What neither count includes: 14 spans list several ranges in one span, or use an en dash instead of
+a hyphen (`` `src/knok/queue.py:508-531, 532-572, 600-610, 704-747` ``,
+`` `src/knok/bridge.py:831–849` ``). They carry 26 ranges between them, so counting every individual
+range rather than every span gives 1,415. The 1,389 figure counts spans, not ranges.
+
+Resolution. For each of the 1,389 citations, `git show 828c9791:<path>` succeeds and the range
+satisfies `1 <= start <= end <= <line count of that file at that commit>`. All 1,389 pass. Review 01
+pins itself to `393197d4` rather than `828c9791`; its 89 citations resolve at both.
+
+The pin is not current main, and these reviews do not describe current main. `828c9791` is nine
+commits behind `origin/main` as of 2026-11-21 — `ac34d0d`, `6270b5a`, `f202db8` and six others landed
+after it — and 12 of the 47 cited files have changed since. The line numbers are true of the pinned
+tree only. To check a citation against today's `main`, resolve it at `828c9791` first: a line that
+has moved is drift, not a bad citation.
