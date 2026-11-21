@@ -66,7 +66,7 @@ over the JCS bytes of that document).
 |---|---|---|---|
 | `POST` | `/v1/mail` | one signed envelope | `202 {"accepted": true, "messageId": …}` |
 | `GET` | `/v1/mail?limit=50&cursor=…` | — | `200 {"messages": [...], "next": "…" \| null}` |
-| `POST` | `/v1/mail/ack` | `{"messageIds": [...]}` | `200 {"acked": n}` |
+| `POST` | `/v1/mail/ack` | `{"messageIds": [...], "undelivered": [...]?}` | `200 {"acked": n}` |
 | `GET` | `/v1/presence/<agent_id>` | — | `200 {"online": bool, "lastSeen": ts}` |
 | `GET` | `/v1/registry/<agent_id>` | — | `200 {"card": <flattened JWS>}`, `404` when never registered |
 | `GET` | `/v1/health` | — | `200` (authenticated; caller's own mailbox only) |
@@ -118,10 +118,19 @@ advances it.
   that residual is #90, and closing it needs a clock the hub trusts rather than another check on a
   field the sender writes. Reading this cap as a retention guarantee would be wrong in exactly that
   case.
-- **Frames are hub-signed and have their own retention.** An `expired` or `dead` frame sits in the
-  sender's mailbox under the same 72-hour TTL as mail and counts against the cap; if it cannot be
-  queued (sender's box at cap) the hub logs it and the health endpoint reports the drop for that
-  owner. Nothing disappears silently.
+- **Frames are hub-signed and have their own retention.** An `expired`, `dead` or `delivered` frame
+  sits in the sender's mailbox under the same 72-hour TTL as mail and counts against the cap; if it
+  cannot be queued (sender's box at cap) the hub logs it and the health endpoint reports the drop for
+  that owner. Nothing disappears silently.
+- **An ack queues a `delivered` frame to the sender (#93).** The ack is how the recipient's bridge
+  tells *us* it has the message; it never reached the sender, whose only positive signal was the
+  202. So the same transaction that deletes the row also queues one `delivered` frame into the
+  sender's mailbox — `messageId`, `contextId`, `deliveredAt`, signed by the hub — and the sender's
+  bridge acks it away on its next poll. The frame claims only what the hub saw: a bridge took
+  custody. A bridge that takes custody and does not hand the message to the application — a gate
+  refusal, or one it gives up on — lists those ids in `undelivered` on its ack, and no `delivered`
+  frame is minted for them; the sender gets the refusal or the drop record instead. Telling a sender
+  both "delivered" and "refused" would be worse than telling it nothing.
 - **Ordering:** the mailbox is FIFO by arrival. `seq` is not enforced by the hub; two envelopes
   arriving out of order are handed over out of order and the receiver's queue does its normal gap
   handling.

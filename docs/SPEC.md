@@ -327,13 +327,26 @@ ack is the sender's entire definition of "delivered" and its licence to drop its
 unauthenticated ack is a forgery primitive any hub on the path could use. The ack is issued once the
 message is fsynced to the receiving bridge's queue — **not** when the agent has processed it — so a
 slow agent never blocks the queue, and per-context FIFO survives because the bridge, not the agent,
-owns ordering. The ack is the receiving bridge's commitment and the hub's licence to delete its copy. It is **not**
-delivered to the sender: `Hub.ack` deletes the row and answers the acking bridge, so what a sender
-knows is that the hub accepted the envelope (202) and, if nothing ever comes of it, that the hub
-queued an `expired` frame at the end of the TTL. Silence therefore means *unknown*, never
-"delivered" and never "refused" — a peer may be offline for hours and collect the message on its
-next poll. Issue #93 tracks whether that stays the contract or whether the hub should queue a
-`delivered` frame; until it is decided, no sender may act on silence as if it were a signal.
+owns ordering. The ack is the receiving bridge's commitment and the hub's licence to delete its copy.
+It is still **not** the sender's signal, and it never was: the ack travels between the receiving
+bridge and the hub, and a sender that watched silence could not tell *queued* from *delivered and
+unanswered* from *lost* (#93).
+
+**A sender learns delivery from a hub-signed `delivered` frame.** When an ack lands, the hub queues
+into the **sender's** mailbox one frame carrying `kind: "delivered"`, `messageId`, `contextId`,
+`deliveredAt`, `from` (the hub) and `to` (the sender), signed with the hub's key exactly as an
+`expired` frame is. It is not a `Message`, never enters a thread, and is deleted when the sender's
+bridge acks it, so it costs one row until the sender next polls. A bridge that takes custody of a
+message but does not hand it to the application — a gate refusal, or a message it gives up on
+— names those ids in `undelivered` on its ack, and the hub mints no `delivered` frame for them: the
+sender already receives the refusal or the drop record, and two contradictory answers are worse
+than one.
+
+What a sender may conclude is therefore: **202** means the hub holds it; a **`delivered` frame**
+means a peer's bridge took it; an **`expired` or `dead` frame** means it died; **silence means
+none of those answers has arrived yet**, which on a peer that polls every few minutes is short and
+on a peer that is offline is bounded by the TTL. A sender MUST NOT treat silence as delivery, and
+MUST NOT retry a message merely because no reply has come.
 
 **Every polled item leaves a delivery record.** One row per item is appended to the bridge's
 `delivery.jsonl` — `at`, `messageId`, `outcome`, plus whatever the item carried for `kind`, `from`,

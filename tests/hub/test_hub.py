@@ -735,3 +735,56 @@ def test_a_message_deposited_before_a_revocation_is_delivered_after_it(ns):
 
     messages = fetch_as(ns.url, ns.muse_id)[1]["messages"]
     assert [m["message"]["messageId"] for m in messages] == [live["message"]["messageId"]]
+
+
+def test_an_ack_queues_a_delivered_frame_to_the_sender(ns):
+    """#93: the sender's only positive signal used to be the 202 at deposit.
+
+    The ack is the recipient's commitment *to the hub*; the hub deletes the row and tells nobody
+    upstream. So the hub now queues a signed ``delivered`` frame into the sender's mailbox when
+    the ack lands — silence at the sender stops meaning either "still queued" or "lost".
+    """
+    envelope = build_envelope(ns.carl_id, ns.muse_id.agent_id, context_id="c-delivered")
+    message_id = envelope["message"]["messageId"]
+    assert deposit(ns.url, envelope)[0] == 202
+    assert ack_as(ns.url, ns.muse_id, [message_id])[0] == 200
+
+    frames = fetch_as(ns.url, ns.carl_id)[1]["messages"]
+    assert [f["kind"] for f in frames] == ["delivered"]
+    frame = frames[0]
+    assert frame["messageId"] == message_id
+    assert frame["contextId"] == "c-delivered"
+    assert frame["to"] == [ns.carl_id.agent_id]
+    assert frame["from"] == ns.hub.agent_id
+    assert "deliveredAt" in frame
+    # Signed by the hub's own key, so a peer cannot forge "delivered" for a message it dropped.
+    assert verify_frame(frame, ns.hub.identity.public_key)
+
+
+def test_the_delivered_frame_leaves_the_sender_mailbox_on_ack(ns):
+    """The frame is mail in the sender's box, not a receipt kept forever: acking it drops it."""
+    envelope = build_envelope(ns.carl_id, ns.muse_id.agent_id, context_id="c-gone")
+    message_id = envelope["message"]["messageId"]
+    assert deposit(ns.url, envelope)[0] == 202
+    assert ack_as(ns.url, ns.muse_id, [message_id])[0] == 200
+
+    assert ack_as(ns.url, ns.carl_id, [message_id])[0] == 200
+    assert fetch_as(ns.url, ns.carl_id)[1]["messages"] == []
+
+
+def test_an_ack_that_reports_the_message_undelivered_claims_nothing(ns):
+    """#93: a refused or given-up message is acked, but the sender must not be told it arrived.
+
+    The bridge takes custody and then declines to hand the message to the application, so the hub
+    has to stop offering it. What it must not do is mint the ``delivered`` frame that a successful
+    hand-over mints — the sender already receives the refusal, and two contradictory answers are
+    worse than one.
+    """
+    envelope = build_envelope(ns.carl_id, ns.muse_id.agent_id, context_id="c-refused")
+    message_id = envelope["message"]["messageId"]
+    assert deposit(ns.url, envelope)[0] == 202
+
+    status, _ = ack_as(ns.url, ns.muse_id, [message_id], undelivered=[message_id])
+    assert status == 200
+
+    assert fetch_as(ns.url, ns.carl_id)[1]["messages"] == []

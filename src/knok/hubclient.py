@@ -158,8 +158,17 @@ class HubClient:
     def fetch(self, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
         return self._signed_json("GET", "/v1/mail", {"limit": limit, "cursor": cursor})
 
-    def ack(self, message_ids: list[str]) -> dict[str, Any]:
-        return self._signed_json("POST", "/v1/mail/ack", None, {"messageIds": message_ids})
+    def ack(self, message_ids: list[str], undelivered: list[str] | None = None) -> dict[str, Any]:
+        """Ack ids out of our mailbox.
+
+        ``undelivered`` names ids the bridge took custody of but did not hand to the
+        application — a gate refusal or a give-up. The hub acks them like any other (it
+        must stop offering them) but does not tell the sender they were delivered.
+        """
+        body: dict[str, Any] = {"messageIds": message_ids}
+        if undelivered:
+            body["undelivered"] = undelivered
+        return self._signed_json("POST", "/v1/mail/ack", None, body)
 
     def presence(self, agent_id: str) -> dict[str, Any]:
         return self._signed_json("GET", "/v1/presence/" + urllib.parse.quote(agent_id, safe=""))

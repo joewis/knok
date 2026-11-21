@@ -359,3 +359,31 @@ def test_a_malformed_notice_is_ignored_but_the_frame_is_acked(deployment):
     )
     assert (outcome, message_id) == ("refused", "r-garbage"), "acked, not re-offered forever"
     assert notices_of(root, "carl") == []
+
+
+def test_a_delivered_message_reaches_the_sender_as_a_frame(deployment):
+    """#93, end to end: the sender's bridge records the hub's `delivered` frame.
+
+    The point of the frame is that a sender polling its own mailbox learns something it could
+    not learn before — that the message left the hub's store — without a reply from the agent.
+    """
+    hub, bridges, root = deployment
+    carl, muse = bridges["carl"], bridges["muse"]
+    context = "c-delivered"
+
+    _, envelope = send(carl, muse.identity.agent_id, "did you get this?", context=context)
+    message_id = envelope["message"]["messageId"]
+    record_attempt(root, "carl", envelope)
+
+    # The recipient's bridge takes custody and acks; the hub then queues the frame to the sender.
+    assert muse.poll_once()["queued"] == 1
+
+    counts = carl.poll_once()
+    assert counts["notices"] == 1
+    delivered = [n for n in notices_of(root, "carl") if n.get("kind") == "delivered"]
+    assert [n["messageId"] for n in delivered] == [message_id]
+    assert delivered[0]["contextId"] == context
+    # The frame is not mail: it never enters the thread and never reaches the application.
+    assert carl.queue.get() is None
+    # And the sender acked it away, so it does not come back.
+    assert carl.client.fetch()["messages"] == []

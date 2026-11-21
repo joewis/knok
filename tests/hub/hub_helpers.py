@@ -160,8 +160,11 @@ def fetch_as(url, identity, *, limit=None, cursor=None, headers=None):
     return status, json.loads(body) if body else None
 
 
-def ack_as(url, identity, message_ids, *, headers=None):
-    body = json.dumps({"messageIds": list(message_ids)}).encode()
+def ack_as(url, identity, message_ids, *, headers=None, undelivered=None):
+    payload: dict[str, object] = {"messageIds": list(message_ids)}
+    if undelivered:
+        payload["undelivered"] = list(undelivered)
+    body = json.dumps(payload).encode()
     signed = headers if headers is not None else signed_headers(
         identity, "POST", "/v1/mail/ack", body
     )

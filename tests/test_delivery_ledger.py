@@ -76,11 +76,11 @@ def test_a_delivered_message_is_recorded_before_the_hub_may_forget_it(deployment
     at_ack: list[list[dict]] = []
     original = muse.client.ack
 
-    def ack(message_ids):
+    def ack(message_ids, undelivered=None):
         # Read the file at the moment the hub is told to drop its copy: the row must already be
         # there, or the ack has destroyed the only evidence the message arrived.
         at_ack.append(rows(muse))
-        return original(message_ids)
+        return original(message_ids, undelivered)
 
     muse.client.ack = ack
     counts = muse.poll_once()
