@@ -3,34 +3,35 @@
 **Review brief:** `docs/review-briefs/02-hub-http.md`  
 **Deployment assessed:** the private tailnet hub described by the project documentation, with a small, operator-controlled registry (currently five agents).  
 **Review type:** static source and test review. The test suite was not executed. No code changes were made.
+**Commit reviewed:** 828c9791da92704ad0c7d71dac26f4d3693aa6f3
 
 ## Bounds table
 
 | Input / resource | Effective limit | Enforcement point | Before or after reading bytes? |
 |---|---|---|---|
-| Request body | 64 KiB (`MAX_ENVELOPE_BYTES`) | `_read_body` in `hub.py` | Content-Length is checked before body read; an oversized body is then read only up to 64 KiB + 1 byte before refusal. A permitted body is read fully before JSON parsing. |
-| Individual header line | Approximately 64 KiB under the CPython `http.server` / `http.client` parser defaults | Standard-library header parser, before handler dispatch | The parser reads each line with a fixed maximum; the bytes are necessarily received into its buffer before the limit is reported. Knok does not configure a smaller limit. |
-| Header count | 100 under the standard-library parser default | Standard-library `http.client.parse_headers` | Enforced while parsing headers, before handler dispatch. Not a Knok-specific setting. |
-| Request target / URL | Approximately 64 KiB as part of the HTTP request-line limit | `BaseHTTPRequestHandler` request parser | Enforced by the standard-library parser before route dispatch. There is no separate Knok URL or query-string limit. |
-| Query field count | No explicit field-count limit; indirectly bounded by the request-line limit | `urllib.parse.parse_qs` in `_fetch` | Parsing happens after the request target is already in memory and after request authentication. `max_num_fields` is not supplied. |
-| Request nonce | No nonce-specific limit; indirectly bounded by the header-line limit | Header parser, then `authenticate` | Header bytes are already read before authentication. No explicit nonce length/format check. See Review 01 F4. |
-| Fetch cursor | No explicit cursor length or numeric range; indirectly bounded by URL/request-line limit | `_decode_cursor` / `_cursor` | Decoded after the target is in memory and after authentication. |
-| Mailbox | 10,000 rows or 256 MiB per recipient, whichever is reached first | `Hub._at_cap` before inserting an envelope/frame | Enforced after the incoming body has been read, parsed and verified. There is no separate global database/mailbox cap. |
+| Request body | 64 KiB (`MAX_ENVELOPE_BYTES`) (`src/knok/transport.py:65`) | `_read_body` in `hub.py` (`src/knok/hub.py:273-285`) | Content-Length is checked before body read (`src/knok/hub.py:275-280`); an oversized body is then read only up to 64 KiB + 1 byte before refusal (`src/knok/hub.py:281-283`). A permitted body is read fully before JSON parsing (`src/knok/hub.py:284`, parse at `src/knok/hub.py:348`). |
+| Individual header line | Approximately 64 KiB under the CPython `http.server` / `http.client` parser defaults | Standard-library header parser, before handler dispatch (`src/knok/hub.py:240`) | The parser reads each line with a fixed maximum; the bytes are necessarily received into its buffer before the limit is reported. Knok does not configure a smaller limit. |
+| Header count | 100 under the standard-library parser default | Standard-library `http.client.parse_headers` | Enforced while parsing headers, before handler dispatch (`src/knok/hub.py:240`). Not a Knok-specific setting. |
+| Request target / URL | Approximately 64 KiB as part of the HTTP request-line limit | `BaseHTTPRequestHandler` request parser (`src/knok/hub.py:240`) | Enforced by the standard-library parser before route dispatch. There is no separate Knok URL or query-string limit (route parsing at `src/knok/hub.py:308-309`). |
+| Query field count | No explicit field-count limit; indirectly bounded by the request-line limit | `urllib.parse.parse_qs` in `_fetch` (`src/knok/hub.py:372`) | Parsing happens after the request target is already in memory and after request authentication (`src/knok/hub.py:366-372`). `max_num_fields` is not supplied (`src/knok/hub.py:372`). |
+| Request nonce | No nonce-specific limit; indirectly bounded by the header-line limit | Header parser, then `authenticate` (`src/knok/hub.py:664-668`) | Header bytes are already read before authentication (`src/knok/hub.py:664-667`). No explicit nonce length/format check (`src/knok/hub.py:668`). See Review 01 F4. |
+| Fetch cursor | No explicit cursor length or numeric range; indirectly bounded by URL/request-line limit | `_decode_cursor` / `_cursor` (`_decode_cursor` at `src/knok/hub.py:171-175`, `_Handler._cursor` at `src/knok/hub.py:399-409`) | Decoded after the target is in memory and after authentication (`src/knok/hub.py:366-368`, `src/knok/hub.py:407`). |
+| Mailbox | 10,000 rows or 256 MiB per recipient, whichever is reached first (`src/knok/hub.py:92-93`) | `Hub._at_cap` before inserting an envelope/frame (`src/knok/hub.py:748-750`, called at `src/knok/hub.py:812`) | Enforced after the incoming body has been read, parsed and verified (read at `src/knok/hub.py:343`, parsed at `src/knok/hub.py:348`, verified at `src/knok/hub.py:786`). There is no separate global database/mailbox cap (`_at_cap` filters by recipient, `src/knok/hub.py:742-745`). |
 
-The body cap and per-recipient mailbox cap are real application-level bounds. Header, request-line and header-count limits come from the Python standard library rather than explicit Knok configuration; they should be treated as runtime-dependent defaults. The mailbox cap bounds each recipient, not total hub storage. The documented ten-agent ceiling is a supported deployment estimate, not an enforced maximum registry size.
+The body cap and per-recipient mailbox cap are real application-level bounds (`src/knok/transport.py:65`, `src/knok/hub.py:748-750`). Header, request-line and header-count limits come from the Python standard library rather than explicit Knok configuration (`src/knok/hub.py:240`); they should be treated as runtime-dependent defaults. The mailbox cap bounds each recipient, not total hub storage (`src/knok/hub.py:742-745`). The documented ten-agent ceiling is a supported deployment estimate, not an enforced maximum registry size.
 
 ## Findings
 
 ### F1 — Slow clients can occupy an unbounded number of request threads
 
 **Severity on the assessed deployment: Low; availability risk if an agent or tailnet peer is compromised.**  
-**Location:** `src/knok/hub.py`, `Hub.start` and `_Handler._read_body`.
+**Location:** `src/knok/hub.py`, `Hub.start` and `_Handler._read_body` (`Hub.start` at `src/knok/hub.py:555-569`, `ThreadingHTTPServer` at `src/knok/hub.py:556`, `daemon_threads = True` at `src/knok/hub.py:557`; `_Handler._read_body` at `src/knok/hub.py:273-285`, blocking `rfile.read(size)` at `src/knok/hub.py:284`).
 
-**Input:** An unauthenticated client opens connections and sends a request line/header slowly, or declares a body within the 64 KiB limit and trickles the body bytes without completing it.
+**Input:** An unauthenticated client opens connections and sends a request line/header slowly, or declares a body within the 64 KiB limit (`src/knok/transport.py:65`) and trickles the body bytes without completing it.
 
-The server is a `ThreadingHTTPServer`; each accepted connection is handled in its own daemon thread. The hub does not set a socket read timeout on accepted sockets and does not impose an application-level cap on concurrent request threads. `_read_body` performs a blocking read for the declared length. The 64 KiB cap limits the total body size, not the time taken to deliver it. Header parsing also occurs before the handler can apply any application policy.
+The server is a `ThreadingHTTPServer`; each accepted connection is handled in its own daemon thread (`src/knok/hub.py:556-557`). The hub does not set a socket read timeout on accepted sockets and does not impose an application-level cap on concurrent request threads (`Hub.start` at `src/knok/hub.py:555-569`: no socket timeout and no concurrency setting). `_read_body` performs a blocking read for the declared length (`src/knok/hub.py:284`). The 64 KiB cap limits the total body size, not the time taken to deliver it (`src/knok/transport.py:65`, `src/knok/hub.py:280-283`). Header parsing also occurs before the handler can apply any application policy (`src/knok/hub.py:240`, `src/knok/hub.py:298`).
 
-**Consequence / reachability:** A client does not need valid Knok credentials to consume a handler thread. Enough slow connections can exhaust threads and associated file descriptors/memory, leaving legitimate agents unable to make progress. The accept loop is not synchronously blocked by one slow body—the server is threaded—but the worker population is not bounded.
+**Consequence / reachability:** A client does not need valid Knok credentials to consume a handler thread. Enough slow connections can exhaust threads and associated file descriptors/memory, leaving legitimate agents unable to make progress. The accept loop is not synchronously blocked by one slow body—the server is threaded—but the worker population is not bounded (`src/knok/hub.py:556-557`).
 
 **Spec status:** The current private-hub contract does not define a socket timeout or concurrency limit. This is an availability gap in the implementation, not a failure to enforce a documented timeout.
 
@@ -39,33 +40,33 @@ The server is a `ThreadingHTTPServer`; each accepted connection is handled in it
 ### F2 — HTTP body framing relies on a single Content-Length value and does not reject ambiguous framing
 
 **Severity on the assessed deployment: Low; proxy-dependent request-framing risk.**  
-**Location:** `src/knok/hub.py`, `_Handler._read_body`.
+**Location:** `src/knok/hub.py`, `_Handler._read_body` (`src/knok/hub.py:273-285`; `Content-Length` header read at `src/knok/hub.py:275`, length validation at `src/knok/hub.py:276-283`, blocking read at `src/knok/hub.py:284`, exact-length check at `src/knok/hub.py:285`).
 
 **Inputs and behaviour:**
 
-- **No Content-Length:** treated as length -1 and refused.
-- **Malformed or negative Content-Length:** refused.
-- **Chunked body without Content-Length:** `Transfer-Encoding` is not implemented; the missing length causes refusal. The chunk framing is not decoded.
-- **Content-Length plus Transfer-Encoding:** the handler ignores `Transfer-Encoding` and reads the declared Content-Length bytes.
-- **Duplicate Content-Length:** `self.headers.get("Content-Length")` selects one value (the first with Python's message implementation); the handler does not reject duplicates or compare all values.
-- **Body shorter than declared:** `rfile.read(size)` waits for the requested bytes or connection termination. If fewer bytes arrive, the handler refuses.
-- **Body longer than declared:** only the declared number of bytes is consumed and parsed. Trailing bytes are not checked as part of the body. The handler responds with connection close and the server uses HTTP/1.0, so it does not process a second request on that connection.
-- **Body over 64 KiB:** the handler reads at most 64 KiB + 1 bytes and refuses.
+- **No Content-Length:** treated as length -1 and refused (`length is None` at `src/knok/hub.py:277`; `size < 0` at `src/knok/hub.py:280`).
+- **Malformed or negative Content-Length:** refused (`ValueError` at `src/knok/hub.py:277-279`; negative at `src/knok/hub.py:280`).
+- **Chunked body without Content-Length:** `Transfer-Encoding` is not implemented; the missing length causes refusal. The chunk framing is not decoded (`Content-Length` is the only framing input at `src/knok/hub.py:275`; no chunk decoding in `_read_body`, `src/knok/hub.py:273-285`).
+- **Content-Length plus Transfer-Encoding:** the handler ignores `Transfer-Encoding` and reads the declared Content-Length bytes (`src/knok/hub.py:275`, `src/knok/hub.py:284`).
+- **Duplicate Content-Length:** `self.headers.get("Content-Length")` selects one value (the first with Python's message implementation); the handler does not reject duplicates or compare all values (`src/knok/hub.py:275`).
+- **Body shorter than declared:** `rfile.read(size)` waits for the requested bytes or connection termination. If fewer bytes arrive, the handler refuses (`len(raw) == size` at `src/knok/hub.py:285`).
+- **Body longer than declared:** only the declared number of bytes is consumed and parsed. Trailing bytes are not checked as part of the body. The handler responds with connection close and the server uses HTTP/1.0, so it does not process a second request on that connection (`protocol_version = "HTTP/1.0"` at `src/knok/hub.py:241`; `Connection: close` at `src/knok/hub.py:269`).
+- **Body over 64 KiB:** the handler reads at most 64 KiB + 1 bytes and refuses (`src/knok/hub.py:280-283`).
 
-**Consequence / reachability:** Direct clients cannot use chunked transfer encoding successfully. Duplicate or conflicting framing headers can, however, be interpreted differently by a reverse proxy and the backend. The backend's one-request-per-connection / close behaviour reduces the usual request-smuggling opportunity, and this review did not demonstrate a working desynchronisation exploit. It is still unsafe to rely on intermediaries making the same choice as `headers.get()`.
+**Consequence / reachability:** Direct clients cannot use chunked transfer encoding successfully. Duplicate or conflicting framing headers can, however, be interpreted differently by a reverse proxy and the backend. The backend's one-request-per-connection / close behaviour reduces the usual request-smuggling opportunity (`src/knok/hub.py:241`), and this review did not demonstrate a working desynchronisation exploit. It is still unsafe to rely on intermediaries making the same choice as `headers.get()` (`src/knok/hub.py:275`).
 
-**Spec status:** The contract specifies a 64 KiB message cap, but does not define duplicate Content-Length handling or chunked transfer support. This is a hardening gap, not a missed numeric body limit.
+**Spec status:** The contract specifies a 64 KiB message cap (`src/knok/transport.py:64-65`), but does not define duplicate Content-Length handling or chunked transfer support. This is a hardening gap, not a missed numeric body limit.
 
 **Recommendation:** Explicitly reject duplicate Content-Length and any Transfer-Encoding header; require exactly one valid Content-Length for body-bearing routes. Configure any reverse proxy to reject ambiguous framing too. Add raw-socket tests for duplicate lengths, CL+TE, chunked-only, short bodies and trailing bytes.
 
 ### F3 — A single authenticated ack request can fan out into thousands of serialized SQL statements
 
 **Severity on the assessed deployment: Low to moderate; requires a registered agent able to sign requests.**  
-**Location:** `src/knok/hub.py`, `_Handler._ack` and `Hub.ack`.
+**Location:** `src/knok/hub.py`, `_Handler._ack` and `Hub.ack` (`_Handler._ack` at `src/knok/hub.py:411-432`, list validation at `src/knok/hub.py:427-430`, call at `src/knok/hub.py:431`; `Hub.ack` at `src/knok/hub.py:864-884`, per-element `DELETE` at `src/knok/hub.py:874-879`).
 
-**Input:** A registered agent submits a valid signed `POST /v1/mail/ack` with a body containing a very large `messageIds` list. The body is still within the 64 KiB request-body limit; the list can contain thousands of short strings, including repeated or empty strings.
+**Input:** A registered agent submits a valid signed `POST /v1/mail/ack` with a body containing a very large `messageIds` list. The body is still within the 64 KiB request-body limit (`src/knok/hub.py:280`, `src/knok/transport.py:65`); the list can contain thousands of short strings, including repeated or empty strings.
 
-The handler checks only that `messageIds` is a list and every item is a string. It does not impose a maximum item count, reject empty IDs, or deduplicate the list. `Hub.ack` then starts one transaction and executes one DELETE statement for every list element while holding the hub's shared database lock.
+The handler checks only that `messageIds` is a list and every item is a string (`src/knok/hub.py:427-428`). It does not impose a maximum item count, reject empty IDs, or deduplicate the list (`src/knok/hub.py:427-431`). `Hub.ack` then starts one transaction and executes one DELETE statement for every list element while holding the hub's shared database lock (`self._lock` at `src/knok/hub.py:870`, `BEGIN IMMEDIATE` at `src/knok/hub.py:872`, loop and `DELETE` at `src/knok/hub.py:874-878`).
 
 **Consequence / reachability:** One authenticated but faulty or compromised agent can turn a small bounded request into thousands of SQL operations and hold the lock that serializes all hub database work. Fetches, deposits, health/presence reads, nonce claims and the expiry sweeper can all be delayed behind that work. This is not an unauthenticated attack, but it is a resource-amplification path inside the trusted-agent boundary.
 
@@ -76,15 +77,15 @@ The handler checks only that `messageIds` is a list and every item is a string. 
 ### F4 — Unsupported HTTP methods bypass the hub's shared refusal response
 
 **Severity on the assessed deployment: Low (protocol fingerprinting / inconsistent refusal behaviour).**  
-**Location:** `src/knok/hub.py`, `_Handler` method dispatch; inherited `BaseHTTPRequestHandler` handling for methods without a `do_<METHOD>` implementation.
+**Location:** `src/knok/hub.py`, `_Handler` method dispatch; inherited `BaseHTTPRequestHandler` handling for methods without a `do_<METHOD>` implementation (`_Handler` at `src/knok/hub.py:240`, `do_GET` at `src/knok/hub.py:298`, `do_POST` at `src/knok/hub.py:323`; no `send_error` override in the class).
 
-**Input:** An unauthenticated caller sends a method other than GET or POST, such as PUT, HEAD, OPTIONS or TRACE.
+**Input:** An unauthenticated caller sends a method other than GET or POST (`src/knok/hub.py:298`, `src/knok/hub.py:323`), such as PUT, HEAD, OPTIONS or TRACE.
 
-The handler defines `do_GET` and `do_POST`, but does not override `send_error` or implement a common `do_* ` fallback. Python's base handler therefore responds to an unsupported method with its standard 501 error response (including its standard HTML error body), rather than Knok's shared 403 JSON refusal. Malformed request lines and parser-level header/request-line errors can likewise be rejected by the standard library before Knok dispatches the request.
+The handler defines `do_GET` and `do_POST`, but does not override `send_error` or implement a common `do_* ` fallback (`src/knok/hub.py:298`, `src/knok/hub.py:323`). Python's base handler therefore responds to an unsupported method with its standard 501 error response (including its standard HTML error body), rather than Knok's shared 403 JSON refusal (`_Handler` inherits `http.server.BaseHTTPRequestHandler` at `src/knok/hub.py:240`; `REFUSAL_STATUS = 403` at `src/knok/transport.py:68`). Malformed request lines and parser-level header/request-line errors can likewise be rejected by the standard library before Knok dispatches the request.
 
-**Consequence / reachability:** An unauthenticated caller can distinguish unsupported methods from unknown GET/POST routes and learn that the endpoint is a Python `BaseHTTPRequestHandler`-based service. This is a small information disclosure, not an authentication bypass. POST to a GET-only route and GET to a POST-only route do reach Knok dispatch and receive the shared 403.
+**Consequence / reachability:** An unauthenticated caller can distinguish unsupported methods from unknown GET/POST routes and learn that the endpoint is a Python `BaseHTTPRequestHandler`-based service. This is a small information disclosure, not an authentication bypass. POST to a GET-only route and GET to a POST-only route do reach Knok dispatch and receive the shared 403 (`src/knok/hub.py:320-321`, `src/knok/hub.py:336-337`).
 
-**Spec status:** The shared-refusal contract is written for application authentication/identity failures; it does not clearly specify how unsupported HTTP methods or malformed HTTP syntax should be answered. The implementation is inconsistent with the broad module-docstring claim that no handler path leaks a distinguishable refusal, but not necessarily with the narrower wire contract.
+**Spec status:** The shared-refusal contract is written for application authentication/identity failures; it does not clearly specify how unsupported HTTP methods or malformed HTTP syntax should be answered. The implementation is inconsistent with the broad module-docstring claim that no handler path leaks a distinguishable refusal (`src/knok/hub.py:36-43`), but not necessarily with the narrower wire contract.
 
 **Recommendation:** Decide whether unsupported methods should intentionally return 501/405 or be folded into the shared refusal. If uniformity is intended, override the base error path deliberately and test it. Do not assume malformed HTTP syntax can be made identical to application-level refusals without taking control of the HTTP parser.
 
@@ -92,58 +93,58 @@ The handler defines `do_GET` and `do_POST`, but does not override `send_error` o
 
 ### Routing
 
-- Unknown GET/POST paths are refused with the shared 403.
-- POST to a GET route and GET to a POST route also fall through to the shared 403.
-- A path containing literal `..` is not normalised into another route; it does not map to a filesystem path.
-- Encoded slashes are only unquoted in the suffix of the presence and registry routes. The result is used as an agent-id lookup string, not as a filesystem path. An encoded slash therefore does not create path traversal; it produces a lookup miss for normal agent IDs.
-- Very deep paths do not recurse through directories or filesystem components. They remain a string passed to route matching / lookup, subject to the request-line limit.
-- Query parsing occurs only on the mail-fetch route. The raw request target is authenticated before `parse_qs` is applied (authentication details were covered in Review 01).
+- Unknown GET/POST paths are refused with the shared 403 (`src/knok/hub.py:320-321`, `src/knok/hub.py:336-337`).
+- POST to a GET route and GET to a POST route also fall through to the shared 403 (`src/knok/hub.py:320-321`, `src/knok/hub.py:336-337`).
+- A path containing literal `..` is not normalised into another route; it does not map to a filesystem path (`src/knok/hub.py:308-309`, `src/knok/hub.py:331`).
+- Encoded slashes are only unquoted in the suffix of the presence and registry routes (`src/knok/hub.py:315`, `src/knok/hub.py:318`). The result is used as an agent-id lookup string, not as a filesystem path. An encoded slash therefore does not create path traversal; it produces a lookup miss for normal agent IDs.
+- Very deep paths do not recurse through directories or filesystem components. They remain a string passed to route matching / lookup, subject to the request-line limit (`src/knok/hub.py:308-309`).
+- Query parsing occurs only on the mail-fetch route (`src/knok/hub.py:372`). The raw request target is authenticated before `parse_qs` is applied (`src/knok/hub.py:366-368`) (authentication details were covered in Review 01).
 
 ### Query values and cursors
 
-- `limit` absent: defaults to 50.
-- `limit` blank: `parse_qs` drops blank values by default, so it also behaves as absent and defaults to 50.
-- `limit` repeated with two non-blank values: refused.
-- `limit` non-integer or less than 1: refused.
-- `limit` above 100: clamped to 100.
-- `cursor` absent or blank: treated as 0.
-- Repeated non-blank cursors: refused.
-- A malformed cursor: refused.
-- A negative integer cursor is accepted by `_decode_cursor`; it behaves much like a cursor of 0 because the query selects rows with `id > after`. An extremely large cursor simply yields no rows. Neither case permits reading another agent's mailbox: the SQL query always filters by the authenticated recipient.
-- Cursors are not cryptographically bound to an agent or mailbox. That is not an access-control defect here: they are client-supplied pagination positions, and the database query scopes every page to the authenticated agent. A caller can choose a cursor that skips its own earlier mail, but cannot use it to read another mailbox.
-- `parse_qs` has no explicit `max_num_fields`, but the request-line limit indirectly bounds the total query bytes. Unknown query keys are parsed and then ignored.
+- `limit` absent: defaults to 50 (`src/knok/hub.py:389-390`, `FETCH_DEFAULT_LIMIT = 50` at `src/knok/hub.py:106`).
+- `limit` blank: `parse_qs` drops blank values by default, so it also behaves as absent and defaults to 50 (`parse_qs` at `src/knok/hub.py:372`; `not values` at `src/knok/hub.py:389`).
+- `limit` repeated with two non-blank values: refused (`src/knok/hub.py:387-388`).
+- `limit` non-integer or less than 1: refused (`src/knok/hub.py:391-396`).
+- `limit` above 100: clamped to 100 (`src/knok/hub.py:397`, `FETCH_MAX_LIMIT = 100` at `src/knok/hub.py:107`).
+- `cursor` absent or blank: treated as 0 (`src/knok/hub.py:404-405`).
+- Repeated non-blank cursors: refused (`src/knok/hub.py:402-403`).
+- A malformed cursor: refused (`src/knok/hub.py:406-409`).
+- A negative integer cursor is accepted by `_decode_cursor`; it behaves much like a cursor of 0 because the query selects rows with `id > after` (`_decode_cursor` at `src/knok/hub.py:171-175`; `id > ?` at `src/knok/hub.py:857`). An extremely large cursor simply yields no rows. Neither case permits reading another agent's mailbox: the SQL query always filters by the authenticated recipient (`src/knok/hub.py:856`).
+- Cursors are not cryptographically bound to an agent or mailbox (`_decode_cursor` at `src/knok/hub.py:171-175`). That is not an access-control defect here: they are client-supplied pagination positions, and the database query scopes every page to the authenticated agent (`src/knok/hub.py:856-857`). A caller can choose a cursor that skips its own earlier mail, but cannot use it to read another mailbox.
+- `parse_qs` has no explicit `max_num_fields`, but the request-line limit indirectly bounds the total query bytes (`src/knok/hub.py:372`). Unknown query keys are parsed and then ignored.
 
 ### Error handling and logs
 
-The application GET/POST entry points catch ordinary exceptions and attempt the shared refusal response. No normal route path deliberately returns HTTP 500. A client disconnect during response writing can still cause a write exception; the handler's attempt to send a refusal may also fail, leaving the client with a truncated response or closed connection rather than a clean 403. This is a transport failure, not a meaningful application error response.
+The application GET/POST entry points catch ordinary exceptions and attempt the shared refusal response (`src/knok/hub.py:298-304`, `src/knok/hub.py:323-327`). No normal route path deliberately returns HTTP 500 (catch-all handlers at `src/knok/hub.py:303-304`, `src/knok/hub.py:326-327`). A client disconnect during response writing can still cause a write exception; the handler's attempt to send a refusal may also fail (`self.wfile.write(body)` at `src/knok/hub.py:271`), leaving the client with a truncated response or closed connection rather than a clean 403. This is a transport failure, not a meaningful application error response.
 
-The base HTTP parser can emit its own 400/414/431-class errors before Knok code runs, and unsupported methods produce the 501 noted in F4. `log_message` is overridden to suppress ordinary request logging. The sweeper logs exceptions; the expired-frame capacity warning includes the sender ID and message ID. Those values originate in validated envelope metadata, but the message ID is sender-controlled, so log consumers should still treat it as untrusted text and avoid rendering it as terminal control sequences.
+The base HTTP parser can emit its own 400/414/431-class errors before Knok code runs, and unsupported methods produce the 501 noted in F4. `log_message` is overridden to suppress ordinary request logging (`src/knok/hub.py:244-245`). The sweeper logs exceptions; the expired-frame capacity warning includes the sender ID and message ID (`log.exception` at `src/knok/hub.py:607`; warning at `src/knok/hub.py:973-977`). Those values originate in validated envelope metadata, but the message ID is sender-controlled (`message_id` read from the envelope at `src/knok/hub.py:796`), so log consumers should still treat it as untrusted text and avoid rendering it as terminal control sequences.
 
 ### Database concurrency and configuration
 
-- One SQLite connection is created in `Hub.__init__` with `check_same_thread=False` and a 30-second SQLite busy timeout (`timeout=30.0`).
-- The connection uses WAL journal mode, `synchronous=FULL`, and foreign keys enabled.
-- A process-wide advisory `flock` prevents a second hub process from opening the same store.
-- A single `threading.RLock` serializes access to the shared connection. The HTTP handlers and sweeper use that lock around database operations; nested helper calls are compatible with the re-entrant lock.
-- The sweeper uses the same connection and lock. It cannot concurrently write through a second connection, and the reviewed code does not show a lock-order cycle that would deadlock the request threads against the sweeper.
-- The 30-second SQLite busy timeout is not a request timeout. A request can still wait behind another operation holding the application lock, including the unbounded ack-list loop in F3 or an expiry sweep processing many rows.
+- One SQLite connection is created in `Hub.__init__` (`src/knok/hub.py:491-503`, connection at `src/knok/hub.py:539-541`) with `check_same_thread=False` and a 30-second SQLite busy timeout (`timeout=30.0`).
+- The connection uses WAL journal mode, `synchronous=FULL`, and foreign keys enabled (`src/knok/hub.py:542-544`).
+- A process-wide advisory `flock` prevents a second hub process from opening the same store (`src/knok/hub.py:531-537`).
+- A single `threading.RLock` serializes access to the shared connection. The HTTP handlers and sweeper use that lock around database operations; nested helper calls are compatible with the re-entrant lock (`threading.RLock()` at `src/knok/hub.py:522`; `with self._lock` at `src/knok/hub.py:713`, `src/knok/hub.py:798`, `src/knok/hub.py:854`, `src/knok/hub.py:870`).
+- The sweeper uses the same connection and lock (`src/knok/hub.py:924`). It cannot concurrently write through a second connection, and the reviewed code does not show a lock-order cycle that would deadlock the request threads against the sweeper.
+- The 30-second SQLite busy timeout is not a request timeout. A request can still wait behind another operation holding the application lock, including the unbounded ack-list loop in F3 or an expiry sweep processing many rows (`timeout=30.0` at `src/knok/hub.py:540`; ack loop under the lock at `src/knok/hub.py:870-880`; sweep at `src/knok/hub.py:924-946`).
 
 ### Response integrity and commit ordering
 
-Responses are assembled in memory and written with one `wfile.write(body)` call after status and headers are sent. That is one application-level write, not a guarantee of one atomic network write.
+Responses are assembled in memory and written with one `wfile.write(body)` call after status and headers are sent (`_Handler._send` at `src/knok/hub.py:265-271`; `_over_capacity` at `src/knok/hub.py:252-263`). That is one application-level write, not a guarantee of one atomic network write.
 
-- Deposit commits the mailbox change before sending 202.
-- Ack commits its deletions before sending 200.
-- Request authentication commits the nonce claim before the endpoint response.
-- A process or connection failure during the response can therefore leave the client uncertain even though the state change has already committed. The client must retry with a fresh signed request nonce. Deposit duplicates are handled by the hub's existing live-row deduplication; ack is idempotent. Replaying the exact same signed request is not a valid retry because its nonce has already been claimed (Review 01).
+- Deposit commits the mailbox change before sending 202 (`COMMIT` at `src/knok/hub.py:833`; `_send(202, ...)` at `src/knok/hub.py:361`).
+- Ack commits its deletions before sending 200 (`COMMIT` at `src/knok/hub.py:880`; `_send(200, ...)` at `src/knok/hub.py:432`).
+- Request authentication commits the nonce claim before the endpoint response (`COMMIT` at `src/knok/hub.py:722`).
+- A process or connection failure during the response can therefore leave the client uncertain even though the state change has already committed. The client must retry with a fresh signed request nonce. Deposit duplicates are handled by the hub's existing live-row deduplication; ack is idempotent (`src/knok/hub.py:799-811`; `src/knok/hub.py:864-884`). Replaying the exact same signed request is not a valid retry because its nonce has already been claimed (Review 01).
 
 ### Resource release
 
-The hub owns one SQLite connection and one lock-file descriptor; both are closed in `Hub.stop`. The server socket is closed by `server_close`, and the serving/sweeper threads are joined with finite waits. Request threads are daemon threads and are not individually joined by `stop`; that is another reason to bound request duration. No request-scoped database cursor or temporary file is retained across calls. The broad exception handlers in the request entry points convert application exceptions to refusals; the sweeper catches and logs failures so that a failed sweep does not terminate the loop.
+The hub owns one SQLite connection and one lock-file descriptor; both are closed in `Hub.stop` (`src/knok/hub.py:571-592`; connection at `src/knok/hub.py:587`, lock file at `src/knok/hub.py:592`). The server socket is closed by `server_close`, and the serving/sweeper threads are joined with finite waits (`src/knok/hub.py:573-582`, `join(timeout=5)`). Request threads are daemon threads and are not individually joined by `stop` (`daemon_threads = True` at `src/knok/hub.py:557`); that is another reason to bound request duration. No request-scoped database cursor or temporary file is retained across calls. The broad exception handlers in the request entry points convert application exceptions to refusals; the sweeper catches and logs failures so that a failed sweep does not terminate the loop (`src/knok/hub.py:303-304`, `src/knok/hub.py:326-327`; `src/knok/hub.py:602-607`).
 
 ## Test coverage observed
 
-The hub tests cover normal deposit/fetch/ack, malformed and over-cap deposits, request authentication, cursor paging, mailbox capacity, expiry, restart persistence, and shared application refusal behaviour. They do not appear to exercise:
+The hub tests cover normal deposit/fetch/ack, malformed and over-cap deposits, request authentication, cursor paging, mailbox capacity, expiry, restart persistence, and shared application refusal behaviour. (`tests/hub/test_hub.py:54` deposit/fetch/ack, `tests/hub/test_hub.py:74` deposit refusals, `tests/hub/test_hub.py:237` over-capacity 429, `tests/hub/test_hub.py:138` request auth, `tests/hub/test_hub.py:218` cursor paging, `tests/hub/test_hub.py:262` expiry, `tests/hub/test_hub.py:337` restart persistence, `tests/hub/test_hub.py:422` unknown path 403) They do not appear to exercise:
 
 - slow headers or slow bodies / read-timeout behaviour;
 - duplicate Content-Length, CL+TE, chunked-only, short or trailing request bodies;
@@ -157,7 +158,7 @@ The hub tests cover normal deposit/fetch/ack, malformed and over-cap deposits, r
 
 ## Overall assessment and priorities
 
-The HTTP implementation has sensible basic bounds: a 64 KiB body cap, a per-recipient mailbox cap, bounded fetch pages, and a single SQLite connection protected by a re-entrant lock. Routing does not expose filesystem traversal, and cursors cannot cross mailbox boundaries.
+The HTTP implementation has sensible basic bounds: a 64 KiB body cap, a per-recipient mailbox cap, bounded fetch pages, and a single SQLite connection protected by a re-entrant lock (`src/knok/transport.py:65`; `src/knok/hub.py:92-93`; `src/knok/hub.py:106-107`; `src/knok/hub.py:522`, `src/knok/hub.py:539-541`). Routing does not expose filesystem traversal, and cursors cannot cross mailbox boundaries (`src/knok/hub.py:306-321`; `src/knok/hub.py:856`).
 
 The main gaps are operational rather than cryptographic:
 
