@@ -113,6 +113,10 @@ def test_an_idle_handler_is_closed_by_the_hub(ns, monkeypatch):
     """#126: a client that connects and says nothing must not hold a thread."""
     import knok.hub as hub_module
 
+    # The timeout has to be configured, not inherited: on main _Handler carries
+    # no timeout of its own, and the base class default only applies because
+    # StreamRequestHandler reads the attribute at accept time.
+    assert hub_module._Handler.timeout == hub_module.REQUEST_TIMEOUT_SECONDS
     monkeypatch.setattr(hub_module._Handler, "timeout", 1)
     parsed = urllib.parse.urlparse(ns.url)
     with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
