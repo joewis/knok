@@ -125,6 +125,16 @@ Every authentication or identity failure returns **403** with the same body as
 `knok.transport.REFUSAL_BODY`: no signature, bad signature, unknown agent, replay, bad skew, unknown
 path, `from`/`to` inconsistency.
 
+**Protocol-level failures answer the same way.** A method the hub does not implement (`PUT`, `OPTIONS`,
+`DELETE`) and a request the parser cannot read (malformed request line, duplicated authentication
+header, duplicated `Content-Length`, a `Transfer-Encoding` this hub does not decode) all return the
+same 403 rather than the stdlib 501/400 with an HTML body. The distinction between "not understood"
+and "understood and refused" is information about the hub, and there is one refusal shape precisely
+so that it is not available.
+
+**One ack carries at most 100 ids** — the same number as a full fetch page. A larger list is not a
+batch but a loop the sender is asking the hub to run for it, so it is refused rather than truncated.
+
 **Over-capacity is the exception, and only on a private hub.** When a mailbox is at cap the hub
 answers **429** with a retry hint, because the honest distinction is *retryable* versus *permanent*,
 and a sender that cannot tell them apart either retries a bad signature forever or gives up on a full

@@ -9,8 +9,10 @@ the one deliberate exception to it.
 from __future__ import annotations
 
 import json
+import socket
 import sys
 import time
+import urllib.parse
 from datetime import timedelta
 from pathlib import Path
 
@@ -69,6 +71,89 @@ def test_deposit_fetch_ack_round_trip(ns):
 
     status, page = fetch_as(ns.url, ns.muse_id)
     assert page == {"messages": [], "next": None}
+
+
+def _raw_http(url: str, head: bytes, body: bytes = b"") -> str:
+    """Send a request exactly as written — http.client normalises headers, so it
+    cannot express the duplicates and malformed lines these tests are about."""
+    parsed = urllib.parse.urlparse(url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(head + b"\r\n" + body)
+        return sock.recv(4096).decode("latin-1")
+
+
+def test_the_handler_ceiling_refuses_before_the_thread_exists(ns, monkeypatch):
+    """#126 review: the cap must be exercised by real sockets, not by patching the
+    limit — hold every handler open with a half-sent request, then knock."""
+    import knok.hub as hub_module
+
+    monkeypatch.setattr(hub_module._Handler, "timeout", 10)
+    parsed = urllib.parse.urlparse(ns.url)
+    held = []
+    try:
+        for _ in range(hub_module.MAX_CONCURRENT_REQUESTS):
+            sock = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+            # No blank line: the handler blocks reading headers, holding its slot.
+            sock.sendall(b"GET /v1/health HTTP/1.1\r\nHost: hub\r\n")
+            held.append(sock)
+        time.sleep(0.5)  # let the accept loop hand every socket to a handler
+
+        extra = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        try:
+            extra.settimeout(3)
+            assert b"429" in extra.recv(256)
+        finally:
+            extra.close()
+    finally:
+        for sock in held:
+            sock.close()
+
+
+def test_an_idle_handler_is_closed_by_the_hub(ns, monkeypatch):
+    """#126: a client that connects and says nothing must not hold a thread."""
+    import knok.hub as hub_module
+
+    # The timeout has to be configured, not inherited: on main _Handler carries
+    # no timeout of its own, and the base class default only applies because
+    # StreamRequestHandler reads the attribute at accept time.
+    assert hub_module._Handler.timeout == hub_module.REQUEST_TIMEOUT_SECONDS
+    monkeypatch.setattr(hub_module._Handler, "timeout", 1)
+    parsed = urllib.parse.urlparse(ns.url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.settimeout(5)
+        assert sock.recv(64) == b""  # closed by the handler's own timeout
+
+
+def test_a_slow_client_is_disconnected(ns, monkeypatch):
+    """#103: a handler with no socket timeout lets one client hold a thread for
+    as long as it likes by never finishing its request."""
+    import knok.hub as hub_module
+
+    monkeypatch.setattr(hub_module._Handler, "timeout", 0.2)
+    parsed = urllib.parse.urlparse(ns.url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(b"GET /v1/mail HTTP/1.1\r\nHost: hub\r\n")
+        sock.settimeout(3)
+        assert sock.recv(1024) == b""  # the hub closed the connection
+
+
+def test_an_ack_with_too_many_ids_is_refused(ns):
+    """#105: one ack must not be a request to run an unbounded DELETE loop."""
+    ids = [f"m-{i}" for i in range(101)]
+    status, body = ack_as(ns.url, ns.muse_id, ids)
+    assert status == 403
+    assert body == REFUSAL_JSON
+
+
+def test_an_unimplemented_method_answers_the_shared_refusal(ns):
+    """#106: the inherited 501 (with an HTML body) classified the request."""
+    response = _raw_http(ns.url, b"PUT /v1/mail HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n")
+    assert " 403" in response
+
+
+def test_a_malformed_request_line_answers_the_shared_refusal(ns):
+    response = _raw_http(ns.url, b"NOT-HTTP\r\n\r\n")
+    assert " 403" in response
 
 
 def test_deposit_refusals_share_one_403(ns):
