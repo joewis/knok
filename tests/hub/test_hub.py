@@ -124,6 +124,16 @@ def test_an_idle_handler_is_closed_by_the_hub(ns, monkeypatch):
         assert sock.recv(64) == b""  # closed by the handler's own timeout
 
 
+def test_the_request_floor_is_per_agent(ns):
+    """#128 review: a global floor lets one agent's fast clock — legal inside the
+    skew window — raise the floor for everyone, so a later hub-clock correction
+    refuses senders who did nothing wrong."""
+    at0 = now_dt()
+    assert ns.hub._request_time_is_current(ns.carl_id.agent_id, at0 + timedelta(seconds=700))
+    # carl's floor is now seven hundred seconds ahead; muse has never been seen.
+    assert ns.hub._request_time_is_current(ns.muse_id.agent_id, at0) is True
+
+
 def test_a_backward_clock_step_cannot_revive_a_pruned_nonce(ns):
     """#100: the skew check compares against the hub's clock, so stepping the hub
     back widens what counts as fresh and an already-pruned nonce returns."""

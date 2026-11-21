@@ -788,7 +788,7 @@ class Hub:
             return None
         if abs((moment - at_dt).total_seconds()) > SKEW_SECONDS:
             return None  # bad skew, signed or not
-        if not self._request_time_is_current(at_dt):
+        if not self._request_time_is_current(agent, at_dt):
             return None  # behind the furthest instant this hub has ever accepted
         # ``X-Knok-Agent`` must equal the ``agent`` inside the signed
         # document. The document is rebuilt from this header, so a signed
@@ -818,28 +818,39 @@ class Hub:
         self._note_seen(agent, moment)
         return agent
 
-    def _request_time_is_current(self, at: datetime) -> bool:
+    def _request_time_is_current(self, agent: str, at: datetime) -> bool:
         """False when ``at`` is more than one nonce window behind the furthest
-        instant the hub has ever accepted.
+        instant this *agent* has had accepted.
 
         The skew check compares a request against the hub's clock, so a clock
         step backward widens what counts as fresh: a request whose nonce has
         already been pruned becomes acceptable again. This floor only moves
         forward, which is what makes pruning nonces safe to do at all.
+
+        Per agent, not global (#128 review): an agent whose clock runs fast is
+        perfectly legal inside the skew window, and a global floor would let it
+        drag every other agent's floor forward — so a hub clock correction would
+        then refuse senders who had done nothing wrong, with no diagnostic that
+        pointed at the causer.
+
+        The floor is only rewritten when the new instant leads the stored one by
+        more than a second: a busy agent whose ``at`` values wobble would
+        otherwise pay an fsync per request on top of its nonce insert.
         """
         at_ts = _ts(at)
+        key = f"request_high_water:{agent}"
         with self._lock:
             row = self._conn.execute(
-                "SELECT value FROM meta WHERE key = 'request_high_water'"
+                "SELECT value FROM meta WHERE key = ?", (key,)
             ).fetchone()
             high = row[0] if row else None
             if high is not None and at_ts < high - NONCE_WINDOW_SECONDS:
                 return False
-            if high is None or at_ts > high:
+            if high is None or at_ts > high + 1.0:
                 self._conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('request_high_water', ?)"
+                    "INSERT INTO meta (key, value) VALUES (?, ?)"
                     " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (at_ts,),
+                    (key, at_ts),
                 )
                 self._conn.commit()
             return True
