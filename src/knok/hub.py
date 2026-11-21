@@ -185,6 +185,20 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _header_values(headers: Any, name: str) -> list[str] | None:
+    """Every value the request carried for ``name``.
+
+    Returns None when ``headers`` is a plain mapping (unit tests, internal
+    callers) because such a mapping cannot report duplicates at all — which is
+    precisely why this helper exists: ``.get()`` answers with the first value
+    and silently drops the rest.
+    """
+    get_all = getattr(headers, "get_all", None)
+    if get_all is None:
+        return None
+    return get_all(name)
+
+
 def _iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -374,6 +388,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _read_body(self) -> bytes | None:
         """Read exactly Content-Length bytes, capped at 64 KiB. None refuses."""
+        lengths = _header_values(self.headers, "Content-Length")
+        if lengths is not None and len(lengths) > 1:
+            return None
+        if self.headers.get("Transfer-Encoding") is not None:
+            return None
         length = self.headers.get("Content-Length")
         try:
             size = int(length) if length is not None else -1
@@ -765,6 +784,13 @@ class Hub:
         hash — so the signature covers what the hub is about to act on.
         """
         moment = now or datetime.now(timezone.utc)
+        # A duplicated authentication header is ambiguous rather than merely
+        # redundant: .get() takes the first, so a proxy and the hub can disagree
+        # about which agent signed the request. Refuse instead of choosing.
+        for name in ("X-Knok-Agent", "X-Knok-Nonce", "X-Knok-At", "X-Knok-Signature"):
+            values = _header_values(headers, name)
+            if values is not None and len(values) > 1:
+                return None
         agent = headers.get("X-Knok-Agent")
         nonce = headers.get("X-Knok-Nonce")
         at = headers.get("X-Knok-At")

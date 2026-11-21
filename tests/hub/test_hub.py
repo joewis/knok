@@ -122,6 +122,49 @@ def test_an_idle_handler_is_closed_by_the_hub(ns, monkeypatch):
     with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
         sock.settimeout(5)
         assert sock.recv(64) == b""  # closed by the handler's own timeout
+def test_a_duplicated_authentication_header_is_refused(ns):
+    """#102: .get() returns the first value, so a second X-Knok-Agent is
+    invisible to everything downstream. Ambiguity is refused, not resolved."""
+    signed = signed_headers(ns.carl_id, "GET", "/v1/mail")
+    head = (
+        b"GET /v1/mail HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n"
+        + b"".join(f"{k}: {v}\r\n".encode() for k, v in signed.items())
+        + f"X-Knok-Agent: {ns.muse_id.agent_id}\r\n".encode()
+    )
+    assert " 403" in _raw_http(ns.url, head)
+
+
+def test_a_duplicated_content_length_is_refused(ns):
+    """#104: two lengths let sender and hub disagree about where the body ends.
+
+    The request is correctly signed, so a refusal can only come from the
+    framing check — without it the hub reads the first length and accepts.
+    """
+    envelope = build_envelope(ns.carl_id, ns.muse_id.agent_id)
+    body = json.dumps(envelope).encode()
+    signed = signed_headers(ns.carl_id, "POST", "/v1/mail", body)
+    head = (
+        b"POST /v1/mail HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n"
+        b"Content-Type: application/json\r\n"
+        + b"".join(f"{k}: {v}\r\n".encode() for k, v in signed.items())
+        + f"Content-Length: {len(body)}\r\nContent-Length: {len(body)}\r\n".encode()
+    )
+    assert " 403" in _raw_http(ns.url, head, body)
+
+
+def test_a_transfer_encoding_body_is_refused(ns):
+    """#104: the handler reads Content-Length only, so a chunked body would be
+    parsed as whatever followed the headers."""
+    envelope = build_envelope(ns.carl_id, ns.muse_id.agent_id)
+    body = json.dumps(envelope).encode()
+    signed = signed_headers(ns.carl_id, "POST", "/v1/mail", body)
+    head = (
+        b"POST /v1/mail HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n"
+        b"Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+        + b"".join(f"{k}: {v}\r\n".encode() for k, v in signed.items())
+        + f"Content-Length: {len(body)}\r\n".encode()
+    )
+    assert " 403" in _raw_http(ns.url, head, body)
 
 
 def test_a_slow_client_is_disconnected(ns, monkeypatch):
