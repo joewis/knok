@@ -277,6 +277,13 @@ and the receiver can dedupe; everything else, `contextId` included, is inside `s
 covers the whole envelope, not the plaintext and not the `sealed` field alone. A hub that receives
 form 1 on a sealed-required endpoint refuses it rather than silently downgrading.
 
+**The sealed plaintext is the A2A `Message` object, JCS-encoded (RFC 8785), with no envelope headers
+inside it; HPKE `aad` and `info` are both empty, deliberately.** The Ed25519 signature covers the
+clear header and the ciphertext together and is verified before decryption, so no header binding is
+needed in the HPKE layer — and an empty AAD is a wire format, not a default: a sealed envelope made
+with non-empty `aad` or `info` is not conformant, and a receiver cannot tell a deliberate AAD from a
+corrupted one, so the answer has to be in this section rather than observable from the ciphertext.
+
 **Turn-taking is three separate things, and v0.1 wrongly collapsed them into one `intent` string:**
 
 - **Speech act** is already in A2A: a `Message` with no `Task` and `turn.expectsReply: true` is a
