@@ -430,3 +430,63 @@ def test_confirmed_notices_do_not_block_later_ones(tmp_path, envelope_factory):
         assert gap["kind"] == "gap"
         assert q.confirm_notice(gap["_noticeId"]) is True
         assert q.get(_at(61))["seq"] == 2  # the released message follows the confirmed notice
+
+
+def _late_notice(message_id: str, seq: int = 1) -> dict:
+    return {
+        "kind": "late",
+        "messageId": message_id,
+        "contextId": "c-1",
+        "seq": seq,
+        "from": "carl@bridge.example",
+        "to": OWNER,
+        "detectedAt": "2026-11-18T05:00:00Z",
+    }
+
+
+def test_a_notice_is_not_queued_twice_while_it_is_still_pending(queue):
+    """One live notice per event: offering the same notice twice stores it once
+    (issue #115). A delivered notice does not block a later one for the same event."""
+    queue._queue_notice(_late_notice("m-1"), T0)
+    queue._queue_notice(_late_notice("m-1"), T0)  # same event, offered twice
+
+    first = queue.get(T0)
+    assert first["kind"] == "late" and first["messageId"] == "m-1"
+    # Taken, not confirmed: re-offered after the backoff, same id — not a twin.
+    second = queue.get(T0 + timedelta(seconds=NOTICE_BACKOFF_SECONDS + 1))
+    assert second["_noticeId"] == first["_noticeId"]
+    assert queue.confirm_notice(first["_noticeId"]) is True
+    # No twin left behind: the second offer was dropped, not stored.
+    assert queue.get(T0 + timedelta(seconds=NOTICE_BACKOFF_SECONDS + 1)) is None
+
+    # Delivered does not block: the same event may be noticed again later.
+    queue._queue_notice(_late_notice("m-1"), T0)
+    third = queue.get(T0)
+    assert third["kind"] == "late" and third["_noticeId"] != first["_noticeId"]
+
+
+def test_different_notices_are_each_queued(queue):
+    """Dedupe is per event, not per kind: distinct notices all go out (issue #115)."""
+    queue._queue_notice(_late_notice("m-1"), T0)
+    queue._queue_notice(_late_notice("m-2", seq=2), T0)
+    first = queue.get(T0)
+    assert first["messageId"] == "m-1"
+    assert queue.confirm_notice(first["_noticeId"]) is True
+    second = queue.get(T0)
+    assert second["messageId"] == "m-2"
+
+
+def test_pending_notices_do_not_starve_due_messages(queue, envelope_factory):
+    """A notice backlog delays a due message by at most one notice: notices and
+    messages interleave instead of notices draining first (issue #115)."""
+    queue.put(_env(envelope_factory, message={"messageId": "m-0"}), T0)
+    for i in range(3):
+        queue._queue_notice(_late_notice(f"n-{i}", seq=i), T0)
+
+    first = queue.get(T0)
+    assert first["kind"] == "late"  # the oldest notice still goes first
+    got = queue.get(T0)
+    assert got["message"]["messageId"] == "m-0"  # ...but the message is not starved
+    assert queue.get(T0)["kind"] == "late"
+    assert queue.get(T0)["kind"] == "late"
+    assert queue.get(T0) is None
