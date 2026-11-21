@@ -25,7 +25,9 @@ make that promise survive a crash:
   held messages are released in order with a gap notice. A ``seq`` below
   the last delivered is a duplicate *unless* a gap release skipped it, in
   which case it is a late arrival: delivered out of order with a ``late``
-  notice, never dropped silently (issue #19).
+  notice, never dropped silently (issue #19). One ``seq`` holds one
+  message: a second id reusing a ``seq`` that is still held is a duplicate
+  too (issue #111) — accepting it would strand it once the first is acked.
 * **The queue knows whose mail it is.** ``Queue(path, agent_id)`` is
   bound at open to one owner, validated with
   ``knok.identity.validate_agent_id``. ``put`` refuses an envelope not
@@ -571,7 +573,8 @@ class Queue:
         survives a kill before ack. A ``messageId`` already seen — live,
         acked, expired or dead — is accepted and dropped, never delivered
         twice. A ``seq`` below the last delivered for its stream is dropped
-        the same way. Raises ``ValueError`` on a malformed or already
+        the same way, and so is a second ``messageId`` reusing a ``seq``
+        that is still held in the queue (issue #111). Raises ``ValueError`` on a malformed or already
         expired envelope, on a sealed (form 2) envelope, whose ``contextId``
         is inside ``sealed`` so the stream key cannot be computed before
         decryption, on an envelope not addressed to this queue's owner, and
@@ -635,6 +638,25 @@ class Queue:
                 context_id, sender, recipient, seq
             )
             if seq < next_seq and not late:
+                self._conn.execute(
+                    "INSERT INTO seen (message_id, context_id, first_seen)"
+                    " VALUES (?, ?, ?)",
+                    (message_id, context_id, _ts(moment)),
+                )
+                return "duplicate"
+            if self._conn.execute(
+                "SELECT 1 FROM messages WHERE context_id = ? AND sender = ?"
+                " AND recipient = ? AND seq = ?",
+                (context_id, sender, recipient, seq),
+            ).fetchone():
+                # A second id competing for a seq that is still held — at
+                # ``next_seq`` or held behind a gap — is a duplicate, not a
+                # second row (issue #111). Accepting it would strand it: once
+                # the first is acked ``next_seq`` advances past the seq, and
+                # ``get`` only selects ``seq = next_seq`` or a late arrival,
+                # so the second row could never be delivered. The ``seen``
+                # insert is what makes a re-offer of the refused id a
+                # duplicate too, rather than a resurrection.
                 self._conn.execute(
                     "INSERT INTO seen (message_id, context_id, first_seen)"
                     " VALUES (?, ?, ?)",

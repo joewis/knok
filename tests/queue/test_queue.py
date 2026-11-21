@@ -183,8 +183,10 @@ def test_dead_letter_after_five_attempts(queue, envelope_factory):
 
 
 def test_expire_emits_unsigned_frame(queue, envelope_factory):
+    # ``m-soon`` sits at seq 1 behind ``m-later`` at seq 0: one seq holds one
+    # message (issue #111), so the two cannot share seq 0.
     queue.put(
-        _env(envelope_factory, message={"messageId": "m-soon"},
+        _env(envelope_factory, seq=1, message={"messageId": "m-soon"},
              expiresAt="2026-11-19T05:00:00Z"),
         T0,
     )
@@ -372,6 +374,45 @@ def test_a_late_arrival_is_not_reported_as_a_duplicate(queue, envelope_factory):
         _env(envelope_factory, seq=0, message={"messageId": "m-again"}), T0
     ) == "duplicate"
     assert queue.get(T0) is None
+
+
+def test_a_second_message_reusing_an_in_flight_seq_is_a_duplicate(
+    queue, envelope_factory
+):
+    """Two ids competing for one seq while the first is still queued: the second is a
+    duplicate, not a second row stranded by the first's ack (issue #111)."""
+    assert queue.put(
+        _env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0
+    ) == "accepted"
+    assert queue.put(
+        _env(envelope_factory, seq=0, message={"messageId": "m-1"}), T0
+    ) == "duplicate"
+    assert queue.depth() == 1
+    assert queue.get(T0)["message"]["messageId"] == "m-0"
+    assert queue.ack("m-0", T0) is True
+    assert queue.get(T0) is None  # nothing stranded behind the acked seq
+    # The refused id stays in ``seen``: a re-offer is still a duplicate.
+    assert queue.put(
+        _env(envelope_factory, seq=0, message={"messageId": "m-1"}), T0
+    ) == "duplicate"
+
+
+def test_a_second_message_reusing_a_held_seq_is_a_duplicate(
+    queue, envelope_factory
+):
+    """The same competition one seq ahead: a second id at a held future seq is a
+    duplicate too (issue #111)."""
+    assert queue.put(
+        _env(envelope_factory, seq=1, message={"messageId": "m-1"}), T0
+    ) == "accepted"
+    assert queue.put(
+        _env(envelope_factory, seq=1, message={"messageId": "m-1b"}), T0
+    ) == "duplicate"
+    assert queue.depth() == 1
+    queue.put(_env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0)
+    assert queue.get(T0)["seq"] == 0
+    queue.ack("m-0", T0)
+    assert queue.get(T0)["message"]["messageId"] == "m-1"
 
 
 def test_seen_is_pruned_after_retention_and_live_messages_are_kept(
