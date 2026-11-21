@@ -1,11 +1,12 @@
 """The adapter's retry policy: which failures are worth repeating, and when (#48).
 
-The wire half (#56) replays a stored envelope verbatim and the read half (#64) reports which
-messages died, but neither says *when* a retry is the right move. This is that policy: a rate
-limit is transient, so a replay after the window clears should succeed; a policy refusal, a
-thread refusal, a malformed message, an expiry and a dead letter will not change by waiting, so
-repeating them is noise. The policy reads the notice, the stored attempt and the retry ledger,
-and says retry, waiting or terminal — never a fresh contextId, never beyond the budget.
+The wire half (#56) mints a new envelope for a stored attempt and the read half (#64)
+reports which messages died, but neither says *when* a retry is the right move. This is that
+policy: a rate limit is transient, so a retry after the window clears should succeed; a
+policy refusal, a thread refusal, a malformed message, an expiry and a dead letter will not
+change by waiting, so repeating them is noise. The policy reads the notice, the stored
+attempt and the retry ledger, and says retry, waiting or terminal — never a fresh contextId,
+never beyond the budget.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from knok.retry import (
     resolved_record,
     retry_count,
     terminal_decided,
+    terminal_record,
 )
 
 from test_phase2 import DOMAIN, deployment
@@ -409,11 +411,12 @@ def carl_env(monkeypatch, deployment):
 
 
 def test_a_rate_limit_refusal_is_retried_when_the_window_clears(carl_env, capsys):
-    """End to end: a refused/limits notice, a due retry, one replayed envelope, one thread.
+    """End to end: a refused/limits notice, a due retry, one new envelope, one thread.
 
     The first attempt is deposited and acked away (it never reached the peer, the state #48
-    describes); the bridge records the rate-limit refusal; ``knok retry`` replays the stored
-    envelope verbatim, and the peer receives the message in the thread the first attempt opened.
+    describes); the bridge records the rate-limit refusal; ``knok retry`` mints a new
+    envelope for the stored attempt — same thread, same seq, ``retryOf`` naming the first —
+    and the peer receives the message in the thread the first attempt opened.
     """
     hub, bridges, root = carl_env
     muse = bridges["muse"]
@@ -452,17 +455,27 @@ def test_a_rate_limit_refusal_is_retried_when_the_window_clears(carl_env, capsys
     assert records[1]["status"] == 0
     assert records[1]["delivered"] is True
     assert records[1]["rule"] == "limits"
+    assert records[1]["messageId"] == first["messageId"], (
+        "the outcome record keeps the original id, so resolved_record still matches the notice"
+    )
+    assert records[1]["retriedMessageId"] != first["messageId"], (
+        "the outcome record names the new envelope the retry deposited"
+    )
     assert retry_count(read_retries(state), first["messageId"]) == 1, (
         "the reservation and the outcome are one retry, not two"
     )
 
     assert muse.poll_once()["queued"] == 1
     delivered = muse.queue.get()
-    assert delivered["message"]["messageId"] == first["messageId"]
+    assert delivered["message"]["messageId"] == records[1]["retriedMessageId"]
+    assert delivered["message"]["messageId"] != first["messageId"]
+    assert delivered["message"]["metadata"]["retryOf"] == first["messageId"]
     assert delivered["message"]["contextId"] == first["contextId"]
+    assert delivered["seq"] == 0, "the original seq was never consumed, so the retry reuses it"
 
     attempts = [json.loads(line) for line in (state / SENT_LEDGER).read_text().splitlines()]
-    assert len(attempts) == 1, "a retry is not a new attempt; it must not grow the ledger"
+    assert len(attempts) == 2, "a retry is a new attempt in the same thread; it grows the ledger by one"
+    assert attempts[1]["envelope"]["message"]["messageId"] == records[1]["retriedMessageId"]
 
 
 #: The five HOLD defects (#68): one family — a bookkeeping failure becomes a message failure.
@@ -495,12 +508,57 @@ def test_a_newer_notice_gets_its_own_retries_after_a_resolution():
     assert decision.attempt == 2
 
 
+def test_terminal_record_is_per_notice_not_per_message():
+    """#118: a terminal decision for one notice must not mask a newer notice.
+
+    Terminal is per notice, like resolution: the record matches the notice it was recorded
+    against, by that notice's time. A later notice for the same message finds no terminal
+    record and is decided fresh.
+    """
+    old = notice("m-50", rule="policy")
+    new = notice("m-50", rule="limits", receivedAt=_iso(NOW))
+    retries = [
+        {
+            "messageId": "m-50",
+            "decision": "terminal",
+            "noticeAt": _iso(NOW - timedelta(hours=2)),
+        }
+    ]
+    assert terminal_record(retries, "m-50", notice_time(old)) is not None
+    assert terminal_record(retries, "m-50", notice_time(new)) is None
+    assert terminal_decided(retries, "m-50", notice_time(new)) is False
+    assert terminal_decided(retries, "m-50") is False, (
+        "a notice with no time cannot be matched to a record that has one"
+    )
+
+
+def test_a_terminal_decision_for_an_old_notice_does_not_mask_a_newer_notice(state, capsys):
+    """#118, end to end: a policy refusal is terminal, but a later limits notice is new.
+
+    The first scan records the terminal decision for the policy notice. A second, newer
+    limits notice for the same message is a new failure: the scan must decide it fresh —
+    waiting for its window — not replay the old terminal reason and exit.
+    """
+    record_notice(state, live_notice("m-50", rule="policy"))
+    write_attempt(state, live_envelope("m-50"))
+    assert main(["retry"]) == 0
+    assert "terminal m-50" in capsys.readouterr().out
+    assert len(read_retries(state)) == 1
+
+    record_notice(state, live_notice("m-50", rule="limits", received_hours_ago=0))
+    assert main(["retry", "--json"]) == 0
+    outcome = json.loads(capsys.readouterr().out.strip())
+    assert outcome["decision"] == "waiting", "a newer notice is a new failure, decided fresh"
+    assert outcome["rule"] == "limits"
+    assert len(read_retries(state)) == 1, "a waiting decision is not recorded"
+
+
 def test_a_missing_ledger_is_not_recorded_as_terminal(state, capsys):
     """A notice for a message this agent never sent must not leave a terminal record.
 
-    The decision is terminal (there is nothing to replay) but the ledger holds no attempt, so
+    The decision is terminal (there is nothing to retry) but the ledger holds no attempt, so
     recording it would claim a decision about a message the adapter never sent — and the next
-    scan would replay the stored terminal instead of re-deciding. A missing ledger is not a
+    scan would repeat the stored terminal instead of re-deciding. A missing ledger is not a
     decision; it is an absence.
     """
     record_notice(state, live_notice("m-50"))
@@ -508,7 +566,7 @@ def test_a_missing_ledger_is_not_recorded_as_terminal(state, capsys):
     assert "terminal m-50" in capsys.readouterr().out
     assert not (state / RETRY_LEDGER).exists(), "a missing ledger must not record a decision"
 
-    # The next scan re-decides it instead of replaying a stored terminal.
+    # The next scan re-decides it instead of repeating a stored terminal.
     assert main(["retry"]) == 0
     assert "terminal m-50" in capsys.readouterr().out
     assert not (state / RETRY_LEDGER).exists()
@@ -560,8 +618,13 @@ def test_a_successful_retry_is_resolved_not_repeated(carl_env, capsys, monkeypat
     outcome = json.loads(out.strip())
     assert outcome["decision"] == "retry"
     assert outcome["delivered"] is True
-    assert deposits == [first["messageId"]]
+    assert outcome["messageId"] == first["messageId"]
+    assert len(deposits) == 1, "one retry, one deposit"
+    assert deposits[0] != first["messageId"], "the retry deposits a new envelope"
+    assert outcome["retriedMessageId"] == deposits[0]
     assert muse.poll_once()["queued"] == 1
+    delivered = muse.queue.get()
+    assert delivered["message"]["metadata"]["retryOf"] == first["messageId"]
 
     # The next scan finds the same notice, but the retry already succeeded: resolved, not a
     # second deposit a day later.
@@ -570,7 +633,7 @@ def test_a_successful_retry_is_resolved_not_repeated(carl_env, capsys, monkeypat
     outcome = json.loads(out.strip())
     assert outcome["decision"] == "resolved"
     assert outcome["delivered"] is True
-    assert deposits == [first["messageId"]], "a resolved retry is never deposited again"
+    assert len(deposits) == 1, "a resolved retry is never deposited again"
     assert muse.poll_once()["queued"] == 0
 
 
@@ -606,6 +669,119 @@ def test_a_retry_that_cannot_be_counted_is_not_deposited(carl_env, capsys, monke
         assert main(["retry"]) == 1, "a due retry that cannot be counted is not performed"
     assert deposits == [], "three scans, no deposit: the bound holds when the ledger fails"
     assert muse.poll_once()["queued"] == 0
+
+
+def _due_limits_notice(state, first, days_ago=2):
+    """A refused/limits notice old enough that both retries in the budget are due."""
+    record_notice(
+        state,
+        {
+            "kind": "refused",
+            "from": f"muse@{DOMAIN}",
+            "receivedAt": _iso(_now() - timedelta(days=days_ago)),
+            "messageId": first["messageId"],
+            "contextId": first["contextId"],
+            "rule": "limits",
+        },
+    )
+
+
+def test_two_scans_cannot_spend_one_budget_slot(carl_env, capsys, monkeypatch):
+    """#117: two scans deciding from the same ledger must not reserve the same attempt.
+
+    The second scan's reservation lands between the first scan's decision and its reserve:
+    the reserve re-reads the ledger under its lock, sees the reservation, and takes attempt 2
+    instead of spending attempt 1 twice. Without the re-read both scans reserve attempt 1,
+    the set-based count sees one retry, and the budget has silently spent a slot twice.
+    """
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    muse.client.ack([first["messageId"]])
+    _due_limits_notice(state, first)
+
+    real_state_from_env = cli_module._state_from_env
+
+    def competing_scan():
+        state_, identity = real_state_from_env()
+        # A second scan decided from the same empty ledger and reserved attempt 1 first.
+        assert record_retry(
+            state,
+            {
+                "messageId": first["messageId"],
+                "decision": "reserved",
+                "attempt": 1,
+                "at": _iso(_now()),
+                "noticeAt": _iso(_now() - timedelta(days=2)),
+            },
+        )
+        return state_, identity
+
+    monkeypatch.setattr(cli_module, "_state_from_env", competing_scan)
+
+    assert main(["retry"]) == 0
+    records = read_retries(state)
+    reserved = [record["attempt"] for record in records if record.get("decision") == "reserved"]
+    assert reserved == [1, 2], "the two scans spent two budget slots, not one twice"
+    assert retry_count(records, first["messageId"]) == 2
+    assert muse.poll_once()["queued"] == 1, "only this scan deposited; the other only reserved"
+
+
+def test_two_concurrent_scans_spend_two_budget_slots(carl_env, capsys, monkeypatch):
+    """#117, concurrently: two scans racing the same due retry take attempts 1 and 2.
+
+    Both scans read the ledger before either reserves — the barrier makes that overlap
+    certain, not a matter of scheduling luck — and the reserve's lock serialises them, so
+    the second scan sees the first's reservation and takes the next attempt number.
+    """
+    import threading
+
+    hub, bridges, root = carl_env
+    muse = bridges["muse"]
+    state = root / "agents" / "carl"
+
+    assert main(["send", "--to", f"muse@{DOMAIN}", "--text", "did you get this?"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    muse.client.ack([first["messageId"]])
+    _due_limits_notice(state, first)
+
+    real_read_retries = cli_module.read_retries
+    barrier = threading.Barrier(2, timeout=10)
+    calls = {"n": 0}
+
+    def rendezvous(directory):
+        # The first two reads are the scans' phase-one reads: hold both there, so both
+        # decide from the same empty ledger. Later reads (the reserves' re-reads) pass.
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            barrier.wait()
+        return real_read_retries(directory)
+
+    monkeypatch.setattr(cli_module, "read_retries", rendezvous)
+
+    results = []
+
+    def scan():
+        results.append(main(["retry"]))
+
+    threads = [threading.Thread(target=scan) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads), "both scans finished"
+    assert sorted(results) == [0, 0]
+
+    records = read_retries(state)
+    reserved = sorted(
+        record["attempt"] for record in records if record.get("decision") == "reserved"
+    )
+    assert reserved == [1, 2], "the two scans spent two budget slots, not one twice"
+    assert retry_count(records, first["messageId"]) == 2
+    assert muse.poll_once()["queued"] == 2, "two retries, two distinct envelopes delivered"
 
 
 def test_json_outcomes_carry_a_delivered_field(state, capsys):
@@ -665,11 +841,11 @@ def test_a_failed_send_prints_its_message_id(monkeypatch, tmp_path, identity, ca
     assert printed["messageId"] in read_attempts(tmp_path)
 
 
-def test_retry_send_failed_replays_a_failed_send(carl_env, capsys, monkeypatch):
+def test_retry_send_failed_retries_a_failed_send(carl_env, capsys, monkeypatch):
     """The send-time half has a CLI path: a send that exited 3 is retryable by messageId.
 
     The send ran against a dead hub (exit 3) two minutes ago, so the poison-ladder backoff is
-    already due; the retry replays the stored envelope verbatim against the live hub.
+    already due; the retry mints a new envelope for the stored attempt against the live hub.
     """
     hub, bridges, root = carl_env
     muse = bridges["muse"]
@@ -735,11 +911,11 @@ def test_single_message_exit_codes_tell_the_outcomes_apart(state, capsys):
 
 def test_a_successful_send_failed_retry_is_resolved_not_repeated(carl_env, capsys, monkeypatch):
     """The synthetic notice is dated from the attempt's sentAt, so a retry the hub accepted
-    resolves it: the next --send-failed reports resolved instead of depositing the same
+    resolves it: the next --send-failed reports resolved instead of depositing a new
     envelope again as the next attempt in the ladder.
 
     The failed send is dated ten minutes back, so both ladder rungs are due — without the
-    date, the second call would wait rather than re-deposit, and the defect would hide.
+    date, the second call would wait rather than deposit, and the defect would hide.
     """
     hub, bridges, root = carl_env
     muse = bridges["muse"]
@@ -765,19 +941,20 @@ def test_a_successful_send_failed_retry_is_resolved_not_repeated(carl_env, capsy
     assert main(["retry", "--send-failed", sent["messageId"], "--send-exit", "3"]) == 0
     line = capsys.readouterr().out.strip()
     assert f"retried {sent['messageId']} (attempt 1): accepted" in line
-    assert deposits == [sent["messageId"]]
+    assert len(deposits) == 1, "one retry, one deposit"
+    assert deposits[0] != sent["messageId"], "the retry deposits a new envelope"
     assert muse.poll_once()["queued"] == 1
 
     # The next call finds the same failure, but the retry already succeeded: resolved.
     assert main(["retry", "--send-failed", sent["messageId"], "--send-exit", "3"]) == 0
     line = capsys.readouterr().out.strip()
     assert f"resolved {sent['messageId']}" in line
-    assert deposits == [sent["messageId"]], "a resolved retry is never deposited again"
+    assert len(deposits) == 1, "a resolved retry is never deposited again"
     assert muse.poll_once()["queued"] == 0
 
 
-def test_send_failed_with_exit_2_is_terminal_and_not_replayed(state, capsys, monkeypatch):
-    """A send the hub permanently refused (exit 2) is never replayed: --send-failed must
+def test_send_failed_with_exit_2_is_terminal_and_not_retried(state, capsys, monkeypatch):
+    """A send the hub permanently refused (exit 2) is never retried: --send-failed must
     use the exit code the send actually exited with, not assume 3. And without --send-exit
     the command refuses rather than guessing."""
     write_attempt(state, live_envelope("m-50"))
@@ -786,7 +963,7 @@ def test_send_failed_with_exit_2_is_terminal_and_not_replayed(state, capsys, mon
     out, _err = capsys.readouterr()
     assert "terminal m-50" in out
     assert "permanently refused" in out
-    assert deposits == [], "an exit-2 send is never replayed"
+    assert deposits == [], "an exit-2 send is never retried"
 
     assert main(["retry", "--send-failed", "m-50"]) == 4
     out, err = capsys.readouterr()
@@ -866,10 +1043,12 @@ def test_a_scan_reports_a_performed_retry_the_hub_refused(carl_env, capsys):
             "rule": "limits",
         },
     )
-    # Corrupt the stored envelope's signature so the real hub 403s the replay.
+    # Point the stored attempt at a recipient the hub does not know, so the real hub 403s
+    # the retry. (Corrupting the signature no longer does it: a retry mints a new envelope
+    # and signs it fresh, so a bad signature does not survive into the deposit.)
     path = state / SENT_LEDGER
     record = json.loads(path.read_text().splitlines()[0])
-    record["envelope"]["signature"] = "not-a-signature"
+    record["envelope"]["to"] = ["nobody@bridge.example"]
     path.write_text(json.dumps(record, sort_keys=True) + "\n")
 
     assert main(["retry"]) == 2
@@ -937,7 +1116,8 @@ def test_a_scan_reports_the_worst_performed_status(carl_env, capsys, monkeypatch
     ids = _two_due_retries(carl_env, capsys)
 
     def failing(_client, envelope):
-        if envelope["message"]["messageId"] == ids[0]:
+        # The retry mints a new messageId, so the message is told apart by the id it retries.
+        if envelope["message"].get("metadata", {}).get("retryOf") == ids[0]:
             return 2, {"refusalStatus": 403}
         return 3, None
 
@@ -951,7 +1131,8 @@ def test_a_scan_reports_a_refusal_over_a_delivery(carl_env, capsys, monkeypatch)
     ids = _two_due_retries(carl_env, capsys)
 
     def mixed(_client, envelope):
-        if envelope["message"]["messageId"] == ids[0]:
+        # The retry mints a new messageId, so the message is told apart by the id it retries.
+        if envelope["message"].get("metadata", {}).get("retryOf") == ids[0]:
             return 0, {"accepted": True}
         return 2, {"refusalStatus": 403}
 

@@ -65,12 +65,23 @@ def test_a_retry_reuses_the_thread_it_repeats(carl_env, capsys):
     retried = json.loads(capsys.readouterr().out)
     assert retried["retried"] is True
     assert retried["contextId"] == first["contextId"], "a retry must not start a new thread"
-    assert retried["messageId"] == first["messageId"]
+    assert retried["messageId"] != first["messageId"], (
+        "a retry mints a new messageId; the old one is in seen and would be dropped"
+    )
+    assert retried["retryOf"] == first["messageId"]
 
     assert muse.poll_once()["queued"] == 1
     delivered = muse.queue.get()
     assert delivered["message"]["contextId"] == first["contextId"]
-    assert len(ledger(root)) == 1, "a retry is not a new attempt; it must not grow the ledger"
+    assert delivered["message"]["messageId"] == retried["messageId"]
+    assert delivered["message"]["metadata"]["retryOf"] == first["messageId"]
+    assert delivered["seq"] == ledger(root)[0]["envelope"]["seq"], (
+        "the original seq was never consumed, so the retry reuses it; seq+1 would open "
+        "an unfillable gap"
+    )
+    assert len(ledger(root)) == 2, (
+        "a retry is a new attempt in the same thread; it grows the ledger by one"
+    )
 
 
 def test_a_retry_of_an_unknown_message_is_refused(carl_env, capsys):
@@ -106,7 +117,7 @@ def test_a_failed_deposit_is_still_retryable(carl_env, capsys, monkeypatch):
     assert len(recorded) == 1, "a failed deposit must still be on record"
     message_id = recorded[0]["envelope"]["message"]["messageId"]
 
-    # The hub is reachable again: the retry lands the same envelope, in the same thread.
+    # The hub is reachable again: the retry lands a new envelope in the same thread.
     # The failed send printed its own object first (the messageId the caller needs to retry
     # it), so the retry's object is the last line.
     monkeypatch.setattr("knok.cli.HubClient", real_client)
@@ -114,6 +125,8 @@ def test_a_failed_deposit_is_still_retryable(carl_env, capsys, monkeypatch):
     lines = capsys.readouterr().out.strip().splitlines()
     retried = json.loads(lines[-1])
     assert retried["contextId"] == recorded[0]["envelope"]["message"]["contextId"]
+    assert retried["messageId"] != message_id, "a retry mints a new messageId"
+    assert retried["retryOf"] == message_id
 
 
 def test_the_end_to_end_incident_one_thread_not_two(carl_env, capsys):
@@ -145,12 +158,17 @@ def test_the_end_to_end_incident_one_thread_not_two(carl_env, capsys):
     assert main(["send", "--retry-of", first["messageId"]]) == 0
     retried = json.loads(capsys.readouterr().out)
     assert retried["contextId"] == first["contextId"]
+    assert retried["messageId"] != first["messageId"], "a retry mints a new messageId"
+    assert retried["retryOf"] == first["messageId"]
 
     assert muse.poll_once()["queued"] == 1
     delivered = muse.queue.get()
     assert delivered["message"]["contextId"] == first["contextId"]
-    assert muse.poll_once()["queued"] == 0, "one message, one delivery: the retry is a replay"
+    assert delivered["message"]["messageId"] == retried["messageId"]
+    assert delivered["message"]["metadata"]["retryOf"] == first["messageId"]
+    assert muse.poll_once()["queued"] == 0, "one message, one delivery: the retry is a new envelope"
     assert muse.queue.get() is None, "one conversation, not two"
+    assert len(ledger(root)) == 2, "the retry is a new attempt in the same thread"
 
     # The behaviour this replaces, pinned: a fresh `send` mints a new context, which is exactly how
     # the incident split the conversation in two.
