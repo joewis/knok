@@ -331,7 +331,12 @@ row is the last evidence the message existed. The ledger is append-only and per-
 is a second row rather than an update — what was offered and what was decided is the history. A
 bridge that cannot write the row acks nothing on that page; a full disk must not become the loss the
 ledger exists to record. A poll's counts use the same names, so `duplicate` is never reported as
-`queued`.
+`queued`. The same rule holds for a hub-signed `expired` or `dead` frame: it is acknowledged only
+once its notice is on disk in `notices.jsonl`, and a frame whose notice cannot be written is left
+at the hub. A crash during any JSONL append can leave a torn final line; a bridge truncates an
+incomplete trailing line — one with no terminating newline, or one that is not valid JSON — before
+it appends again and on startup, so a crash loses at most the record being written and never
+corrupts the file.
 
 Poison messages: after 5 attempts with exponential backoff (1m, 5m, 30m, 2h, 12h) the message moves
 to a dead-letter store visible to the recipient's owner. Never retry forever, never drop silently.
