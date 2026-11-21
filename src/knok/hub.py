@@ -115,6 +115,11 @@ REQUEST_TIMEOUT_SECONDS = 15
 #: another thread: the point of the cap is that a slow client cannot spend the
 #: hub's memory, not that it eventually gets served.
 MAX_CONCURRENT_REQUESTS = 64
+#: Nonces one agent may hold at once. The window bounds them in time, not in
+#: number: a busy agent inside the window could otherwise choose the table's
+#: size. Past this the agent's oldest nonces go first — they are the ones
+#: closest to expiry anyway, so the loss is the smallest available.
+MAX_NONCES_PER_AGENT = 5000
 #: Ids one ack may carry. A page is at most FETCH_MAX_LIMIT, so a larger request
 #: is not a batch — it is a loop the sender is asking the hub to run for it.
 MAX_ACK_IDS = FETCH_MAX_LIMIT
@@ -152,6 +157,10 @@ CREATE TABLE IF NOT EXISTS nonces (
     nonce    TEXT NOT NULL,
     seen_at  REAL NOT NULL,
     PRIMARY KEY (agent, nonce)
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS presence (
     agent     TEXT PRIMARY KEY,
@@ -805,6 +814,8 @@ class Hub:
             return None
         if abs((moment - at_dt).total_seconds()) > SKEW_SECONDS:
             return None  # bad skew, signed or not
+        if not self._request_time_is_current(agent, at_dt):
+            return None  # behind the furthest instant this hub has ever accepted
         # ``X-Knok-Agent`` must equal the ``agent`` inside the signed
         # document. The document is rebuilt from this header, so a signed
         # document naming a different agent fails verification here — the
@@ -833,6 +844,43 @@ class Hub:
         self._note_seen(agent, moment)
         return agent
 
+    def _request_time_is_current(self, agent: str, at: datetime) -> bool:
+        """False when ``at`` is more than one nonce window behind the furthest
+        instant this *agent* has had accepted.
+
+        The skew check compares a request against the hub's clock, so a clock
+        step backward widens what counts as fresh: a request whose nonce has
+        already been pruned becomes acceptable again. This floor only moves
+        forward, which is what makes pruning nonces safe to do at all.
+
+        Per agent, not global (#128 review): an agent whose clock runs fast is
+        perfectly legal inside the skew window, and a global floor would let it
+        drag every other agent's floor forward — so a hub clock correction would
+        then refuse senders who had done nothing wrong, with no diagnostic that
+        pointed at the causer.
+
+        The floor is only rewritten when the new instant leads the stored one by
+        more than a second: a busy agent whose ``at`` values wobble would
+        otherwise pay an fsync per request on top of its nonce insert.
+        """
+        at_ts = _ts(at)
+        key = f"request_high_water:{agent}"
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            high = row[0] if row else None
+            if high is not None and at_ts < high - NONCE_WINDOW_SECONDS:
+                return False
+            if high is None or at_ts > high + 1.0:
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, at_ts),
+                )
+                self._conn.commit()
+            return True
+
     def _claim_nonce(self, agent: str, nonce: str, moment: datetime) -> bool:
         """Atomically claim (agent, nonce). False when already claimed (replay).
 
@@ -845,6 +893,16 @@ class Hub:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute("DELETE FROM nonces WHERE seen_at <= ?", (cutoff,))
+                held = self._conn.execute(
+                    "SELECT COUNT(*) FROM nonces WHERE agent = ?", (agent,)
+                ).fetchone()[0]
+                if held >= MAX_NONCES_PER_AGENT:
+                    self._conn.execute(
+                        "DELETE FROM nonces WHERE agent = ? AND nonce IN ("
+                        " SELECT nonce FROM nonces WHERE agent = ?"
+                        " ORDER BY seen_at LIMIT ?)",
+                        (agent, agent, held - MAX_NONCES_PER_AGENT + 1),
+                    )
                 self._conn.execute(
                     "INSERT INTO nonces (agent, nonce, seen_at) VALUES (?, ?, ?)",
                     (agent, nonce, _ts(moment)),

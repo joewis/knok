@@ -167,6 +167,55 @@ def test_a_transfer_encoding_body_is_refused(ns):
     assert " 403" in _raw_http(ns.url, head, body)
 
 
+def test_the_request_floor_is_per_agent(ns):
+    """#128 review: a global floor lets one agent's fast clock — legal inside the
+    skew window — raise the floor for everyone, so a later hub-clock correction
+    refuses senders who did nothing wrong."""
+    at0 = now_dt()
+    assert ns.hub._request_time_is_current(ns.carl_id.agent_id, at0 + timedelta(seconds=700))
+    # carl's floor is now seven hundred seconds ahead; muse has never been seen.
+    assert ns.hub._request_time_is_current(ns.muse_id.agent_id, at0) is True
+
+
+def test_a_backward_clock_step_cannot_revive_a_pruned_nonce(ns):
+    """#100: the skew check compares against the hub's clock, so stepping the hub
+    back widens what counts as fresh and an already-pruned nonce returns."""
+    at0 = now_dt()
+    headers = signed_headers(ns.carl_id, "GET", "/v1/mail", at=iso(at0))
+    assert ns.hub.authenticate(
+        method="GET", target="/v1/mail", headers=headers, body=b"", now=at0
+    ) == ns.carl_id.agent_id
+
+    # Seven hundred seconds later the first nonce is outside the window and gone.
+    at1 = at0 + timedelta(seconds=700)
+    later = signed_headers(ns.carl_id, "GET", "/v1/mail", at=iso(at1))
+    assert ns.hub.authenticate(
+        method="GET", target="/v1/mail", headers=later, body=b"", now=at1
+    ) == ns.carl_id.agent_id
+
+    # Clock rolled back to four minutes after the first request: within skew, and
+    # the nonce is no longer in the table. The high-water floor refuses it.
+    rolled_back = at0 + timedelta(seconds=240)
+    assert ns.hub.authenticate(
+        method="GET", target="/v1/mail", headers=headers, body=b"", now=rolled_back
+    ) is None
+
+
+def test_an_agent_nonce_table_has_a_ceiling(ns, monkeypatch):
+    """#101: the window bounds nonces in time, not in number."""
+    import knok.hub as hub_module
+
+    monkeypatch.setattr(hub_module, "MAX_NONCES_PER_AGENT", 3)
+    moment = now_dt()
+    assert all(ns.hub._claim_nonce(ns.carl_id.agent_id, f"n-{i}", moment) for i in range(5))
+
+    held = [row[0] for row in ns.hub._conn.execute(
+        "SELECT nonce FROM nonces WHERE agent = ? ORDER BY seen_at", (ns.carl_id.agent_id,)
+    ).fetchall()]
+    assert len(held) == 3
+    assert "n-0" not in held and "n-4" in held  # oldest evicted, newest kept
+
+
 def test_a_slow_client_is_disconnected(ns, monkeypatch):
     """#103: a handler with no socket timeout lets one client hold a thread for
     as long as it likes by never finishing its request."""

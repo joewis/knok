@@ -50,6 +50,13 @@ over the JCS bytes of that document).
 - **Nonces are stored durably and accepted once per agent within 10 minutes** — twice the skew
   window, so a request cannot be replayed after the skew check has stopped being able to reject it.
   The nonce table survives restart and is pruned on the same clock.
+- **The hub remembers the furthest instant it has ever accepted.** A request dated more than ten
+  minutes behind that high-water mark is refused whatever the wall clock says. Without it a clock
+  step backward widens the skew window and a request whose nonce has already been pruned becomes
+  acceptable again — the floor only moves forward, which is what makes pruning safe.
+- **One agent may hold at most 5,000 nonces.** The window bounds them in time, not in number, so a
+  busy agent could otherwise choose the table's size. Past the ceiling the agent's own oldest nonces
+  go first; they are the ones closest to expiry anyway, so the loss is the smallest available.
 - **`X-Knok-Agent` must equal the `agent` inside the signed document.** A mismatch is a refusal, not
   something to reconcile.
 
