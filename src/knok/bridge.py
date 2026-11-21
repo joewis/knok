@@ -65,6 +65,26 @@ NOTICE_KEY = "knok.notice"
 #: happened after ``knok send`` had already exited 0, and what ``knok notices`` reads.
 NOTICES = "notices.jsonl"
 
+#: How long the bridge keeps a row in its local audit files (#124). Thirty days aligns with the
+#: spec's own clocks: hub-log metadata is retained 30 days (SPEC §10) and dead letters 30 days
+#: (SPEC §6). The hub's 72-hour mailbox TTL does not prune these bridge-local copies, so the
+#: bridge prunes them itself, on its poll loop.
+LEDGER_RETENTION = timedelta(days=30)
+#: How often the poll loop prunes: retention is 30 days, so once a day of process time is plenty,
+#: and re-reading four files every two-second poll would be pure churn.
+PRUNE_LEDGER_INTERVAL_SECONDS = 24 * 3600
+#: The bridge-owned audit files, and the timestamp keys that date a row in each. A notice row is
+#: dated by whichever of its event times it carries — ``receivedAt`` for a peer refusal,
+#: ``expiredAt``/``deadedAt`` for a hub frame, ``detectedAt``/``releasedAt`` for a gap or late
+#: notice. ``sent.jsonl`` and ``retries.jsonl`` are not here: the CLI and the retry adapter own
+#: them, and their retention is their own decision.
+LEDGER_FILES: dict[str, tuple[str, ...]] = {
+    "delivery.jsonl": ("at",),
+    "refused.jsonl": ("at",),
+    "dropped.jsonl": ("at",),
+    NOTICES: ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at"),
+}
+
 
 def iso(moment: datetime) -> str:
     """The one timestamp format the wire and the logs both use."""
@@ -109,6 +129,94 @@ def safe_log_text(value: Any, *, limit: int = MAX_PROTOCOL_ID_LENGTH) -> str:
     if len(rendered) > limit:
         rendered = rendered[:limit] + "…"
     return rendered
+
+
+def _ledger_row_time(row: dict[str, Any], keys: tuple[str, ...]) -> datetime | None:
+    """The instant a ledger row dates itself by, or ``None`` when it carries no readable time.
+
+    Rows are dated by the timestamp the writer put on them, in the one format the bridge uses
+    (``%Y-%m-%dT%H:%M:%SZ``). A row with no readable timestamp is not datable, and the pruner
+    treats that as "keep": deleting evidence it cannot read would be the silent loss this file
+    exists to prevent.
+    """
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, str):
+            try:
+                return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def prune_ledgers(directory: Path, *, retention: timedelta = LEDGER_RETENTION,
+                  now: datetime | None = None) -> dict[str, int]:
+    """Drop audit rows older than ``retention`` from the bridge's ledger files (#124).
+
+    Every file in ``LEDGER_FILES`` is read, rows past retention are removed, and the file is
+    replaced atomically (temp file, fsync, ``os.replace``, directory fsync), so a crash mid-prune
+    leaves the old file or the new one, never a half-written one. A file that does not exist is
+    not created; a row with no readable timestamp, and a line that is not JSON at all, are kept.
+    A file that cannot be read or replaced is left exactly as found and logged, never deleted.
+
+    Returns ``{filename: rows removed}`` for the files that lost rows. Pruning these files does
+    not securely erase copies elsewhere — SQLite WAL pages and nightly backups keep their own
+    schedule — it bounds what the live audit trail holds.
+    """
+    moment = now or datetime.now(timezone.utc)
+    removed: dict[str, int] = {}
+    for name, keys in LEDGER_FILES.items():
+        path = directory / name
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            log.error("could not read %s to prune it; leaving it alone: %s", name, exc)
+            continue
+        kept: list[str] = []
+        dropped = 0
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                kept.append(line)
+                continue
+            stamp = _ledger_row_time(row, keys) if isinstance(row, dict) else None
+            if stamp is not None and moment - stamp > retention:
+                dropped += 1
+                continue
+            kept.append(line)
+        if not dropped:
+            continue
+        tmp = directory / f".{name}.prune-{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                for line in kept:
+                    handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            try:
+                dir_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        except OSError as exc:
+            log.error("could not prune %s; leaving it alone: %s", name, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        removed[name] = dropped
+        log.info("pruned %d row(s) older than %d days from %s", dropped, retention.days, name)
+    return removed
 
 
 def item_key(item: Any) -> str:
@@ -257,6 +365,9 @@ class Bridge:
         self._attempts: dict[str, int] = {}
         self.poll_seconds = poll_seconds
         self._clock = clock
+        #: Monotonic time of the last ledger prune, or ``None`` before the first poll. Pruning
+        #: runs at most once a day of process time (#124); the field is what makes that true.
+        self._last_prune: float | None = None
 
         state.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(state.directory, 0o700)
@@ -511,6 +622,24 @@ class Bridge:
         )
         return True
 
+    def _prune_ledgers_if_due(self) -> dict[str, int]:
+        """Prune audit rows past retention, at most once a day of process time (#124).
+
+        Called at the top of every poll, before any fetch: the rows pruned are at least 30 days
+        old, so nothing on the page being fetched can be among them, and the prune never runs
+        between a delivery row being written and its ack.
+        """
+        now = self._clock()
+        if self._last_prune is not None and now - self._last_prune < PRUNE_LEDGER_INTERVAL_SECONDS:
+            return {}
+        self._last_prune = now
+        try:
+            return prune_ledgers(self.state.directory)
+        except Exception:
+            # Pruning is housekeeping: a failure here must never stop the poll.
+            log.exception("ledger pruning failed; continuing")
+            return {}
+
     def poll_once(self) -> dict[str, int]:
         """Fetch one page, handle it in order, record it, ack what was handled.
 
@@ -523,6 +652,7 @@ class Bridge:
         point: ``duplicate`` and ``dropped`` are decisions that destroy mail, and once the hub has
         been told to drop it the row is the only evidence the message ever arrived.
         """
+        self._prune_ledgers_if_due()
         self.reload_policy_if_changed()
         self.reload_registry_if_changed()
         try:
