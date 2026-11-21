@@ -301,6 +301,20 @@ def item_key(item: Any) -> str:
     ).hexdigest()[:32]
 
 
+def item_digest(item: Any) -> str:
+    """SHA-256 of the canonical JSON of an item, for correlating a record with a copy elsewhere.
+
+    The digest is the whole item reduced to one hex string: enough for an operator holding the
+    hub-side copy to confirm it is the same item, and nothing an operator without that copy can
+    reconstruct a body from.
+    """
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(
+        json.dumps(item, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass
 class BridgeState:
     """Where an agent keeps everything it owns. No two of these share a directory."""
@@ -1116,10 +1130,30 @@ class Bridge:
         A dropped message is gone from the hub on the strength of this line being on disk. If the
         write fails, acking would destroy the only copy and leave no trace — the one outcome this
         whole path exists to avoid — so the caller leaves the item unacked and tries again.
+
+        The record is metadata only (#122): a dropped item is one the bridge could not verify or
+        handle, so keeping the complete item would retain the body of a message the bridge never
+        accepted — including one from a sender with no trusted card. What is kept is the key, the
+        time, the sender/kind/messageId when the item safely carries them, and a digest of the
+        item, which is what correlates this record with a hub-side copy. The ``delivery.jsonl``
+        ``dropped`` row names the decision; this file names the item, without its content.
         """
         path = self.state.directory / "dropped.jsonl"
-        record = {"key": key, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                  "item": item}
+        record: dict[str, Any] = {
+            "key": key,
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "itemDigest": item_digest(item),
+        }
+        if isinstance(item, dict):
+            for field in ("kind", "from"):
+                if isinstance(item.get(field), str):
+                    record[field] = item[field]
+            message = item.get("message")
+            if isinstance(message, dict):
+                if "kind" not in record and isinstance(message.get("kind"), str):
+                    record["kind"] = message["kind"]
+                if isinstance(message.get("messageId"), str):
+                    record["messageId"] = message["messageId"]
         try:
             self._append_jsonl(path, [record])
             return True
