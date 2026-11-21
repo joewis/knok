@@ -44,7 +44,9 @@ make that promise survive a crash:
 * **Notices are queued, delivered once.** A ``late`` arrival and a ``dead``
   letter each produce one transport frame, handed out by :meth:`Queue.get`
   alongside the gap frame, so the sender learns its message died rather
-  than waiting for a reply that cannot come.
+  than waiting for a reply that cannot come. One live notice is stored per
+  event, and notices interleave with messages — a backlog delays a due
+  message by at most one notice, never starves it (issue #115).
 * **``seen`` is pruned, not grown forever.** Rows older than the 30-day
   ``expiresAt`` bound are deleted by :meth:`Queue.expire`, except those
   whose message is still live (issue #13).
@@ -131,7 +133,12 @@ CREATE TABLE IF NOT EXISTS notices (
     -- anywhere else; it is re-offered after NOTICE_BACKOFF_SECONDS so a crash or a failed
     -- write cannot swallow the frame the sender depends on.
     state        TEXT NOT NULL CHECK (state IN ('pending', 'taken', 'delivered')),
-    available_at REAL NOT NULL
+    available_at REAL NOT NULL,
+    -- Stable identity of the event this notice reports, for dedupe (issue #115). A second
+    -- notice for the same live event is not stored twice; a delivered one does not block
+    -- a later notice for the same event. Rows written before this column existed carry
+    -- '' and are never matched by a real key.
+    dedupe_key   TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS skipped (
     context_id  TEXT NOT NULL,
@@ -170,6 +177,29 @@ def _ts(moment: datetime) -> float:
     return moment.timestamp()
 
 
+def _notice_dedupe_key(notice: dict[str, Any]) -> str:
+    """Stable identity of the event a notice reports (issue #115).
+
+    The key names the event, not the frame: timestamps (``detectedAt``,
+    ``releasedAt``) differ between offers of the same event, so the payload
+    itself can never be the key. A ``late``/``dead`` notice is one per
+    message; a ``gap`` notice is one per released gap. An unknown kind falls
+    back to the exact payload, so it dedupes only on an identical re-offer.
+    """
+    kind = notice.get("kind")
+    if kind == "late":
+        return f"late:{notice.get('messageId')}"
+    if kind == "dead":
+        return f"dead:{notice.get('messageId')}"
+    if kind == "gap":
+        missing = ",".join(str(seq) for seq in notice.get("missing", []))
+        return (
+            f"gap:{notice.get('contextId')}:{notice.get('from')}"
+            f":{notice.get('to')}:{missing}"
+        )
+    return json.dumps(notice, sort_keys=True)
+
+
 class Queue:
     """A durable, single-owner queue of signed envelopes for one agent.
 
@@ -190,6 +220,11 @@ class Queue:
         self.context_ttl = context_ttl
         self._lock = threading.RLock()
         self._closed = False
+        # Notices served since the last message handed out. ``get`` interleaves
+        # the two (issue #115): a notice backlog may delay a due message by at
+        # most one notice, never starve it. In-memory only — a restart resets
+        # the interleave, which only reorders, never loses, either side.
+        self._notices_since_message = 0
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Advisory lock first: one process owns the queue. Held for the
@@ -219,6 +254,14 @@ class Queue:
             if "late" not in columns:
                 self._conn.execute(
                     "ALTER TABLE messages ADD COLUMN late INTEGER NOT NULL DEFAULT 0"
+                )
+            # Same additive migration for the notice dedupe key (issue #115).
+            notice_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(notices)")
+            }
+            if "dedupe_key" not in notice_columns:
+                self._conn.execute(
+                    "ALTER TABLE notices ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''"
                 )
             # Crash recovery: a message handed out but never acked is still
             # owed. It returns to the queue immediately — the crash is not a
@@ -356,12 +399,30 @@ class Queue:
     # -- notices, late arrivals, retention -------------------------------
 
     def _queue_notice(self, notice: dict[str, Any], moment: datetime) -> None:
-        """Record a transport frame the bridge must send. Caller holds the lock."""
+        """Record a transport frame the bridge must send. Caller holds the lock.
+
+        One live notice per event (issue #115): a notice whose dedupe key
+        matches a notice that is still pending or taken is not stored twice,
+        so a sustained source of the same event cannot grow the backlog. A
+        delivered notice does not block a later one for the same event.
+        """
+        dedupe_key = _notice_dedupe_key(notice)
         self._conn.execute(
-            "INSERT INTO notices (kind, payload, created_at, state, available_at)"
-            " VALUES (?, ?, ?, 'pending', ?)",
-            (notice["kind"], json.dumps(notice, sort_keys=True), _ts(moment), _ts(moment)),
+            "INSERT INTO notices (kind, payload, created_at, state, available_at,"
+            " dedupe_key) SELECT ?, ?, ?, 'pending', ?, ?"
+            " WHERE NOT EXISTS (SELECT 1 FROM notices"
+            " WHERE dedupe_key = ? AND state != 'delivered')",
+            (notice["kind"], json.dumps(notice, sort_keys=True), _ts(moment),
+             _ts(moment), dedupe_key, dedupe_key),
         )
+
+    def _notice_due(self, moment: datetime) -> bool:
+        """Whether a notice is due, without taking it. Caller holds the lock."""
+        return self._conn.execute(
+            "SELECT 1 FROM notices WHERE state != 'delivered'"
+            " AND available_at <= ? LIMIT 1",
+            (_ts(moment),),
+        ).fetchone() is not None
 
     def _take_notice(self, moment: datetime) -> dict[str, Any] | None:
         """Hand out the oldest notice that is due, and mark it taken.
@@ -584,7 +645,9 @@ class Queue:
         May also return a gap notice — ``{"kind": "gap", ...}``, a
         transport frame, not a Message — when a stream's gap has outlived
         the context TTL: the held messages are then released in order on
-        subsequent calls. Returns ``None`` when nothing is due.
+        subsequent calls. Notices and messages interleave: the oldest due
+        notice still goes first, but a due message is delayed by at most one
+        notice (issue #115). Returns ``None`` when nothing is due.
         """
         moment = now or datetime.now(timezone.utc)
         with self._lock:
@@ -592,11 +655,6 @@ class Queue:
             # Releasing an expired gap queues its notice rather than returning it, so a crash
             # after the release cannot lose the only signal that messages were skipped.
             self._release_expired_gap(moment)
-            # A pending notice goes out before more mail: the receiver must be told a gap was
-            # released, or that a message it will never see died, before the messages after it.
-            pending = self._take_notice(moment)
-            if pending is not None:
-                return pending
             row = self._conn.execute(
                 "SELECT m.message_id, m.envelope_json FROM messages m"
                 " JOIN streams s ON s.context_id = m.context_id"
@@ -609,6 +667,18 @@ class Queue:
                 "   m.inserted_at, m.message_id LIMIT 1",
                 (_ts(moment),),
             ).fetchone()
+            # A pending notice goes out before more mail: the receiver must be told a gap was
+            # released, or that a message it will never see died, before the messages after it.
+            # But strict priority lets a notice backlog starve mail, so the two interleave
+            # (issue #115): a due message is delayed by at most one notice, and a backlog
+            # still drains freely when no message is due.
+            if self._notice_due(moment) and (
+                row is None or self._notices_since_message == 0
+            ):
+                pending = self._take_notice(moment)
+                if pending is not None:
+                    self._notices_since_message += 1
+                    return pending
             if row is None:
                 return None
             message_id, envelope_json = row
@@ -627,6 +697,7 @@ class Queue:
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
+            self._notices_since_message = 0
             return json.loads(envelope_json)
 
     def _release_expired_gap(self, moment: datetime) -> bool:
