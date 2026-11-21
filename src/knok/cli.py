@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from .agentcard import verify_card
-from .bridge import NOTICES, BridgeState, fingerprint_key, load_cards
+from .bridge import NOTICES, BridgeState, fingerprint_key, load_cards, safe_log_text
 from .envelope import sign
 from .hubclient import HubClient, HubError, HubRefused
 from .identity import b64url_decode, load as load_identity
@@ -409,19 +409,24 @@ def _notice_line(notice: dict[str, Any]) -> str:
 
     Every shape the bridge records must fill every column: a ``?`` here means the reader dropped a
     fact the file holds, which is the one thing a failure record must not do.
+
+    Every value is escaped before interpolation (#123): a peer-controlled messageId, contextId or
+    rule carrying a newline would otherwise make one notice print as several terminal lines,
+    including text resembling a second event. The JSON form (``--json``) needs no escaping — the
+    encoder does it — so only this human-readable line does.
     """
     when = next((str(notice[key]) for key in NOTICE_TIMES if notice.get(key)), "?")
     rule = notice.get("rule")
     kind = str(notice.get("kind") or "?")
     return "  ".join(
         [
-            when,
+            safe_log_text(when),
             # A dead letter's frame carries no sender — the queue knows it, the record does not —
             # so "-" says "not recorded" where "?" would say "the reader failed to find it".
-            str(notice.get("from") or "-"),
-            _notice_subject(notice),
-            f"[{notice.get('contextId') or '-'}]",
-            f"{kind} ({rule})" if rule else kind,
+            safe_log_text(notice.get("from") or "-"),
+            safe_log_text(_notice_subject(notice)),
+            f"[{safe_log_text(notice.get('contextId') or '-')}]",
+            f"{safe_log_text(kind)} ({safe_log_text(rule)})" if rule else safe_log_text(kind),
         ]
     )
 
