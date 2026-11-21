@@ -264,7 +264,7 @@ def verify_envelope(envelope: Any, public_key, now: datetime | None = None) -> t
 
 
 def seal(envelope: dict[str, Any], identity: Identity, recipient_public: bytes,
-         recipient_key_id: str, *, aad: bytes = b"", info: bytes = b"",
+         recipient_key_id: str, *, aad: bytes = hpke.SEALED_AAD, info: bytes = hpke.SEALED_INFO,
          encap_private: bytes | None = None) -> dict[str, Any]:
     """Return the form 2 (sealed) envelope carrying this form 1 envelope's body.
 
@@ -272,6 +272,12 @@ def seal(envelope: dict[str, Any], identity: Identity, recipient_public: bytes,
     the point — an envelope whose context is only inside the ciphertext cannot be threaded by
     anything that routes it. ``messageId`` is copied to the clear header so the receiver can dedupe
     and ack without decrypting, and :func:`unseal` refuses a body whose own id disagrees with it.
+
+    SPEC §6 pins HPKE ``aad`` and ``info`` empty, deliberately: the Ed25519 signature covers the
+    clear header and the ciphertext together and is verified before decryption, so no header
+    binding is needed in the HPKE layer. A sealed envelope made with non-empty ``aad`` or ``info``
+    is not conformant, and this function refuses one — the pin is enforced at the API boundary,
+    not just written in the spec.
 
     The result is signed by ``identity`` over the sealed form, so the signature the sender's peer
     verifies covers the ciphertext and the clear header together. The form 1 input must already be
@@ -285,6 +291,8 @@ def seal(envelope: dict[str, Any], identity: Identity, recipient_public: bytes,
         raise ValueError("seal takes a form 1 envelope; this one is already sealed")
     if envelope["from"] != identity.agent_id:
         raise ValueError("envelope 'from' does not match the sealing identity")
+    if aad != hpke.SEALED_AAD or info != hpke.SEALED_INFO:
+        raise ValueError("sealed envelopes pin HPKE aad and info empty (SPEC §6)")
     message = envelope["message"]
     message_id = message.get("messageId") if isinstance(message, dict) else None
     if not isinstance(message_id, str) or not message_id:
@@ -305,8 +313,8 @@ def seal(envelope: dict[str, Any], identity: Identity, recipient_public: bytes,
     return sign(body, identity)
 
 
-def unseal(envelope: Any, private_key: bytes, *, key_id: str | None = None, aad: bytes = b"",
-           info: bytes = b"") -> tuple[dict[str, Any] | None, str]:
+def unseal(envelope: Any, private_key: bytes, *, key_id: str | None = None, aad: bytes = hpke.SEALED_AAD,
+           info: bytes = hpke.SEALED_INFO) -> tuple[dict[str, Any] | None, str]:
     """Open a sealed envelope into its form 1 form. Returns ``(envelope, "")`` or ``(None, reason)``.
 
     Never raises, for the same reason :func:`verify_envelope` never does: the input is hostile
@@ -319,16 +327,17 @@ def unseal(envelope: Any, private_key: bytes, *, key_id: str | None = None, aad:
     ``messageId`` disagrees with the clear header is malformed, not "the id from inside": the clear
     id is what the hub routed on and what ``seen`` holds.
 
-    ``hpke``'s ``aad`` and ``info`` are empty by default. SPEC §6 does not pin them yet — the
-    signature is the binding between the clear header and the body, and it covers both — so the
-    first implementation to put sealed mail on the wire has to write that sentence before it can
-    interoperate with anything but itself.
+    SPEC §6 pins HPKE ``aad`` and ``info`` empty, and this function refuses a call that passes
+    anything else — the signature is the binding between the clear header and the body, and it
+    covers both, so no header binding is needed in the HPKE layer.
     """
     reason = validate(envelope)
     if reason:
         return None, reason
     if form_of(envelope) != "sealed":
         return None, "envelope is not sealed"
+    if aad != hpke.SEALED_AAD or info != hpke.SEALED_INFO:
+        return None, "sealed envelopes pin HPKE aad and info empty (SPEC §6)"
     sealed = envelope["sealed"]
     if key_id is not None and sealed["recipientKeyId"] != key_id:
         return None, "sealed for a different recipient key"

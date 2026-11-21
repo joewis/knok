@@ -228,3 +228,62 @@ def test_sealing_an_already_sealed_envelope_is_refused(plain_envelope, recipient
 
     with pytest.raises(ValueError, match="already sealed"):
         seal(sealed, carl, raw_public, key_id)
+
+
+# --- SPEC §6 pins the sealed bytes (issue #83) ------------------------------------------
+# Fixed vector: the sealed bytes for one message under fixed keys. The plaintext is the A2A
+# Message JCS-encoded and HPKE aad/info are empty, so these bytes are the wire format — any
+# change to the plaintext, the canonicalisation, the key schedule or the aad/info breaks this
+# test on purpose. The keys are SHA-256 of fixed labels, recorded here so the vector is
+# reproducible from the file alone.
+
+VECTOR_RECIPIENT_PRIVATE = bytes.fromhex(
+    "cc321355d1639ff05db17e4482540d93c784312dd526ade7185947296725f8cc")
+VECTOR_RECIPIENT_PUBLIC = bytes.fromhex(
+    "8ab511ae3443a130ea99527702dbc0fe345cdf6fa142c5951c245841bcf57814")
+VECTOR_EPHEMERAL_PRIVATE = bytes.fromhex(
+    "3f2ab8bdac9c83ffad31283a910cab59a32e9c845515ecf6d2dbc2c3e1967107")
+VECTOR_ENC = "ZoP+fCmgLrtGt8vokdbvWVl14+QHAuSke2e/Ke/vMj4="
+VECTOR_CIPHERTEXT = (
+    "VwUDJmdYZfvnwTpw5HYxtuK6HPM3lZ09Qx4rPDAKsf1haeTy3f2UZPLm5meykYg8IjTBJwuWRCIrOS2Efy0VzjnN59SJn76ZMQka/"
+    "u7tS49M3XsAWZRPLweDLMFzOh2rANcqY7/QTY3ueEYbHiYi+5GHAZfB2uJOSB3kYUer7eoUcgP3F2QJXR2Phdx9GBvdkvLws+"
+    "qXUiq7aCJ74jVkhq+JuLfg3Tz7lg==")
+
+
+def test_the_pinned_aad_and_info_are_named_constants():
+    """The pin is a wire format, not an accident of defaults: the empty aad/info are named."""
+    assert hpke.SEALED_AAD == b""
+    assert hpke.SEALED_INFO == b""
+
+
+def test_sealing_with_a_nonempty_aad_or_info_is_refused(plain_envelope, recipient):
+    """SPEC §6 pins aad and info empty, and the envelope layer enforces it — a caller that asks
+    for anything else gets a refusal, not a non-conformant sealed envelope."""
+    envelope, carl = plain_envelope
+    raw_private, raw_public, key_id = recipient
+
+    with pytest.raises(ValueError, match="aad and info empty"):
+        seal(envelope, carl, raw_public, key_id, aad=b"Count-0")
+    with pytest.raises(ValueError, match="aad and info empty"):
+        seal(envelope, carl, raw_public, key_id, info=b"Count-0")
+
+    sealed = seal(envelope, carl, raw_public, key_id)
+    opened, reason = unseal(sealed, raw_private, key_id=key_id, aad=b"Count-0")
+    assert opened is None and "aad and info empty" in reason
+    opened, reason = unseal(sealed, raw_private, key_id=key_id, info=b"Count-0")
+    assert opened is None and "aad and info empty" in reason
+
+
+def test_the_sealed_bytes_are_fixed_by_spec_section_6(plain_envelope):
+    """The wire format, pinned: same message, same keys, same bytes. A future change to the
+    plaintext, the canonicalisation, the key schedule or the aad/info must break this test."""
+    envelope, carl = plain_envelope
+
+    sealed = seal(envelope, carl, VECTOR_RECIPIENT_PUBLIC, "test-key-id",
+                  encap_private=VECTOR_EPHEMERAL_PRIVATE)
+    assert sealed["sealed"]["hpke"]["enc"] == VECTOR_ENC
+    assert sealed["sealed"]["hpke"]["ciphertext"] == VECTOR_CIPHERTEXT
+
+    opened, reason = unseal(sealed, VECTOR_RECIPIENT_PRIVATE, key_id="test-key-id")
+    assert reason == "" and opened is not None
+    assert opened["message"] == envelope["message"]

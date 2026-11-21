@@ -41,6 +41,14 @@ VERSION_LABEL = b"HPKE-v1"
 SUITE_ID = b"HPKE" + KEM_ID.to_bytes(2, "big") + KDF_ID.to_bytes(2, "big") + AEAD_ID.to_bytes(2, "big")
 KEM_SUITE_ID = b"KEM" + KEM_ID.to_bytes(2, "big")
 
+#: SPEC §6 pins HPKE ``aad`` and ``info`` empty for sealed envelopes, deliberately: the Ed25519
+#: signature covers the clear header and the ciphertext together and is verified before
+#: decryption, so no header binding is needed in the HPKE layer. Empty is a wire format, not a
+#: default — a sealed envelope made with non-empty ``aad`` or ``info`` is not conformant, and
+#: ``envelope.seal`` / ``envelope.unseal`` refuse one.
+SEALED_AAD = b""
+SEALED_INFO = b""
+
 
 class HpkeError(Exception):
     """A sealed body could not be opened. One type, so a caller cannot tell a wrong key from a
@@ -85,7 +93,7 @@ def _kem_shared_secret(dh: bytes, kem_context: bytes) -> bytes:
     return _labeled_expand(eae_prk, KEM_SUITE_ID, b"shared_secret", kem_context, Nsecret)
 
 
-def key_schedule(shared_secret: bytes, info: bytes = b"") -> tuple[bytes, bytes]:
+def key_schedule(shared_secret: bytes, info: bytes = SEALED_INFO) -> tuple[bytes, bytes]:
     """Base-mode key schedule (RFC 9180 §5.1) for one message: ``(key, base_nonce)``.
 
     Single shot means sequence number 0, so the AEAD nonce *is* ``base_nonce`` and there is no
@@ -100,7 +108,7 @@ def key_schedule(shared_secret: bytes, info: bytes = b"") -> tuple[bytes, bytes]
     return key, base_nonce
 
 
-def seal(recipient_public: bytes, plaintext: bytes, *, aad: bytes = b"", info: bytes = b"",
+def seal(recipient_public: bytes, plaintext: bytes, *, aad: bytes = SEALED_AAD, info: bytes = SEALED_INFO,
          encap_private: bytes | None = None) -> tuple[bytes, bytes]:
     """Seal ``plaintext`` to a recipient's raw X25519 key. Returns ``(enc, ciphertext)``.
 
@@ -125,8 +133,8 @@ def seal(recipient_public: bytes, plaintext: bytes, *, aad: bytes = b"", info: b
     return enc, ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
 
 
-def open_sealed(recipient_private: bytes, enc: bytes, ciphertext: bytes, *, aad: bytes = b"",
-                info: bytes = b"") -> bytes:
+def open_sealed(recipient_private: bytes, enc: bytes, ciphertext: bytes, *, aad: bytes = SEALED_AAD,
+                info: bytes = SEALED_INFO) -> bytes:
     """Open a single-shot sealed body. Raises :class:`HpkeError` for anything that is not a valid
     ciphertext under this key — a wrong key, a corrupted body, a truncated ``enc``."""
     if len(recipient_private) != NENC:
