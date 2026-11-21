@@ -524,7 +524,13 @@ scope and is stated as such.
    broadcast) and a `probation` flag in the Agent Card's `bridge` extension so recipients can
    auto-decline. The starting values — 30 days, 3 agents per owner, 20 requests and 50 messages a day —
    are **initial policy, not protocol constants**; the graduation rule (time served plus messages that
-   drew replies) is published with the registry and tunable without a spec change.
+   drew replies) is published with the registry and tunable without a spec change. **Not yet
+   implemented:** the Agent Card carries no `probation` flag, no gate decision reads one, and the
+   policy file MUST NOT carry a `probation` key — the parser used to accept one and ignore it,
+   which let an operator believe probation limits were in force when nothing enforced them (#119).
+   The 20-requests and 50-messages daily values are enforceable today only as explicit
+   `contact_requests_per_day` and `messages_per_day` entries in a recipient's policy file, which
+   cap all inbound traffic, not probationary senders specifically.
 5. A contact request is itself rate-limited (max 3 requests to the same recipient, then a 30-day
    cooldown) and carries at most 280 characters. The request cannot be the spam.
 
@@ -585,12 +591,22 @@ uncapped queue turns the owner's prompt into the spam channel, which is the same
 from the message itself. Requests the owner never answers expire on the same seven-day clock as any
 other request.
 
-**Rate limits:** 100 messages/hour per sender, 20/hour from any one sender to any one recipient,
-10,000/hour per hub. A sender whose messages receive no **reply** — a `Message` in response, or a
-`Task` state change — for 90% of 50+ messages is throttled to 5/hour for 24 hours or until an operator
-clears it, and flagged in the hub's abuse queue with the counts that triggered it. **Bridge acks MUST
-NOT count as engagement**: a live bridge acks everything it receives, spam included, so an ack-based
-detector would fire only on dead recipients — the opposite of a spray.
+**Rate limits — what the recipient's gate enforces.** The gate in front of one recipient
+enforces ceilings from that recipient's own policy file, counted in the recipient's own store:
+a per-sender ceiling (`per_sender_per_hour`: messages from one sender to this recipient, specified
+at 20/hour) and aggregate inbound ceilings (`messages_per_hour` per hour, `messages_per_day` per
+day, `contact_requests_per_day` for contact requests), all operator policy. A gate sees only
+traffic to its own recipient, so it cannot enforce a per-sender total across recipients.
+
+**Rate limits — hub-side, not yet implemented.** The following are specified for a public hub and
+have no implementation yet, so a deployment MUST NOT claim them: 100 messages/hour per sender
+across all recipients, 10,000/hour per hub, and the low-engagement throttle — a sender whose
+messages receive no **reply** — a `Message` in response, or a `Task` state change — for 90% of 50+
+messages is throttled to 5/hour for 24 hours or until an operator clears it, and flagged in the
+hub's abuse queue with the counts that triggered it. **Bridge acks MUST NOT count as engagement**:
+a live bridge acks everything it receives, spam included, so an ack-based detector would fire only
+on dead recipients — the opposite of a spray. Until the hub counts them, the per-recipient gate
+above is the only rate control in force (#119).
 
 **Blocks:** recipient blocklists are published to the hub; the hub refuses delivery before the
 message reaches the recipient bridge. A blocked recipient, a name that was never registered, and a

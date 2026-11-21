@@ -160,3 +160,25 @@ def test_a_refused_envelope_does_not_burn_the_rate_budget(tmp_path):
     assert gate.decide(envelope(context="c-1"), T0).allowed is True
     assert gate.decide(envelope(context="c-2"), T0).allowed is True
     assert gate.decide(envelope(context="c-3"), T0).allowed is False
+
+
+def test_messages_per_hour_is_a_shared_inbound_budget(tmp_path):
+    # #119 / §9: `messages_per_hour` is the aggregate inbound ceiling for this one recipient,
+    # shared by every sender — it is NOT the spec's 100/hour per sender across recipients,
+    # which no counter in this bridge can see. Two senders spend the same budget.
+    doc = {**CLOSED, "allow": [SENDER, STRANGER], "limits": {"messages_per_hour": 2}}
+    gate, _ = build(tmp_path, doc, rates=True)
+    assert gate.decide(envelope(sender=SENDER, context="c-1"), T0).allowed is True
+    assert gate.decide(envelope(sender=STRANGER, context="c-2"), T0).allowed is True
+    assert gate.decide(envelope(sender=SENDER, context="c-3"), T0).allowed is False
+
+
+def test_per_sender_per_hour_is_per_sender_to_this_recipient(tmp_path):
+    # #119 / §9: `per_sender_per_hour` is the 20/hour limit from one sender to this one
+    # recipient. Each sender has its own budget; one sender spending it does not throttle
+    # another.
+    doc = {**CLOSED, "allow": [SENDER, STRANGER], "limits": {"per_sender_per_hour": 1}}
+    gate, _ = build(tmp_path, doc, rates=True)
+    assert gate.decide(envelope(sender=SENDER, context="c-1"), T0).allowed is True
+    assert gate.decide(envelope(sender=SENDER, context="c-2"), T0).allowed is False
+    assert gate.decide(envelope(sender=STRANGER, context="c-3"), T0).allowed is True

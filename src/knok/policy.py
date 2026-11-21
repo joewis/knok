@@ -14,9 +14,12 @@ from typing import Any
 
 from .identity import IdentityError, validate_agent_id
 
-KNOWN_KEYS = {"agent_id", "contact_policy", "deployment", "allow", "block", "limits", "probation"}
-#: §9 names four numbers: 100 messages/hour, 20/hour from one sender, and the probation pair
-#: (20 contact requests and 50 messages a day). All four are policy, not protocol constants.
+KNOWN_KEYS = {"agent_id", "contact_policy", "deployment", "allow", "block", "limits"}
+#: The four ceilings the recipient's gate enforces, all policy, not protocol constants
+#: (§9): an aggregate inbound ceiling per hour and per day, a per-sender-to-this-recipient
+#: ceiling per hour, and a contact-request ceiling per day. These are per-recipient scopes:
+#: the spec's per-sender-across-recipients and hub-wide limits are hub-side controls, not
+#: these names — `messages_per_hour` is NOT the spec's 100/hour per sender (#119).
 KNOWN_LIMITS = {
     "messages_per_hour",
     "per_sender_per_hour",
@@ -39,7 +42,6 @@ class Policy:
     allow: frozenset[str]
     block: frozenset[str]
     limits: dict[str, int]
-    probation: bool = False
 
     @property
     def direct_delivery(self) -> bool:
@@ -103,10 +105,6 @@ def parse(document: Any) -> Policy:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise PolicyError(f"limit {name} must be a non-negative integer")
 
-    probation = document.get("probation", False)
-    if not isinstance(probation, bool):
-        raise PolicyError("probation must be a boolean")
-
     return Policy(
         agent_id=agent_id,
         contact_policy=contact_policy,
@@ -114,7 +112,6 @@ def parse(document: Any) -> Policy:
         allow=_identifiers(document.get("allow", []), "allow"),
         block=_identifiers(document.get("block", []), "block"),
         limits=dict(limits_raw),
-        probation=probation,
     )
 
 

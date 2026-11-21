@@ -28,6 +28,15 @@ def test_unknown_limit_is_fatal():
         parse({**BASE, "limits": {"messages_per_minute": 1}})
 
 
+def test_probation_key_is_rejected():
+    # #119: the policy file carried a `probation` flag no gate decision ever read, so an
+    # operator could set it and believe probation limits were enforced when nothing was.
+    # §9 puts the probation flag in the Agent Card's `bridge` extension, not in the policy
+    # file, so the parser rejects it like any other unknown key.
+    with pytest.raises(PolicyError, match="unknown policy keys"):
+        parse({**BASE, "probation": True})
+
+
 def test_direct_delivery_requires_a_non_public_deployment():
     # §9: there is no open mode on a public hub.
     with pytest.raises(PolicyError, match="not allowed on a public deployment"):
