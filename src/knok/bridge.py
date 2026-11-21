@@ -84,6 +84,75 @@ LEDGER_FILES: dict[str, tuple[str, ...]] = {
     "dropped.jsonl": ("at",),
     NOTICES: ("receivedAt", "expiredAt", "deadedAt", "detectedAt", "releasedAt", "at"),
 }
+#: Every file a bridge appends JSON lines to. A crash mid-append can leave a torn final line in
+#: any of them; all five are repaired the same way (#114).
+JSONL_STATE_FILES = ("delivery.jsonl", NOTICES, "refused.jsonl", "dropped.jsonl", "inbox.jsonl")
+
+
+def _find_line_start(handle, end: int) -> int:
+    """Index just after the last ``\\n`` before ``end`` (0 when there is none).
+
+    ``handle`` is open in binary mode; ``end`` is the byte offset the line ends at. Scans
+    backwards in blocks, so a long file costs one line's worth of reads, not the whole file.
+    """
+    block = 65536
+    pos = end
+    while pos > 0:
+        start = max(0, pos - block)
+        handle.seek(start)
+        chunk = handle.read(pos - start)
+        idx = chunk.rfind(b"\n")
+        if idx != -1:
+            return start + idx + 1
+        pos = start
+    return 0
+
+
+def _truncate_torn_tail(path: Path) -> None:
+    """Drop a torn trailing line from a JSONL file, if it has one (#114).
+
+    An append is one ``write`` of one line plus fsync, so a crash during it can leave a partial
+    final line: bytes on disk, no complete record. The next append would glue its record onto
+    the fragment and corrupt both lines. Only the final line can be torn this way — every line
+    before it was complete when a later line was written after it — so the repair is
+    conservative: drop the tail when it is not a complete, valid JSON line, and leave every
+    complete line before it alone. A newline-terminated last line that is not valid JSON is a
+    fused line from a crash before this repair existed, and is dropped the same way.
+
+    Best effort, never fatal: a file that cannot be read or truncated is logged and left for
+    the append's own error handling, and the repair runs again on the next attempt.
+    """
+    try:
+        with open(path, "r+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size == 0:
+                return
+            tail_start = _find_line_start(handle, size)
+            if tail_start < size:
+                # No trailing newline: the final line never completed.
+                handle.truncate(tail_start)
+                handle.flush()
+                os.fsync(handle.fileno())
+                log.warning("truncated a torn final line in %s (%d bytes dropped)",
+                            path, size - tail_start)
+                return
+            # Ends with a newline, but the last line may still be a fused fragment.
+            last_start = _find_line_start(handle, size - 1)
+            handle.seek(last_start)
+            try:
+                json.loads(handle.read(size - last_start))
+            except ValueError:
+                handle.truncate(last_start)
+                handle.flush()
+                os.fsync(handle.fileno())
+                log.warning("truncated an unparseable final line in %s (%d bytes dropped)",
+                            path, size - last_start)
+    except OSError as exc:
+        # No file yet is the ordinary case; anything else is logged, not raised — the append
+        # that follows will report a write it cannot make in its own terms.
+        if not isinstance(exc, FileNotFoundError):
+            log.warning("could not repair %s; leaving it for the next append: %s", path, exc)
 
 
 def iso(moment: datetime) -> str:
@@ -371,6 +440,12 @@ class Bridge:
 
         state.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(state.directory, 0o700)
+        # A crash during an earlier append can leave a torn final line in a state file; heal all
+        # five before this process writes anything, so a reader never meets a fragment the next
+        # append would have glued a record onto (#114). The append path repairs again before
+        # every write, for a fragment left by a partial write in this same lifetime.
+        for name in JSONL_STATE_FILES:
+            _truncate_torn_tail(state.directory / name)
 
         own_card = state.registry.get(state.agent_id)
         if own_card is None:
@@ -741,6 +816,22 @@ class Bridge:
                 record["contextId"] = message["contextId"]
         return record
 
+    def _append_jsonl(self, path: Path, records: list[dict[str, Any]]) -> None:
+        """Append records as fsynced JSON lines. Raises OSError when they cannot be written.
+
+        A torn final line from a crash during an earlier append is truncated first, so the new
+        records never glue onto a fragment and corrupt the file (#114). The records go out in
+        one ``write``: a crash during it can tear at most the page's last record, and the next
+        repair drops exactly that.
+        """
+        _truncate_torn_tail(path)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("".join(
+                json.dumps(record, sort_keys=True, default=str) + "\n" for record in records
+            ))
+            handle.flush()
+            os.fsync(handle.fileno())
+
     def _record_deliveries(self, records: list[dict[str, Any]]) -> bool:
         """Append the page's delivery rows, fsynced, before any of them is acked.
 
@@ -752,11 +843,7 @@ class Bridge:
             return True
         path = self.state.directory / "delivery.jsonl"
         try:
-            with open(path, "a", encoding="utf-8") as handle:
-                for record in records:
-                    handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._append_jsonl(path, records)
             return True
         except OSError as exc:
             log.error("could not write the delivery ledger; acking nothing this pass: %s", exc)
@@ -861,7 +948,12 @@ class Bridge:
             safe_log_text(frame.get("expiredAt")),
             safe_log_text(frame.get("contextId")),
         )
-        self._record_notice(frame)
+        if not self._record_notice(frame):
+            # The frame is the only evidence the message expired or died — the body is already
+            # gone — so without it on disk the frame stays at the hub and the bounded attempt
+            # counter decides, rather than being acked away. The same write-success condition
+            # the local queue-notice path in drain and the refusal-notice path already apply.
+            return "unhandled", None
         return "notices", message_id if isinstance(message_id, str) else None
 
     # -- refusals: tell the sender, don't just ack the hub (#50) -----------
@@ -1011,10 +1103,7 @@ class Bridge:
         """Append one fsynced JSON line to a state file. False (and logged) when it cannot be written."""
         path = self.state.directory / name
         try:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._append_jsonl(path, [record])
             return True
         except OSError as exc:
             log.log(getattr(logging, level.upper(), logging.WARNING),
@@ -1032,10 +1121,7 @@ class Bridge:
         record = {"key": key, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   "item": item}
         try:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._append_jsonl(path, [record])
             return True
         except OSError as exc:
             log.error("could not record a dropped item %s; leaving it at the hub: %s", key, exc)
@@ -1049,10 +1135,7 @@ class Bridge:
         """
         path = self.state.directory / NOTICES
         try:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(frame, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._append_jsonl(path, [frame])
             return True
         except OSError as exc:
             log.warning("could not record notice: %s", exc)
@@ -1093,10 +1176,7 @@ class Bridge:
 
     def _append_inbox(self, envelope: dict[str, Any]) -> None:
         path = self.state.directory / "inbox.jsonl"
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(envelope, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        self._append_jsonl(path, [envelope])
 
     def run_forever(self, stop=None) -> None:
         """Poll until asked to stop. Jitter keeps ten bridges from landing on the same tick."""
