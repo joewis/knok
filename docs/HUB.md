@@ -142,6 +142,19 @@ so that it is not available.
 **One ack carries at most 100 ids** — the same number as a full fetch page. A larger list is not a
 batch but a loop the sender is asking the hub to run for it, so it is refused rather than truncated.
 
+**A deposit from a key that is not valid now is refused, and says so (#90, decision 0005).** The
+deposit asks two questions. The first is the audit question — was the sender's key valid at the
+envelope's own `sentAt`? — and it is unchanged, so mail deposited before a revocation remains
+deliverable after it. The second is asked at the deposit: is this key valid *now*? A key that has
+been revoked, superseded, expired or is not yet valid cannot mint new mail through this hub,
+whatever `sentAt` it claims. Without the second question a holder of a revoked key simply
+backdates `sentAt` past the revocation, which verifies perfectly. The answer is the shared **403**
+with a different body — `{"error": "sender key is not valid at deposit time"}` — because it
+describes the depositor's own key and never whether a recipient exists, and because it is
+unreachable until the envelope has verified. A legacy `{fingerprint: public_key}` registry cannot
+answer the second question at all; decision 0002 defines those keys as valid forever, and the check
+is skipped rather than refusing every sender on an older deployment.
+
 **Over-capacity is the exception, and only on a private hub.** When a mailbox is at cap the hub
 answers **429** with a retry hint, because the honest distinction is *retryable* versus *permanent*,
 and a sender that cannot tell them apart either retries a bad signature forever or gives up on a full

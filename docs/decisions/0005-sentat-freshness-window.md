@@ -1,8 +1,8 @@
 # 0005 — No freshness window on `sentAt`; the hub refuses deposits from a key revoked as of deposit time
 
 Date: 2026-11-21
-Status: accepted — reviewed by Carl, 2026-11-21. The hub-side deposit check this record adopts
-is the implementation follow-up; until it lands, #90 stays open.
+Status: accepted and implemented — reviewed by Carl, 2026-11-21; `Hub.deposit` carries the check
+and `tests/hub/test_hub.py` pins both halves.
 Authors: Muse
 Addresses: #90
 Blocks: public-hub launch (not Phase 3 on a private hub, per #90)
@@ -93,6 +93,27 @@ before revocation and delivered after is still accepted: it was legitimate when 
 
 This is a protocol decision, not a product one. No product question is being absorbed: the choice is
 about what the wire guarantees, and it belongs in the spec.
+
+## Implemented form (0005a)
+
+Two points the record left open were decided during implementation, and both narrow it:
+
+- **The predicate is "not valid now", not "revoked now".** A key that has been superseded, has
+  expired, or is not yet valid is in the same position as a revoked one: it must not mint new
+  mail. Keying only on `revoked_at` would let a rotated key keep depositing for as long as the
+  sender liked, and a peer still signing with a rotated key is either misconfigured or
+  compromised. `_card_key_status` asks the registry's own `KeyRecord.status(now)` and refuses on
+  anything but `valid`.
+- **The refusal is not uniform; it is distinct.** The record said "the uniform 403", which is the
+  right default for anything that could describe a recipient. This one describes only the
+  depositor's own key, and it is unreachable until the envelope has verified, so it cannot be used
+  by a stranger to ask about somebody else's key. It answers `403` with
+  `{"error": "sender key is not valid at deposit time"}`. A silent refusal here would be the
+  failure §6 was written against: the sender's `send` would exit 0 and the message would die.
+
+A legacy `{fingerprint: public_key}` registry cannot answer the question at all; decision 0002
+defines those keys as valid forever, so the check is skipped rather than refusing every sender on
+an older deployment.
 
 ## What stays open
 

@@ -38,12 +38,13 @@ from hub_helpers import (  # noqa: E402
     verify_frame,
 )
 from knok.envelope import sign  # noqa: E402
-from knok.hub import Hub  # noqa: E402
+from knok.hub import KEY_REFUSAL_BODY, Hub  # noqa: E402
 from knok.identity import generate  # noqa: E402
 from knok.transport import MAX_ENVELOPE_BYTES, REFUSAL_BODY, REFUSAL_STATUS  # noqa: E402
 
 #: The shared refusal as parsed JSON — deposit() parses response bodies.
 REFUSAL_JSON = json.loads(REFUSAL_BODY)
+KEY_REFUSAL_JSON = json.loads(KEY_REFUSAL_BODY)
 
 
 @pytest.fixture
@@ -653,23 +654,17 @@ def test_unknown_path_is_shared_403(ns):
     assert (status, body) == (REFUSAL_STATUS, REFUSAL_BODY)
 
 
-def test_a_message_signed_before_a_revocation_is_still_accepted(ns):
-    """#23 at the hub: the deposit asks the sender's key what it meant at `sentAt`.
-
-    The card is verified as of the message's instant, not as of the deposit. A key revoked half an
-    hour ago signed a message an hour ago; refusing it here would make the hub disagree with every
-    bridge that verified the same message at the same instant.
-    """
+def _revoked_registry(ns, revoked_at):
+    """A registry where carl's key is revoked at ``revoked_at`` and the peers are live."""
     from datetime import timedelta
 
     from knok.registry import KeyRecord, Registry
 
-    from hub_helpers import iso, now_dt
+    from hub_helpers import now_dt
 
     moment = now_dt()
-    carl = ns.carl_id
 
-    def record(identity, revoked_at=None):
+    def record(identity, revoked=None):
         return KeyRecord(
             agent_id=identity.agent_id,
             key_type="ed25519",
@@ -677,23 +672,66 @@ def test_a_message_signed_before_a_revocation_is_still_accepted(ns):
             fingerprint=identity.fingerprint,
             not_before=moment - timedelta(days=1),
             not_after=moment + timedelta(days=1),
-            revoked_at=revoked_at,
+            revoked_at=revoked,
         )
 
-    # Every registered agent needs a record: the recipient's card is checked too.
-    ns.hub.registry = Registry([
-        record(carl, revoked_at=moment - timedelta(minutes=30)),
+    return Registry([
+        record(ns.carl_id, revoked=revoked_at),
         record(ns.muse_id),
         record(ns.mallory_id),
     ])
 
-    before = build_envelope(carl, ns.muse_id.agent_id, context_id="c-before",
-                            sent_at=iso(moment - timedelta(hours=1)))
-    status, _body, _ = deposit(ns.url, before)
-    assert status == 202
 
-    after = build_envelope(carl, ns.muse_id.agent_id, context_id="c-after",
-                           sent_at=iso(moment - timedelta(minutes=10)))
-    status, body, _ = deposit(ns.url, after)
-    assert status == 403
-    assert body == REFUSAL_JSON
+def test_a_revoked_key_cannot_deposit_a_backdated_message(ns):
+    """#90 / decision 0005: verification at ``sentAt`` alone lets a revoked key mint *new* mail.
+
+    The envelope below verifies — the key was valid at the instant it claims — so the audit check
+    passes it through. What refuses it is the second question the deposit asks: is this key valid
+    now? Without that question a compromised key can send for as long as it likes by backdating.
+    """
+    from datetime import timedelta
+
+    from hub_helpers import iso, now_dt
+
+    moment = now_dt()
+    ns.hub.registry = _revoked_registry(ns, moment - timedelta(minutes=30))
+
+    forged = build_envelope(
+        ns.carl_id, ns.muse_id.agent_id, context_id="c-forged",
+        sent_at=iso(moment - timedelta(hours=1)),
+    )
+    status, body, _ = deposit(ns.url, forged)
+    assert status == REFUSAL_STATUS
+    assert body == KEY_REFUSAL_JSON
+
+    # Nothing reached the mailbox.
+    assert fetch_as(ns.url, ns.muse_id)[1]["messages"] == []
+
+
+def test_a_message_deposited_before_a_revocation_is_delivered_after_it(ns):
+    """The deposit-time check must not refuse mail that was already in the system.
+
+    A message deposited while the key was live stays deliverable after revocation: the receiving
+    bridge verifies it at ``sentAt``, where the key was valid, which is the audit property decision
+    0002 established. Only a *new* deposit is refused.
+    """
+    from datetime import timedelta
+
+    from hub_helpers import iso, now_dt
+
+    moment = now_dt()
+    revoked_at = moment - timedelta(minutes=30)
+    ns.hub.registry = _revoked_registry(ns, revoked_at)
+
+    live = build_envelope(
+        ns.carl_id, ns.muse_id.agent_id, context_id="c-live",
+        sent_at=iso(revoked_at - timedelta(minutes=5)),
+    )
+    # Deposited before the revocation: ask the hub the question it would have been asked then.
+    status, _message_id = ns.hub.deposit(
+        live, len(json.dumps(live)), now=revoked_at - timedelta(minutes=1)
+    )
+    assert status == "accepted"
+
+    messages = fetch_as(ns.url, ns.muse_id)[1]["messages"]
+    assert [m["message"]["messageId"] for m in messages] == [live["message"]["messageId"]]

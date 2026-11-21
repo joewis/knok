@@ -281,12 +281,25 @@ def verify_frame(frame: Any, public_key) -> bool:
     return verify_signature(public_key, payload, signature)
 
 
+#: The one refusal that says why (#90, decision 0005). It is safe to be distinct because it is
+#: about the *sender's own* key, never about whether the recipient exists — the property the
+#: uniform refusal in §9 protects. It is only reachable after the envelope has verified, so a
+#: stranger cannot use it to ask the hub about somebody else's key.
+KEY_REFUSAL_BODY = json.dumps(
+    {"error": "sender key is not valid at deposit time"}, sort_keys=True
+).encode("ascii")
+
+
 class _Refused(Exception):
     """An outcome that is the shared 403. Raised internally, never across the wire."""
 
 
 class _OverCapacity(Exception):
     """The recipient's mailbox is at cap: the one 429 in the contract."""
+
+
+class _KeyNotCurrent(_Refused):
+    """The sender's key is revoked, superseded or expired as of this deposit (#90)."""
 
 
 class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
@@ -483,6 +496,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             outcome, message_id = hub.deposit(envelope, len(raw))
         except _OverCapacity:
             self._over_capacity()
+            return
+        except _KeyNotCurrent:
+            self._send(REFUSAL_STATUS, KEY_REFUSAL_BODY)
             return
         except _Refused:
             self._refuse()
@@ -775,6 +791,30 @@ class Hub:
         except Exception:
             return None
 
+    def _card_key_status(self, agent_id: str, at: datetime) -> str | None:
+        """The registry's verdict on the sender's signing key at ``at``, or None.
+
+        None means the registry cannot answer — a legacy ``{fingerprint: key}`` mapping, which
+        decision 0002 defines as "valid forever" — and the deposit-time check is skipped for it
+        rather than refusing every sender on an older deployment.
+        """
+        from .registry import Registry
+
+        if not isinstance(self.registry, Registry):
+            return None
+        card = self.cards.get(agent_id)
+        if not isinstance(card, dict):
+            return None
+        try:
+            header = json.loads(b64url_decode(card["protected"]))
+        except Exception:
+            return None
+        kid = header.get("kid") if isinstance(header, dict) else None
+        record = self.registry.get(kid or "")
+        if record is None:
+            return "unknown"
+        return record.status(at)
+
     # -- authentication ---------------------------------------------------
 
     def authenticate(
@@ -974,6 +1014,16 @@ class Hub:
         ok, _reason = verify_envelope(envelope, public_key, sent_at)
         if not ok:
             raise _Refused("envelope does not verify")
+        # #90 / decision 0005: the check above answers "was this key valid when the message
+        # claims to have been sent", which is the audit property and stays as it is. On its own
+        # it lets the holder of a revoked key mint a *new* message with a backdated sentAt: the
+        # key was valid at the forged instant, so both the hub and the receiving bridge accept
+        # it. The deposit is the one moment this hub can ask what the key's status is now, and
+        # answering that here closes the hole without any clock comparison on the receiver —
+        # so mail that is merely old is never refused, and store-and-forward is untouched.
+        key_status = self._card_key_status(sender, moment)
+        if key_status is not None and key_status != "valid":
+            raise _KeyNotCurrent(f"sender key is {key_status} at deposit time")
         recipients = envelope["to"]
         if not isinstance(recipients, list) or len(recipients) != 1:
             raise _Refused("one recipient only; fan-out is not in v1")
