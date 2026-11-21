@@ -419,6 +419,54 @@ def test_dropped_frame_counted_and_reported(tmp_path):
         close_hub(ns)
 
 
+def test_an_acked_envelope_cannot_be_deposited_again(ns):
+    """#99: ack deletes the mail row, so without a tombstone a replay of the same
+    still-valid envelope is stored again and handed over a second time."""
+    envelope = build_envelope(ns.carl_id, ns.muse_id.agent_id)
+    status, body, _ = deposit(ns.url, envelope)
+    assert status == 202 and body["accepted"] is True
+
+    assert ack_as(ns.url, ns.muse_id, [envelope["message"]["messageId"]])[0] == 200
+
+    # A duplicate answers 202 as well — deliberately, so a replay learns nothing
+    # from the shape of the reply. The evidence is the effect: nothing is stored,
+    # so the recipient is not handed the message a second time.
+    status, body, _ = deposit(ns.url, envelope)
+    assert status == 202 and body["messageId"] == envelope["message"]["messageId"]
+    assert fetch_as(ns.url, ns.muse_id)[1]["messages"] == []
+
+
+def test_an_acked_id_reused_for_a_different_body_is_refused(ns):
+    """#99: the tombstone carries the hash, so reusing the id for a different
+    body is still a refusal rather than a silent replacement."""
+    first = build_envelope(ns.carl_id, ns.muse_id.agent_id, text="the original")
+    assert deposit(ns.url, first)[0] == 202
+    assert ack_as(ns.url, ns.muse_id, [first["message"]["messageId"]])[0] == 200
+
+    second = build_envelope(
+        ns.carl_id, ns.muse_id.agent_id,
+        message_id=first["message"]["messageId"], text="something else",
+    )
+    status, body, _ = deposit(ns.url, second)
+    assert (status, body) == (REFUSAL_STATUS, REFUSAL_JSON)
+
+
+def test_a_retry_with_a_new_id_is_accepted_after_the_ack(ns):
+    """#99 must not break retry: SPEC §8 mints a new messageId carrying retryOf,
+    which is a different id and therefore a different message."""
+    first = build_envelope(ns.carl_id, ns.muse_id.agent_id)
+    assert deposit(ns.url, first)[0] == 202
+    assert ack_as(ns.url, ns.muse_id, [first["message"]["messageId"]])[0] == 200
+
+    retry = build_envelope(ns.carl_id, ns.muse_id.agent_id, text="did you get this?")
+    retry["message"]["metadata"] = {"retryOf": first["message"]["messageId"]}
+    retry = sign(retry, ns.carl_id)
+    assert deposit(ns.url, retry)[0] == 202
+    assert [m["message"]["messageId"] for m in fetch_as(ns.url, ns.muse_id)[1]["messages"]] == [
+        retry["message"]["messageId"]
+    ]
+
+
 def test_unknown_path_is_shared_403(ns):
     signed = signed_headers(ns.muse_id, "GET", "/v1/nope")
     status, body, _ = raw_request(ns.url, "GET", "/v1/nope", signed)
