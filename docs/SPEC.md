@@ -632,7 +632,11 @@ state. "Stateless apart from its queue" was a contradiction and is deleted.
   refusals by rule, time-to-bridge-ack (not time-to-agent-action), dead-letter count, presence cache
   hit rate.
 - **Logs:** envelope metadata 30 days; bodies zero days on the public hub. Any log line that could
-  contain a body is a bug.
+  contain a body is a bug. Bridge-local audit files (`delivery.jsonl`, `refused.jsonl`,
+  `dropped.jsonl`, `notices.jsonl`) keep metadata rows the same 30 days, and the bridge prunes
+  older rows itself on its poll loop, at most once a day, by atomic replacement — a row the pruner
+  cannot date is kept rather than deleted (#124). Pruning bounds the live audit trail; it does not
+  securely erase SQLite WAL pages or nightly backups, which keep their own schedule.
 
 ## 11. Roadmap
 
