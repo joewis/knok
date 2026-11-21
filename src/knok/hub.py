@@ -334,7 +334,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         Bad request lines, oversized headers and unsupported methods all reach
         this inherited hook; letting it emit stdlib HTML would make the hub's
         failures distinguishable from each other (§9, HUB.md).
+
+        ``request_version`` is forced to the hub's protocol before answering:
+        when the request line itself is unparseable the attribute is still the
+        handler's default of HTTP/0.9, and ``send_response`` writes nothing but
+        the body in that case — a status-line-less answer on Python 3.12, where
+        that default has not changed.
         """
+        self.request_version = self.protocol_version
         self._refuse()
 
     def _over_capacity(self) -> None:
