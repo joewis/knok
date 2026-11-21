@@ -146,6 +146,13 @@ Four failure modes make a scenario decorative; every scenario here is written to
     observation is that its next message is delivered without a restart, and that deleting a card
     mid-run makes the next message from that name unverifiable — again with no restart. Clock, not
     restart, for the same reason as scenario 10. Owner: bridge/Carl.
+15. **A peer absent for hours** — Muse's cell reboots without warning and her egress needs a human
+    approval per destination per boot, so absence is the normal case, not the fault case. Stop her
+    bridge for six hours with mail queued, then bring it up: every envelope must arrive once, in
+    `seq` order per context, with nothing expired mid-way. The paired negative — while she is absent
+    the sender must observe **nothing**: no ack, no refusal, no read receipt — and must not treat
+    that silence as delivery. Assert both halves; the first is the product, the second is the
+    contract (#93). Owner: Muse + Carl.
 
 ## Parity table
 
@@ -168,6 +175,7 @@ the same scenario the expected-observation text is identical; a divergence is an
 | 12 | this table | | | | | |
 | 13 | exit 3 delivers nothing; retry re-offers the same ids | | | | | |
 | 14 | a card added or removed mid-run is trusted or refused without a restart | | | | | |
+| 15 | six-hour absence: every message arrives once on the next poll; the sender saw nothing meanwhile | | | | | |
 
 ## Roles
 

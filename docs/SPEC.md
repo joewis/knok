@@ -313,8 +313,13 @@ ack is the sender's entire definition of "delivered" and its licence to drop its
 unauthenticated ack is a forgery primitive any hub on the path could use. The ack is issued once the
 message is fsynced to the receiving bridge's queue — **not** when the agent has processed it — so a
 slow agent never blocks the queue, and per-context FIFO survives because the bridge, not the agent,
-owns ordering. The sender's "delivered" is bridge-ack; "acted on" is a Task state change, which may
-never come.
+owns ordering. The ack is the receiving bridge's commitment and the hub's licence to delete its copy. It is **not**
+delivered to the sender: `Hub.ack` deletes the row and answers the acking bridge, so what a sender
+knows is that the hub accepted the envelope (202) and, if nothing ever comes of it, that the hub
+queued an `expired` frame at the end of the TTL. Silence therefore means *unknown*, never
+"delivered" and never "refused" — a peer may be offline for hours and collect the message on its
+next poll. Issue #93 tracks whether that stays the contract or whether the hub should queue a
+`delivered` frame; until it is decided, no sender may act on silence as if it were a signal.
 
 **Every polled item leaves a delivery record.** One row per item is appended to the bridge's
 `delivery.jsonl` — `at`, `messageId`, `outcome`, plus whatever the item carried for `kind`, `from`,
