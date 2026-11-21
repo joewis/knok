@@ -107,6 +107,17 @@ FETCH_DEFAULT_LIMIT = 50
 FETCH_MAX_LIMIT = 100
 #: Over-capacity retry hint (HUB.md names no number; 60 s is the sweep tick).
 RETRY_AFTER_SECONDS = 60
+#: A client has this long to send its request line, headers and body before the
+#: handler drops the connection. Without it one client holding a socket open ties
+#: up a thread for as long as it likes.
+REQUEST_TIMEOUT_SECONDS = 15
+#: Handlers that may run at once. Past this the hub refuses rather than spawning
+#: another thread: the point of the cap is that a slow client cannot spend the
+#: hub's memory, not that it eventually gets served.
+MAX_CONCURRENT_REQUESTS = 64
+#: Ids one ack may carry. A page is at most FETCH_MAX_LIMIT, so a larger request
+#: is not a batch — it is a loop the sender is asking the hub to run for it.
+MAX_ACK_IDS = FETCH_MAX_LIMIT
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS mail (
@@ -255,9 +266,54 @@ class _OverCapacity(Exception):
     """The recipient's mailbox is at cap: the one 429 in the contract."""
 
 
+class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer with a ceiling on handlers and a per-connection timeout.
+
+    http.server spawns a thread per connection without limit, so a client that
+    opens sockets and trickles bytes spends hub threads indefinitely. The slot is
+    taken before the thread exists: over the cap the request is refused from the
+    accept loop instead of queued behind a thread the hub cannot afford.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, *args, max_concurrent: int = MAX_CONCURRENT_REQUESTS, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(max_concurrent)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                body = json.dumps(
+                    {"error": "over-capacity", "retryAfterSeconds": RETRY_AFTER_SECONDS},
+                    sort_keys=True,
+                ).encode("ascii")
+                request.sendall(
+                    b"HTTP/1.0 429 Too Many Requests\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                    b"Retry-After: " + str(RETRY_AFTER_SECONDS).encode() + b"\r\n"
+                    b"Connection: close\r\n\r\n" + body
+                )
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"  # one request per connection; no keep-alive state
     server_version = "KnokHub/0.1"
+    timeout = REQUEST_TIMEOUT_SECONDS  # StreamRequestHandler applies this to the socket
 
     def log_message(self, *args: object) -> None:  # keep demo/test output clean
         pass
@@ -266,6 +322,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _refuse(self) -> None:
         self._send(REFUSAL_STATUS, REFUSAL_BODY)
+
+    # A method the hub does not implement is a refusal like any other: the
+    # inherited handler would answer 501 with an HTML body, which tells the
+    # caller their request was understood well enough to be classified.
+    do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _refuse
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        """Parser-level failures answer the shared refusal too.
+
+        Bad request lines, oversized headers and unsupported methods all reach
+        this inherited hook; letting it emit stdlib HTML would make the hub's
+        failures distinguishable from each other (§9, HUB.md).
+        """
+        self._refuse()
 
     def _over_capacity(self) -> None:
         body = json.dumps(
@@ -446,6 +516,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 or not all(isinstance(item, str) for item in body["messageIds"]):
             self._refuse()
             return
+        if len(body["messageIds"]) > MAX_ACK_IDS:
+            self._refuse()
+            return
         acked = hub.ack(agent, body["messageIds"])
         self._send(200, json.dumps({"acked": acked}, sort_keys=True).encode("ascii"))
 
@@ -571,8 +644,7 @@ class Hub:
         return f"http://{self.host}:{port}"
 
     def start(self) -> "Hub":
-        server = http.server.ThreadingHTTPServer((self.host, self.port), _Handler)
-        server.daemon_threads = True
+        server = _BoundedThreadingHTTPServer((self.host, self.port), _Handler)
         server.hub = self  # type: ignore[attr-defined]
         self._server = server
         self._thread = threading.Thread(
