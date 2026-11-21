@@ -82,6 +82,44 @@ def _raw_http(url: str, head: bytes, body: bytes = b"") -> str:
         return sock.recv(4096).decode("latin-1")
 
 
+def test_the_handler_ceiling_refuses_before_the_thread_exists(ns, monkeypatch):
+    """#126 review: the cap must be exercised by real sockets, not by patching the
+    limit — hold every handler open with a half-sent request, then knock."""
+    import knok.hub as hub_module
+
+    monkeypatch.setattr(hub_module._Handler, "timeout", 10)
+    parsed = urllib.parse.urlparse(ns.url)
+    held = []
+    try:
+        for _ in range(hub_module.MAX_CONCURRENT_REQUESTS):
+            sock = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+            # No blank line: the handler blocks reading headers, holding its slot.
+            sock.sendall(b"GET /v1/health HTTP/1.1\r\nHost: hub\r\n")
+            held.append(sock)
+        time.sleep(0.5)  # let the accept loop hand every socket to a handler
+
+        extra = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        try:
+            extra.settimeout(3)
+            assert b"429" in extra.recv(256)
+        finally:
+            extra.close()
+    finally:
+        for sock in held:
+            sock.close()
+
+
+def test_an_idle_handler_is_closed_by_the_hub(ns, monkeypatch):
+    """#126: a client that connects and says nothing must not hold a thread."""
+    import knok.hub as hub_module
+
+    monkeypatch.setattr(hub_module._Handler, "timeout", 1)
+    parsed = urllib.parse.urlparse(ns.url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.settimeout(5)
+        assert sock.recv(64) == b""  # closed by the handler's own timeout
+
+
 def test_a_slow_client_is_disconnected(ns, monkeypatch):
     """#103: a handler with no socket timeout lets one client hold a thread for
     as long as it likes by never finishing its request."""

@@ -301,7 +301,14 @@ class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
             finally:
                 self.shutdown_request(request)
             return
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # The slot is released by the thread's own finally, but the thread may
+            # never exist: a spawn failure under memory pressure would leak the
+            # slot, and 64 of those refuse every client forever (#126 review).
+            self._slots.release()
+            raise
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
