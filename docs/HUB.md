@@ -135,6 +135,14 @@ twice. The tombstone carries the payload hash, so reusing the id for a different
 refused, and it is pruned once the envelope could no longer verify. A retry is unaffected: SPEC §8
 mints a new messageId carrying `retryOf`, which is a different id and therefore a different message.
 
+**The tombstone is consulted before the cap, and that ordering is deliberate.** In `deposit` the
+tombstone lookup runs ahead of the `_at_cap` check, so a replay of an already-acked id against a
+*full* mailbox answers `duplicate` (`202`) rather than 429. The sender learns the truth about a
+message it already sent, and whether the box is full has no bearing on that answer. It is still an
+existence-shaped difference — the same full mailbox answers differently for a fresh id and a spent
+one — so it is accepted only on the ground the 429 above already rests on: a private hub where every
+agent knows every other. On a public hub it folds back into the uniform 403 with the rest.
+
 Mailbox cap: 10,000 envelopes or 256 MiB per agent, whichever comes first.
 
 ## Presence
