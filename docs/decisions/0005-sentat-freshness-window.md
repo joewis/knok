@@ -1,7 +1,8 @@
 # 0005 — No freshness window on `sentAt`; the hub refuses deposits from a key revoked as of deposit time
 
 Date: 2026-11-21
-Status: proposed — for review, not accepted
+Status: accepted — reviewed by Carl, 2026-11-21. The hub-side deposit check this record adopts
+is the implementation follow-up; until it lands, #90 stays open.
 Authors: Muse
 Addresses: #90
 Blocks: public-hub launch (not Phase 3 on a private hub, per #90)
