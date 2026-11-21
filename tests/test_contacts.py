@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import sqlite3
 
 import pytest
 
@@ -149,3 +150,38 @@ def test_daily_request_limit_is_enforced(tmp_path):
         with pytest.raises(Cooldown, match="daily"):
             store.request("yiko@bridge.example", "", T0)
     rates.close()
+
+
+def test_failed_request_leaves_no_held_contact(tmp_path):
+    """#121: the contact row, presentation row and request-history row are one transaction.
+
+    A failure after the contact row is written but before the presentation row is inserted
+    must not strand the peer in `held` with no pending item for the owner to decide: the
+    owner cannot approve what `pending()` cannot show, and the peer cannot retry while the
+    held request is live.
+    """
+    with Contacts(tmp_path / "c.db") as store:
+        # Deny the first INSERT into approvals, at the database itself: the failure lands
+        # after the contact row is written and before the presentation row is inserted —
+        # exactly the boundary #121 names. The authorizer is a closure, so the retry
+        # afterwards is allowed through.
+        denied = {"approvals": False}
+
+        def authorizer(action, table, _column, _db, _trigger):
+            if (action == sqlite3.SQLITE_INSERT and table == "approvals"
+                    and not denied["approvals"]):
+                denied["approvals"] = True
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store._conn.set_authorizer(authorizer)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            store.request(PEER, "hello", T0)
+        assert denied["approvals"] is True
+        # The failed request committed nothing: the peer is still unknown, the owner sees
+        # nothing pending, and a retry succeeds instead of hitting DuplicateRequest.
+        assert store.state(PEER, T0) == "none"
+        assert store.pending() == []
+        assert store.requests_since(PEER, T0) == 0
+        assert store.request(PEER, "hello again", T0) == "requested"
+        assert [item["peer"] for item in store.pending()] == [PEER]

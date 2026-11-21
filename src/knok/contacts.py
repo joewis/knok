@@ -266,7 +266,12 @@ class Contacts:
         return row[0]
 
     @_locked
-    def _set(self, peer: str, state: str, now: datetime, bump: bool = False) -> None:
+    def _set(self, peer: str, state: str, now: datetime, bump: bool = False,
+             commit: bool = True) -> None:
+        """Write the contact row. With ``commit=False`` the transaction stays open for a caller
+        writing more rows in the same transaction — the caller commits (#121: ``request``
+        writes the contact row, the presentation row and the request-history row together,
+        so none of them may exist without the others)."""
         if bump:
             self._conn.execute(
                 "INSERT INTO contacts (peer, state, updated, requests, last_request)"
@@ -282,7 +287,8 @@ class Contacts:
                 " ON CONFLICT(peer) DO UPDATE SET state = excluded.state, updated = excluded.updated",
                 (peer, state, _ts(now)),
             )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     @_locked
     def request(self, peer: str, text: str = "", now: datetime | None = None,
@@ -320,19 +326,28 @@ class Contacts:
             # messages: an uncapped approval queue is the spam channel one layer up (§9).
             raise Cooldown(f"{peer}: the owner's approval queue is full for today")
 
-        self._set(peer, LOCAL_HELD, moment, bump=True)
-        self._conn.execute(
-            "INSERT INTO approvals (peer, text, fingerprint, presented, decision)"
-            " VALUES (?, ?, ?, ?, NULL)"
-            " ON CONFLICT(peer) DO UPDATE SET text = excluded.text,"
-            " fingerprint = excluded.fingerprint, presented = excluded.presented,"
-            " decision = NULL, decided_by = NULL, decided_at = NULL",
-            (peer, text, fingerprint, _ts(moment)),
-        )
-        self._conn.execute(
-            "INSERT INTO contact_requests (peer, at) VALUES (?, ?)", (peer, _ts(moment))
-        )
-        self._conn.commit()
+        # The contact row, the presentation row and the request-history row are one
+        # transaction (#121): a failure after the contact row is written must not strand the
+        # peer in `held` with no presentation row for the owner to decide. The rollback
+        # matters on this connection too — without it the uncommitted row would still be
+        # visible here and the peer's retry would hit DuplicateRequest.
+        try:
+            self._set(peer, LOCAL_HELD, moment, bump=True, commit=False)
+            self._conn.execute(
+                "INSERT INTO approvals (peer, text, fingerprint, presented, decision)"
+                " VALUES (?, ?, ?, ?, NULL)"
+                " ON CONFLICT(peer) DO UPDATE SET text = excluded.text,"
+                " fingerprint = excluded.fingerprint, presented = excluded.presented,"
+                " decision = NULL, decided_by = NULL, decided_at = NULL",
+                (peer, text, fingerprint, _ts(moment)),
+            )
+            self._conn.execute(
+                "INSERT INTO contact_requests (peer, at) VALUES (?, ?)", (peer, _ts(moment))
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         if self.rates is not None:
             self.rates.hit("requests", "all", moment, timedelta(days=1))
         return "requested"   # the peer sees requested; the owner sees held
