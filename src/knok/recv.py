@@ -79,7 +79,6 @@ def _gate_for(state: BridgeState) -> tuple[Gate, list]:
             allow=frozenset(peer for peer in state.registry if peer != state.agent_id),
             block=frozenset(),
             limits={},
-            probation=False,
         )
     rates = Rates(state.directory / "rates.db")
     contacts = Contacts(state.directory / "contacts.db", rates=rates)
