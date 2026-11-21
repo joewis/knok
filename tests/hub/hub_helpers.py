@@ -24,8 +24,6 @@ from knok.identity import Identity, generate
 from knok.transport import REFUSAL_BODY, REFUSAL_STATUS, make_agent_card, registry_for
 
 HUB_DOMAIN = "hub.local"
-SENT_AT = "2026-11-18T05:00:00Z"
-EXPIRES_AT = "2026-11-21T05:00:00Z"
 
 
 def now_dt() -> datetime:
@@ -34,6 +32,12 @@ def now_dt() -> datetime:
 
 def iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Relative to the wall clock: literal dates turn the suite red on a calendar day
+# rather than on a code change.
+SENT_AT = iso(now_dt() - timedelta(hours=1))
+EXPIRES_AT = iso(now_dt() + timedelta(hours=23))
 
 
 def new_message_id() -> str:

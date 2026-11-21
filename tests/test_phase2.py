@@ -375,6 +375,10 @@ def test_a_late_notice_does_not_ack_away_the_message_it_names(tmp_path):
     from knok.bridge import Bridge
 
     frame = {"kind": "late", "messageId": "m-1", "contextId": "c-1", "seq": 1}
+    from datetime import datetime, timedelta, timezone
+
+    _now = datetime.now(timezone.utc)
+    _stamp = lambda d: (_now + d).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
     message = {
         "envelopeVersion": 1,
         "seq": 1,
@@ -382,8 +386,8 @@ def test_a_late_notice_does_not_ack_away_the_message_it_names(tmp_path):
                     "role": "agent", "parts": [{"kind": "text", "text": "late"}]},
         "from": "carl@bridge.example",
         "to": ["muse@bridge.example"],
-        "sentAt": "2026-11-18T05:00:00Z",
-        "expiresAt": "2026-11-21T05:00:00Z",
+        "sentAt": _stamp(timedelta(hours=-1)),
+        "expiresAt": _stamp(timedelta(hours=23)),
         "turn": {"expectsReply": False, "closesThread": False},
     }
 

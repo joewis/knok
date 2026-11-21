@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from knok.identity import generate  # noqa: E402
+
+
+def _stamp(delta: timedelta) -> str:
+    """A wire timestamp relative to the wall clock, never a fixed date.
+
+    The envelope fixture used to carry literal dates, so the whole suite turned
+    red the moment the clock passed them; a test that fails because a day
+    changed tells you nothing about the code.
+    """
+    return (datetime.now(timezone.utc) + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture
@@ -33,8 +44,8 @@ def envelope_factory(identity, peer):
             },
             "from": identity.agent_id,
             "to": [peer.agent_id],
-            "sentAt": "2026-11-18T05:00:00Z",
-            "expiresAt": "2026-11-21T05:00:00Z",
+            "sentAt": _stamp(timedelta(hours=-1)),
+            "expiresAt": _stamp(timedelta(hours=23)),
             "turn": {"expectsReply": True, "closesThread": False},
         }
         envelope.update(overrides)

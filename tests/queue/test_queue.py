@@ -30,6 +30,11 @@ def _env(envelope_factory, **overrides):
     message = overrides.pop("message", {})
     env = envelope_factory()
     env["message"].update(message)
+    # This module runs on a simulated clock pinned at T0, so the envelope has to
+    # be dated against T0 as well — the shared fixture's wall-clock stamps would
+    # otherwise sit in the future relative to every assertion here.
+    env["sentAt"] = (T0 - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    env["expiresAt"] = (T0 + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     env.update(overrides)
     return env
 
