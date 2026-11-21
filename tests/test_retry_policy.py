@@ -781,7 +781,12 @@ def test_two_concurrent_scans_spend_two_budget_slots(carl_env, capsys, monkeypat
     )
     assert reserved == [1, 2], "the two scans spent two budget slots, not one twice"
     assert retry_count(records, first["messageId"]) == 2
-    assert muse.poll_once()["queued"] == 2, "two retries, two distinct envelopes delivered"
+    # Both scans deposited, but only one row lands: the two retries are two envelopes for the
+    # same message at the same seq, so the second is a duplicate of the first (issue #111) —
+    # the message is delivered once, with nothing stranded behind the acked seq.
+    counts = muse.poll_once()
+    assert counts["queued"] == 1, "the first retry lands"
+    assert counts["duplicate"] == 1, "the second retry is the same message at the same seq"
 
 
 def test_json_outcomes_carry_a_delivered_field(state, capsys):

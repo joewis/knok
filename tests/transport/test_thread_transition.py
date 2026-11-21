@@ -49,7 +49,9 @@ def test_a_retry_after_a_lost_ack_decrements_exactly_once(pair):
     assert muse.queue.depth() == 1, "and it must not be delivered twice"
 
     # The second reply the thread still owes is admitted: the lost ack did not eat an expectation.
-    second = build_envelope(pair.carl_id, pair.muse_id.agent_id, context_id="c-1")
+    # It carries seq 1: a real sender assigns increasing seqs per context, and two distinct
+    # replies cannot share seq 0 — one seq holds one message (issue #111).
+    second = build_envelope(pair.carl_id, pair.muse_id.agent_id, context_id="c-1", seq=1)
     assert muse.bridge.deliver(second) is not None
     assert expects_of(muse) == 0
     assert muse.queue.depth() == 2
