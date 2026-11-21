@@ -21,7 +21,7 @@ from knok.bridge import NOTICE_KEY, safe_log_text
 from knok.cli import _notice_line
 
 from test_phase2 import deployment, send  # noqa: F401  (fixture used by name)
-from test_refusal_notice import apply_policy, notices_of, policy_path, rewrite
+from test_refusal_notice import apply_policy, notices_of, policy_path, record_sent_attempt, rewrite
 
 
 def notice_item(sender_id, message_id, notice):
@@ -88,6 +88,8 @@ def test_an_overlong_notice_field_is_ignored(deployment):
 def test_a_plain_valid_notice_is_still_recorded(deployment):
     hub, bridges, root = deployment
     carl, muse = bridges["carl"], bridges["muse"]
+    # A plain valid notice is one about a message carl really sent to muse (#120).
+    record_sent_attempt(root, "carl", "m-ok", muse.identity.agent_id)
     item = notice_item(
         muse.identity.agent_id,
         "r-ok",
