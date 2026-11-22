@@ -7,6 +7,7 @@ must not turn the 403 path into an existence oracle. The negative here is the on
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from knok.bridge import MAX_HANDLE_ATTEMPTS, MAX_REFUSAL_NOTICES_PER_HOUR, NOTICE_KEY
 from knok.gate import Gate
@@ -433,3 +434,50 @@ def test_a_message_at_a_spent_seq_is_refused_and_the_sender_is_told(deployment):
     # And the hub claimed no delivery: the ack named the id as undelivered, so no frame was
     # minted into the sender's mailbox (#93).
     assert carl.client.fetch()["messages"] == []
+
+
+def test_a_notice_text_bounds_the_message_id_it_echoes(deployment):
+    """The id in the body is peer-controlled; it is bounded where the notice is composed (#142).
+
+    The receiver already refuses a notice whose fields are overlong, so this is defence in depth
+    rather than a live hole — but a string a peer chose should not be assembled into a message
+    without a limit at the point it is assembled.
+    """
+    hub, bridges, root = deployment
+    muse = bridges["muse"]
+    long_id = "m-" + "a" * 4000
+
+    assert muse._send_refusal_notice(
+        "carl@hub.local", long_id, "c-long-id", "sequence collision", datetime.now(timezone.utc)
+    )
+
+    body = bridges["carl"].client.fetch()["messages"]
+    texts = [
+        part.get("text", "")
+        for envelope in body
+        for part in (envelope.get("message") or {}).get("parts", [])
+    ]
+    assert texts, "the notice was deposited"
+    assert all(len(text) < 400 for text in texts), "the echoed id is bounded"
+
+
+def test_a_conflict_with_no_sender_is_recorded_rather_than_dropped(deployment):
+    """The one silent case, named: no sender means nobody to notify — but the operator still sees it.
+
+    A verified envelope always names a sender, so this path is unreachable from the wire; the test
+    exists so the decision is explicit in the record instead of being the shape of an early return.
+    """
+    hub, bridges, root = deployment
+    muse = bridges["muse"]
+
+    muse._refuse_conflict({"message": {"contextId": "c-no-sender"}}, "m-orphan")
+
+    rows = [
+        json.loads(line)
+        for line in (root / "agents" / "muse" / "refused.jsonl").read_text().splitlines()
+    ]
+    recorded = [row for row in rows if row["messageId"] == "m-orphan"]
+    assert len(recorded) == 1
+    assert recorded[0]["from"] is None
+    assert recorded[0]["rule"] == "sequence collision"
+    assert notices_of(root, "muse") == [], "no notice sent: there is nobody to address"

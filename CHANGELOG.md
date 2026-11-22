@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+**A follow-up in a thread is no longer silent**
+
+- `knok send` takes the next `seq` for its thread from the sent ledger instead of defaulting to 0
+  (#142). A thread is ordered by `seq` per sender, so the second message used to arrive at a
+  position its predecessor had spent; the receiving queue answered `duplicate` — the silent answer
+  a retry gets — and the message was gone with a 202 at the sender and an ack at the hub.
+- A different message at a spent `seq` is now a `conflict`, not a duplicate (#142). It is recorded
+  in `refused.jsonl` and reported to the sender as a refusal notice with the rule
+  `sequence collision`; a genuine retry (`metadata.retryOf`, same `seq`) is still a silent
+  duplicate, which is the only case silence was ever meant for. The bridge names a conflict in
+  `undelivered` on its ack, so the hub mints no `delivered` frame for mail it did not hand over.
+- **Known gap, stated rather than implied:** if an envelope reaches the queue without a sender
+  string, the conflict is recorded and the sender is *not* notified — there is nobody to address.
+  A verified envelope always names a sender, so the path is unreachable from the wire; it is
+  recorded in `refused.jsonl` so the operator still sees it, and it is the one conflict that is
+  silent by construction rather than by accident.
+
+**A `delivered` frame is a frame**
+
+- A reader recognised a hub transport frame by the absence of a `message` key, which is also how a
+  sealed form-2 envelope looks. `expired` and `dead` were named explicitly and `delivered` was not,
+  so it fell into the branch that leaves sealed mail at the hub: never printed, never acked, and
+  re-offered on every `recv` (#144). A recv-only agent accumulated one per message it sent.
+- The frame kinds are one constant, `HUB_FRAME_KINDS`, used by both branches: a frame is
+  recognised by its `kind`, never by what it lacks. A sealed envelope keeps the #70 treatment —
+  left at the hub, unacked, because acking would destroy mail `recv` cannot read.
+
 ## v0.4.0 — 2026-11-22 — the review sweep
 
 Twenty-six issues opened by nine area-by-area reviews and closed against code, then the three the

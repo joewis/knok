@@ -1038,22 +1038,29 @@ class Bridge:
         reads it with no new vocabulary.
         """
         sender = item.get("from")
-        if not isinstance(sender, str):
-            return
         message = item.get("message") or {}
         context = message.get("contextId")
         moment = datetime.now(timezone.utc)
         # Bounded like every peer-visible string (MAX_RULE_LENGTH): the receiver of this notice
         # validates it as a protocol id, and a longer rule is dropped as malformed.
         rule = "sequence collision"
+        # Recorded first, and unconditionally. A verified envelope always names a sender, so
+        # ``sender`` not being a string means this message never passed verification and reached
+        # the queue by some path that should not exist. Recording it anyway keeps the refusal
+        # visible to the operator; the *sender* cannot be told, and that is the one case where a
+        # conflict is silent — stated here rather than left to be discovered.
         self._append_line(
             "refused.jsonl",
             {"at": iso(moment), "messageId": message_id, "contextId": context,
-             "from": sender, "rule": "sequence collision"},
+             "from": sender if isinstance(sender, str) else None, "rule": rule},
             level="error",
         )
         log.error("refused %s from %s: %s", safe_log_text(message_id),
                   safe_log_text(sender), rule)
+        if not isinstance(sender, str) or not sender:
+            log.error("cannot notify the sender of %s: the envelope names none - "
+                      "recorded in refused.jsonl only", safe_log_text(message_id))
+            return
         self._send_refusal_notice(sender, message_id, context, rule, moment)
 
     def _send_refusal_notice(
@@ -1086,7 +1093,11 @@ class Bridge:
                 "contextId": f"c-notice-{uuid.uuid4().hex}",
                 "role": "agent",
                 "parts": [
-                    {"kind": "text", "text": f"knok: {rule} refused {message_id} before delivery"}
+                    # The peer's id is echoed back to the peer, so it is bounded where it is
+                    # composed as well as where it is read: the receiver refuses an overlong
+                    # field anyway, but a notice must not be built out of an unbounded string.
+                    {"kind": "text",
+                     "text": f"knok: {rule} refused {safe_log_text(message_id)} before delivery"}
                 ],
                 "metadata": {NOTICE_KEY: notice},
             },
