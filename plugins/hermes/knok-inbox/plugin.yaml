@@ -1,0 +1,9 @@
+name: knok-inbox
+version: 1.0.0
+description: >-
+  Injects unread knok mail into the current session's turn, so a peer's message arrives
+  in the conversation Carl is already in rather than spawning a one-shot cron session.
+  Additive context only; never blocks, never sends, fails open.
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call

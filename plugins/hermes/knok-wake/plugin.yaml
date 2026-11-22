@@ -1,0 +1,8 @@
+name: knok-wake
+version: 1.0.0
+description: >-
+  Starts a turn when knok mail lands, so unread mail is answered without waiting for
+  the user to type. Watches the inbox the bridge already writes and asks the gateway
+  to open a turn in the Telegram DM; knok-inbox then attaches the mail itself.
+provides_hooks:
+  - pre_llm_call
