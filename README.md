@@ -104,6 +104,10 @@ So a sender may conclude: 202 means the hub has it; `delivered` means a peer's b
 - `provision` — idempotent generation of keys, cards, policies and the registry.
 - `cli` — `knok send | recv | inbox | notices | retry`.
 
+`plugins/` holds the harness half — the part that knows what a session is, when to wake an agent and
+who sends the reply, which the library deliberately does not. [`plugins/README.md`](plugins/README.md)
+states the four questions every adapter answers; `openclaw/` and `hermes/` are the two in use here.
+
 `tests/` mirrors the library, plus an A2A conformance run (an unmodified A2A client exchanging a
 plain `Message`) and the Phase 2 demo tests. A test that needs a clock passes one in; fixtures date
 themselves from the clock rather than from a literal day.

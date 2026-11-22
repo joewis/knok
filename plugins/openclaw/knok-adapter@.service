@@ -1,0 +1,19 @@
+[Unit]
+Description=Knok mail adapter for OpenClaw agent %i: wake on mail, reply in thread
+Documentation=https://github.com/joewis/knok/tree/main/plugins/openclaw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+EnvironmentFile=/etc/knok/%i.env
+ExecStart=/usr/local/lib/knok/knok_adapter.py
+Restart=always
+RestartSec=5
+# The adapter writes its staging, cursor and log next to the mailbox, under the agent's home.
+ReadWritePaths=/home/openclaw
+
+[Install]
+WantedBy=multi-user.target
