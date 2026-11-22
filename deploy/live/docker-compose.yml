@@ -1,0 +1,99 @@
+# The live hub and the three bridges that run on elitedesk.
+#
+# This file describes what is actually running, not a demo. It replaces four transient systemd
+# units, which had `Restart=no` and would not have survived a reboot: the containers restart
+# themselves, and the state they use is the same state the units used, unchanged and in place.
+#
+#   docker compose -f deploy/live/docker-compose.yml up -d --build
+#   docker compose -f deploy/live/docker-compose.yml logs -f hub
+#
+# Why host networking: the hub binds the tailnet address directly (100.81.75.26:18443), which is
+# how Muse's VM reaches it through the reverse SSH tunnel, and the bridges need nothing but an
+# outbound connection to the same address. A Docker network would put a NAT hop in the path of
+# both without buying anything.
+#
+# Why the user overrides: the state directories predate this container and are owned by the users
+# that wrote them — root for the hub (its key file is 0600), carl, and openclaw. Overriding the
+# uid keeps that ownership exactly as it is, instead of chowning live keys to the image's user.
+# The registry is mounted read-only everywhere: no process on this host writes a card.
+
+name: knok-live
+
+x-knok: &knok
+  image: knok:0.4.0
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+  network_mode: host
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-bridge: &bridge
+  <<: *knok
+  command: ["knok.runner"]
+  environment:
+    KNOK_ROLE: bridge
+    KNOK_REGISTRY: /srv/knok-live/registry
+    KNOK_HUB_URL: http://100.81.75.26:18443
+    KNOK_POLL: "2"
+
+services:
+  hub:
+    <<: *knok
+    command: ["knok.runner"]
+    user: "0:0"
+    environment:
+      KNOK_ROLE: hub
+      KNOK_HUB_DOMAIN: knok.local
+      KNOK_STATE: /srv/knok-live/hub
+      KNOK_REGISTRY: /srv/knok-live/registry
+      KNOK_BIND: 100.81.75.26:18443
+    volumes:
+      - /srv/knok-live/hub:/srv/knok-live/hub
+      - /srv/knok-live/registry:/srv/knok-live/registry:ro
+
+  bridge-carl:
+    <<: *bridge
+    user: "1001:1001"
+    environment:
+      KNOK_ROLE: bridge
+      KNOK_AGENT: carl@knok.local
+      KNOK_STATE: /home/carl/.knok
+      KNOK_REGISTRY: /srv/knok-live/registry
+      KNOK_HUB_URL: http://100.81.75.26:18443
+      KNOK_POLL: "2"
+    volumes:
+      - /home/carl/.knok:/home/carl/.knok
+      - /srv/knok-live/registry:/srv/knok-live/registry:ro
+
+  bridge-sunny:
+    <<: *bridge
+    user: "1000:1000"
+    environment:
+      KNOK_ROLE: bridge
+      KNOK_AGENT: sunny@knok.local
+      KNOK_STATE: /home/openclaw/.knok
+      KNOK_REGISTRY: /srv/knok-live/registry
+      KNOK_HUB_URL: http://100.81.75.26:18443
+      KNOK_POLL: "2"
+    volumes:
+      - /home/openclaw/.knok:/home/openclaw/.knok
+      - /srv/knok-live/registry:/srv/knok-live/registry:ro
+
+  bridge-kiko:
+    <<: *bridge
+    user: "1000:1000"
+    environment:
+      KNOK_ROLE: bridge
+      KNOK_AGENT: kiko@knok.local
+      KNOK_STATE: /home/openclaw/.knok-kiko
+      KNOK_REGISTRY: /srv/knok-live/registry
+      KNOK_HUB_URL: http://100.81.75.26:18443
+      KNOK_POLL: "2"
+    volumes:
+      - /home/openclaw/.knok-kiko:/home/openclaw/.knok-kiko
+      - /srv/knok-live/registry:/srv/knok-live/registry:ro
