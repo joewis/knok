@@ -87,12 +87,12 @@ def from_b64(public_b64: str):
     return public_key_from_b64(public_b64)
 
 
-def send(sender: Bridge, recipient_id: str, text: str, *, context=None, message_id=None):
+def send(sender: Bridge, recipient_id: str, text: str, *, context=None, message_id=None, seq=0):
     """Sign and deposit one message the way an agent's CLI does."""
     moment = now()
     unsigned = {
         "envelopeVersion": 1,
-        "seq": 0,
+        "seq": seq,
         "message": {
             "kind": "message",
             "messageId": message_id or f"m-{moment.timestamp()}-{text[:4]}",

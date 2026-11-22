@@ -176,6 +176,24 @@ CREATE TABLE IF NOT EXISTS dead_letters (
 """
 
 
+def _retries_a_seen_message(message: dict, conn) -> bool:
+    """Whether this envelope is a retry of a message this queue has already seen.
+
+    A retry mints a new id carrying ``metadata.retryOf`` naming the original (SPEC §8). It
+    arrives at the *same* seq as the original, so a spent seq alone cannot tell a retry from a
+    collision — the name can. No retryOf, and the id it would retry was never seen: not a retry.
+    """
+    if not isinstance(message, dict):
+        return False
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    original = metadata.get("retryOf")
+    # The claim is enough. A sender that lies here only silences its own message, and requiring
+    # the original to still be in ``seen`` would fail exactly when the ledger has been pruned.
+    return isinstance(original, str) and bool(original)
+
+
 class QueueLockedError(RuntimeError):
     """A second process tried to open a queue that is already owned."""
 
@@ -638,12 +656,21 @@ class Queue:
                 context_id, sender, recipient, seq
             )
             if seq < next_seq and not late:
-                self._conn.execute(
-                    "INSERT INTO seen (message_id, context_id, first_seen)"
-                    " VALUES (?, ?, ?)",
-                    (message_id, context_id, _ts(moment)),
-                )
-                return "duplicate"
+                # A seq below the stream's next is spent. If this envelope says it retries a
+                # message we have already seen, it is a retry and silence is correct — the
+                # original was delivered. Anything else is a *different* message arriving at a
+                # seq another message already used, which is the sender breaking the ordering
+                # contract. Answering "duplicate" there is how a follow-up question vanished
+                # while every log said delivered (#142): the bridge acked it and the hub told
+                # the sender a bridge had taken it. It is refused by name instead.
+                if _retries_a_seen_message(message, self._conn):
+                    self._conn.execute(
+                        "INSERT INTO seen (message_id, context_id, first_seen)"
+                        " VALUES (?, ?, ?)",
+                        (message_id, context_id, _ts(moment)),
+                    )
+                    return "duplicate"
+                return "conflict"
             if self._conn.execute(
                 "SELECT 1 FROM messages WHERE context_id = ? AND sender = ?"
                 " AND recipient = ? AND seq = ?",
@@ -657,12 +684,14 @@ class Queue:
                 # so the second row could never be delivered. The ``seen``
                 # insert is what makes a re-offer of the refused id a
                 # duplicate too, rather than a resurrection.
-                self._conn.execute(
-                    "INSERT INTO seen (message_id, context_id, first_seen)"
-                    " VALUES (?, ?, ?)",
-                    (message_id, context_id, _ts(moment)),
-                )
-                return "duplicate"
+                if _retries_a_seen_message(message, self._conn):
+                    self._conn.execute(
+                        "INSERT INTO seen (message_id, context_id, first_seen)"
+                        " VALUES (?, ?, ?)",
+                        (message_id, context_id, _ts(moment)),
+                    )
+                    return "duplicate"
+                return "conflict"
             # The local cap (issue #116), checked after the duplicate answers
             # so a re-offer at cap is still a duplicate: the hub cap alone
             # does not bound this queue, because the hub copy is deleted on

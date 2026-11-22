@@ -171,9 +171,10 @@ def cmd_send(args: argparse.Namespace) -> int:
     moment = datetime.now(timezone.utc)
     message_id = args.message_id or f"m-{uuid.uuid4().hex}"
     context = args.context or f"c-{uuid.uuid4().hex}"
+    seq = args.seq if args.seq is not None else _next_seq(state, context, recipient)
     unsigned: dict[str, Any] = {
         "envelopeVersion": 1,
-        "seq": args.seq,
+        "seq": seq,
         "message": {
             "kind": "message",
             "messageId": message_id,
@@ -210,6 +211,38 @@ def cmd_send(args: argparse.Namespace) -> int:
         )
     )
     return status
+
+
+def _next_seq(state: BridgeState, context: str, recipient: str) -> int:
+    """The next ``seq`` this agent should use in ``context``, counted per thread and per sender.
+
+    The default used to be a flat 0, which meant the second message in every thread — the
+    follow-up question — arrived at a seq its predecessor had already spent. The receiving queue
+    answered ``duplicate``, the bridge acked, and the message was gone with a success on both
+    ends (#142). The ledger already knows what this agent sent, so the default reads it.
+
+    A retry keeps the original's seq (it is the same position in the thread), so the maximum is
+    the right basis rather than a count. An unreadable ledger falls back to 0 — the first
+    message — because a send must still be possible, and says so on stderr.
+    """
+    from .retry import read_attempts
+
+    highest = -1
+    try:
+        attempts = read_attempts(state.directory)
+    except (OSError, ValueError) as exc:
+        print(f"warning: cannot read the sent ledger to pick a seq: {exc}", file=sys.stderr)
+        return 0
+    for envelope in attempts.values():
+        message = envelope.get("message") or {}
+        if message.get("contextId") != context:
+            continue
+        if envelope.get("to") != [recipient]:
+            continue
+        seq = envelope.get("seq")
+        if isinstance(seq, int):
+            highest = max(highest, seq)
+    return highest + 1
 
 
 def _try_deposit(client: HubClient, envelope: dict[str, Any]) -> tuple[int, dict[str, Any] | None]:
@@ -1031,7 +1064,13 @@ def main(argv: list[str] | None = None) -> int:
     #: the messageId the failed attempt printed rather than making the caller guess a
     #: context id.
     send.add_argument("--retry-of", dest="retry_of", default=None, metavar="MESSAGE_ID")
-    send.add_argument("--seq", type=int, default=0)
+    send.add_argument(
+        "--seq",
+        type=int,
+        default=None,
+        help="position in this thread; defaults to the next one this agent used "
+             "in the context (0 for a new thread)",
+    )
     send.add_argument("--ttl-hours", type=int, default=72)
     send.add_argument("--expects-reply", action="store_true", default=True)
     send.add_argument("--no-reply", dest="expects_reply", action="store_false")

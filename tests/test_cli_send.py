@@ -86,3 +86,67 @@ def test_send_parser_rejects_reply_to():
             ]
         )
     assert excinfo.value.code == 2
+
+
+def test_a_follow_up_in_a_thread_takes_the_next_seq(monkeypatch, tmp_path, identity):
+    """The default was a flat 0, so the second message in a thread was silently refused (#142).
+
+    Two sends in one context, no ``--seq``: the receiver orders by seq per thread and per sender,
+    so the first is 0 and the second must be 1, or the follow-up question arrives at a spent
+    position and the queue answers "conflict" — which is what happened for real.
+    """
+    state = BridgeState(
+        agent_id=identity.agent_id,
+        directory=tmp_path,
+        hub_url="http://127.0.0.1:1",
+        registry={"muse@bridge.example": {}},
+    )
+    monkeypatch.setattr("knok.cli._state_from_env", lambda: (state, identity))
+    sent: list[dict] = []
+
+    class CapturingClient:
+        def __init__(self, hub_url, identity):
+            pass
+
+        def deposit(self, envelope):
+            sent.append(envelope)
+            return {}
+
+    monkeypatch.setattr("knok.cli.HubClient", CapturingClient)
+
+    for text in ("first", "follow-up", "third"):
+        assert main(["send", "--to", "muse@bridge.example", "--text", text,
+                     "--context", "c-thread"]) == 0
+
+    assert [envelope["seq"] for envelope in sent] == [0, 1, 2]
+    # A different thread starts at 0 again: seq is per (context, sender, recipient).
+    assert main(["send", "--to", "muse@bridge.example", "--text", "other thread",
+                 "--context", "c-other"]) == 0
+    assert sent[-1]["seq"] == 0
+
+
+def test_an_explicit_seq_still_wins(monkeypatch, tmp_path, identity):
+    """The auto default must not override a caller that knows the position — retries rely on it."""
+    state = BridgeState(
+        agent_id=identity.agent_id,
+        directory=tmp_path,
+        hub_url="http://127.0.0.1:1",
+        registry={"muse@bridge.example": {}},
+    )
+    monkeypatch.setattr("knok.cli._state_from_env", lambda: (state, identity))
+    sent: list[dict] = []
+
+    class CapturingClient:
+        def __init__(self, hub_url, identity):
+            pass
+
+        def deposit(self, envelope):
+            sent.append(envelope)
+            return {}
+
+    monkeypatch.setattr("knok.cli.HubClient", CapturingClient)
+
+    for seq in (0, 7):
+        assert main(["send", "--to", "muse@bridge.example", "--text", f"s{seq}",
+                     "--context", "c-thread", "--seq", str(seq)]) == 0
+    assert [envelope["seq"] for envelope in sent] == [0, 7]
