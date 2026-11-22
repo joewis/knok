@@ -369,3 +369,29 @@ def test_a_sealed_envelope_is_left_at_the_hub_rather_than_acked_away(
     assert recv_once(state, ns.muse_id) == 0
     assert capsys.readouterr().out == ""
     assert acked == [], "a sealed envelope was acked: that deletes mail recv cannot read"
+
+
+def test_recv_acks_a_delivered_frame_so_the_sender_is_told_once(agent_state, capsys):
+    """A ``delivered`` frame is a transport frame, not a sealed envelope (#144).
+
+    Since 0.4 the hub mints one into the sender's mailbox when the recipient's bridge acks, so a
+    recv-only agent learns its message landed. The reader recognised a frame by the absence of a
+    ``message`` key, which is also how a sealed form-2 envelope looks, so the frame fell into the
+    "leave it at the hub" branch: never printed, never acked, re-offered on every recv forever.
+    """
+    ns, state = agent_state
+    envelope = deposit(ns, text="did you get this?", seq=0, context="c-delivered")
+    message_id = envelope["message"]["messageId"]
+
+    # The recipient acks it, which is what queues the hub's frame back into our mailbox.
+    from knok.hubclient import HubClient
+
+    HubClient(ns.url, ns.muse_id).ack([message_id])
+
+    assert recv_once(state, ns.carl_id) == 1
+    printed = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [frame["kind"] for frame in printed] == ["delivered"]
+    assert printed[0]["messageId"] == message_id
+
+    # Read once, acked once: the mailbox is empty on the next pass.
+    assert recv_once(state, ns.carl_id) == 0

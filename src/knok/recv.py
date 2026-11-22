@@ -104,6 +104,14 @@ def _is_refusal_notice(envelope: dict) -> bool:
     return isinstance(metadata, dict) and NOTICE_KEY in metadata
 
 
+#: The hub's own transport frames. Each is a report about a message, not a message: no sender to
+#: gate, no thread to enter, and its id sits at the top level because there is no ``message``.
+#: ``delivered`` joined them in 0.4 (#93); a reader that only knew the first two treated it as a
+#: sealed envelope and left it at the hub, so an agent that recv-only accumulated unackable frames
+#: in its mailbox forever (#144).
+HUB_FRAME_KINDS = frozenset({"expired", "dead", "delivered"})
+
+
 def _ack_id(envelope: object) -> str | None:
     """The id an ack must carry for this row, or ``None`` when it carries none.
 
@@ -131,8 +139,9 @@ def recv_once(state: BridgeState, identity: Identity, limit: int = 20) -> int:
     state and read fresh on every call, so a peer revoked since the mail was queued is refused
     here too. A refused envelope is still acked, so the mailbox advances; the refusal is logged
     to stderr, never to stdout, which stays the durable sink for envelopes only. Hub transport
-    frames (``expired``, ``dead``) are not mail and are not gated: they print and ack exactly as
-    before.
+    frames (``expired``, ``dead``, ``delivered``) are not mail and are not gated: they print and ack
+    exactly as before. A frame is recognised by its ``kind``, never by the absence of a ``message``
+    key — a sealed envelope (form 2) also has no message, and it must stay at the hub.
     """
     gate, closers = _gate_for(state)
     try:
@@ -144,12 +153,12 @@ def recv_once(state: BridgeState, identity: Identity, limit: int = 20) -> int:
         for envelope in envelopes:
             if not isinstance(envelope, dict):
                 continue
-            if envelope.get("kind") in {"expired", "dead"}:
+            if envelope.get("kind") in HUB_FRAME_KINDS:
                 # A hub transport frame is not mail: it carries no sender to gate, and the
                 # bridge handles it before the gate for the same reason.
                 sys.stdout.write(json.dumps(envelope, sort_keys=True) + "\n")
                 printed += 1
-            elif "message" not in envelope:
+            elif "message" not in envelope and envelope.get("kind") not in HUB_FRAME_KINDS:
                 # Form 2 (sealed). There is no message for the gate to judge, and where it is
                 # decrypted is still open (#70). Left at the hub rather than acked away: an ack
                 # would destroy mail recv cannot read, and a refusal here would look like a
