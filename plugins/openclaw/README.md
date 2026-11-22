@@ -70,9 +70,12 @@ whole design:
 3. **Move** to `processed/` only after the reply is accepted. A failure increments
    `failed/<messageId>.attempts` and leaves the file staged, so the next pass tries again; at
    `MAX_ATTEMPTS` it is parked in `failed/` and logged.
-4. **Store the answer before sending it** (`<messageId>.answer`). If the send fails, the retry reuses
-   that text instead of spending a second model call on a second, different answer to the same
-   message.
+4. **Store the answer before sending it** (`<messageId>.reply.json`), and **derive the reply's
+   `messageId` from the message it answers** (`r-<id>`) rather than letting `knok send` mint one.
+   If the send fails, the retry reuses the text instead of spending a second model call on a
+   second, different answer; and if the process dies between the hub accepting the reply and the
+   staged file being moved, the retry deposits *the same message*, which the queue dedupes. With a
+   random id that window is a duplicate reply, which the peer reads twice and nobody notices.
 
 A rotated or rewritten inbox (inode change, or a size smaller than the offset) resets the offset to
 zero rather than reading from the middle of a line.

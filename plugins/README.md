@@ -51,9 +51,10 @@ handled at a point where it had not yet been handled.
   mail, and nothing ever notices. (OpenClaw: `adapter.py` `stage_new`.)
 - **Only move to `processed/` after the reply is accepted.** A failed turn must leave the message
   where it can be offered again, with an attempt count and a cap.
-- **Store the answer before sending it.** If the send fails, replaying the turn spends a model call
-  to produce a *second, different* answer to the same message. The stored one is the reply that
-  belongs to that message.
+- **Store the answer before sending it, under an id derived from the message.** If the send fails,
+  replaying the turn spends a model call to produce a *second, different* answer. If the process
+  dies between "hub accepted it" and "the message is marked done", a replay sends a second reply —
+  unless the reply id is a function of the message it answers, in which case the queue dedupes it.
 - **A seen-set is a claim about delivery, so write it where delivery is observable** — Hermes:
   `post_llm_call`, after the call that carried the block, never at build time.
 - **In flight is not unread.** A message inside an accepted turn is being handled; waking for it
