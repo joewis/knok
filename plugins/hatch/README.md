@@ -9,50 +9,67 @@ cron — not in this repository, so this directory is a README only.
 ## The four answers
 
 **When does it wake?** A hook polls every 15 s and runs `knok recv`. Each
-envelope is staged to `inbox/<messageId>.json` with a claim file, and one
-detached worker is woken per batch, so a burst of three messages is one
-worker, not three. A claim goes stale after 15 minutes, so an envelope no
-worker picked up is offered again. A 30-minute backstop cron runs the same
-steps if the hook misses a batch.
+envelope is staged to `inbox/<messageId>.json` with a claim file. A worker
+is expensive, so wakes coalesce on 30 seconds of quiet time: mail that
+arrives while a worker is pending joins that worker's batch, with a cap so
+mail never waits unbounded. The 15-second tick is the poll interval, not
+the wake. A claim is stale only if its mtime is old — the worker touches
+the claim file's mtime while it runs, so a live turn is never re-offered
+mid-run. A 30-minute backstop cron runs the same steps if the hook misses
+a batch.
 
 **Which session?** None that persists. Mail lands in the detached worker run;
 there is no session to inject into and no `knok:<peer>` equivalent. Per-peer
 memory lives in `state/<peer>.md`, which the worker reads before answering
-and updates after. The worker cannot start a turn in the user's conversation.
+and updates after. A per-peer lock file is held from the state read until
+the reply is sent and the state written, so two workers for the same peer
+cannot interleave. The worker cannot start a turn in the user's conversation.
 That is a design constraint of the harness, not a gap in this adapter: mail
 that needs the user is reported in the worker's summary, and the main agent
 carries it to the user.
 
 **Who sends the reply?** The worker, through the CLI. The incoming envelope
 carries the thread's `contextId`; the worker sends with that context, so the
-thread stays whole. The agent never invents a context.
+thread stays whole. The agent never invents a context. When a message needs
+the user and the user has not answered, the worker sends a one-line holding
+reply in the same contextId rather than leaving the sender with nothing —
+never drop silently (§6); the real answer follows later in the same thread.
+The outbound message id is minted deterministically from the inbound id and
+written to `sent.jsonl` before the send, so a retried send produces the same
+id and the hub/queue dedupes it.
 
 **What counts as delivered?** The hub accepting the reply. Only then does
 the envelope move from `inbox/` to `processed/`. Nothing is marked handled
-before that.
+before that. A replayed send carries the same deterministic message id, so
+it is deduped rather than delivered twice.
 
 ## How it works, and why it is shaped this way
 
 **Poll and stage.** The hook runs `knok recv` and stages every envelope it
 prints to `inbox/<messageId>.json`, writing a claim file for each. A staged
-file whose claim is missing or stale (older than 15 minutes) is offered
-first, before any new mail — that is the rescue path for a worker that died
-mid-batch. The hook never acks anything itself; `recv` acks after printing,
+file whose claim is missing or stale — stale by mtime, not by a fixed age —
+is offered first, before any new mail — that is the rescue path for a worker
+that died mid-batch. The hook never acks anything itself; `recv` acks after printing,
 and the claim is what keeps a second worker from picking the same file up.
 
-**Worker.** One detached run per batch. It reads the staged envelopes oldest
-first, reads `state/<peer>.md` for the sender, replies with `knok send`
-when the envelope expects one, updates the state file, and moves the
-envelope to `processed/` — but only after the hub accepts the reply. A
-message that asks something only the user can answer is not answered for
-them; it is reported in the worker's summary for the main agent to carry to
-the user. The worker never replies to an envelope with `expectsReply:
+**Worker.** One detached run per batch, coalesced on 30 seconds of quiet
+time. It reads the staged envelopes oldest first, takes the per-peer lock,
+reads `state/<peer>.md` for the sender, replies with `knok send` when the
+envelope expects one — minting the outbound message id deterministically
+from the inbound id and writing it to `sent.jsonl` before sending — updates
+the state file, releases the lock, and moves the envelope to `processed/` —
+but only after the hub accepts the reply. A message that asks something only
+the user can answer is not answered for them; it is reported in the worker's
+summary for the main agent to carry to the user, and the worker sends a
+one-line holding reply in the same contextId so the sender is not left with
+nothing. The worker never replies to an envelope with `expectsReply:
 false`; that would be a protocol error.
 
 **Backstop.** A cron runs every 30 minutes and repeats the hook's steps:
 list `inbox/`, run `recv`, process what is unclaimed. It exists because a
 hook wake can be missed, and it uses the same claim files, so it cannot
-double-process what the hook already claimed.
+double-process what the hook already claimed. It wakes on the same
+30-second quiet-time rule as the hook.
 
 ## Layout
 
@@ -74,12 +91,37 @@ State files, mailboxes, and identity material stay outside the tree, under
   sends it in the same run. If the send fails, the retry spends a second
   model call to produce a second, different answer to the same message.
   The answer that belongs to a message is the one that was sent, and it is
-  not kept anywhere.
+  not kept anywhere. The deterministic message id softens this: a retried
+  send is deduped by id even when the answer differs, so the sender never
+  receives two different answers — but the answer itself is still not
+  stored.
 - **Move to `processed/` is not atomic with the send.** A worker that dies
   between the send and the move leaves the envelope in `inbox/`. After the
   claim expires, another worker offers it again and can reply a second
-  time. The window is small — one filesystem move — but it exists.
+  time. The window is small — one filesystem move — but it exists. The
+  deterministic message id softens this too: a replay after a crash carries
+  the same id, so the hub dedupes it instead of delivering a second reply.
 - **No push, and no session to push into.** Latency is the poll interval
   plus worker startup, and mail that needs the user waits for the main
   agent to surface it. That is the harness's shape, not a bug to fix in
   the adapter.
+
+## Review (2026-11-22)
+
+Carl reviewed this README and asked for five improvements; all five are
+accepted and folded in above.
+
+1. **Heartbeat the claim mtime.** Staleness is mtime-based: the worker
+   touches the claim file's mtime while it runs, so a live turn is never
+   re-offered mid-run.
+2. **Per-peer lock on `state/<peer>.md`.** Held from the state read until
+   the reply is sent and the state written, so two workers for the same
+   peer cannot interleave.
+3. **Holding reply when a human must answer.** One line, same contextId,
+   never drop silently (§6); the real answer follows later in the same
+   thread.
+4. **Deterministic `--message-id` from the inbound id, written before
+   sending.** A retried send produces the same id, so replays dedupe.
+5. **Coalesce wakes on 30 seconds of quiet time, with a cap.** The worker
+   is expensive; the 15-second tick stays as the poll interval, not the
+   wake.
