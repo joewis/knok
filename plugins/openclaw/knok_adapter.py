@@ -20,6 +20,9 @@ Two durability rules, both learned from the mailbox it sits on:
     advanced — the same shape as the bridge's own "write, then ack".
   * A staged file is only moved to ``processed/`` after the reply is accepted by the hub. A failed
     turn leaves the file in place (with an attempt count) and it is offered again.
+  * The reply's ``messageId`` is derived from the message it answers and written down before the
+    send. Moved or not, a replay then deposits the same message and the queue dedupes it; with a
+    freshly minted id it would be a second reply to one question.
 """
 
 from __future__ import annotations
@@ -199,14 +202,25 @@ def _final_text(payload) -> str:
     return ""
 
 
-def send_reply(to: str, context: str, text: str, reply_to: str) -> dict:
+def reply_id_for(message_id: str) -> str:
+    """The reply id is fixed by the message it answers, so a replay deposits the same message.
+
+    ``knok send`` mints a random id by default. A crash between the hub accepting the reply and
+    this adapter moving the staged file would then re-send under a *new* id and the peer would see
+    the answer twice. Derived, the second deposit dedupes at the queue, which is the only place
+    that can decide it.
+    """
+    return "r-" + (message_id[2:] if message_id.startswith("m-") else message_id)
+
+
+def send_reply(to: str, context: str, text: str, reply_id: str) -> dict:
     env = dict(os.environ, KNOK_AGENT=AGENT_ID, KNOK_STATE=KNOK_STATE,
                KNOK_REGISTRY=KNOK_REGISTRY, KNOK_HUB_URL=KNOK_HUB_URL)
     if PYTHONPATH:
         env["PYTHONPATH"] = PYTHONPATH
     result = subprocess.run(
         [PYTHON, "-m", "knok.cli", "send", "--to", to, "--context", context,
-         "--reply-to", reply_to, "--text", text],
+         "--message-id", reply_id, "--text", text],
         capture_output=True, text=True, timeout=60, env=env,
     )
     if result.returncode != 0:
@@ -224,25 +238,28 @@ def handle(envelope: dict, staged_file: Path) -> str:
         return "own message"
     peer = sender.split("@")[0]
     session_key = f"knok:{peer}"
-    answer_file = staged_file.with_suffix(".answer")
-    if answer_file.exists():
+    sidecar = staged_file.with_suffix(".reply.json")
+    if sidecar.exists():
         # A previous attempt got an answer out of the agent and then failed to send it. Re-running
         # the turn would spend a model call to produce a second, different answer for the same
-        # message; the stored one is the reply that belongs to this message.
-        answer = answer_file.read_text()
-        log(f"reusing stored answer for {message_id}")
+        # message; the stored one is the reply that belongs to this message, under the id it will
+        # be deposited with.
+        stored = json.loads(sidecar.read_text())
+        answer, reply_id = stored["text"], stored["messageId"]
+        log(f"reusing stored answer for {message_id} as {reply_id}")
     else:
         log(f"wake {session_key} for {message_id} thread={context} expects_reply={expects_reply}")
         answer = run_turn(session_key, build_prompt(envelope, sender, context, expects_reply))
+        reply_id = reply_id_for(message_id)
         if expects_reply:
             if not answer:
                 raise RuntimeError("the agent returned no text to send")
-            tmp = answer_file.with_suffix(".answer.tmp")
-            tmp.write_text(answer)
-            tmp.replace(answer_file)
+            tmp = Path(str(sidecar) + ".tmp")
+            tmp.write_text(json.dumps({"text": answer, "messageId": reply_id}))
+            tmp.replace(sidecar)  # before the send: the id has to survive a crash mid-send
     if not expects_reply:
         return f"noted, no reply expected ({session_key})"
-    result = send_reply(sender, context, answer, message_id)
+    result = send_reply(sender, context, answer, reply_id)
     return f"replied in {context}: {result}"
 
 
@@ -282,10 +299,12 @@ def main() -> int:
                     log(f"gave up on {message_id}; left in {FAILED}")
                 continue
             shutil.move(str(staged_file), str(PROCESSED / staged_file.name))
-            try:
-                staged_file.with_suffix(".answer").unlink()
-            except OSError:
-                pass
+            for leftover in (staged_file.with_suffix(".reply.json"),
+                             staged_file.with_suffix(".answer")):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
             log(f"done {message_id}: {outcome}")
         time.sleep(POLL_SECONDS)
 
