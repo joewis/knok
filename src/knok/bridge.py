@@ -902,8 +902,9 @@ class Bridge:
         message = item.get("message")
         if not isinstance(message, dict):
             # Sealed (form 2): its contextId is inside the sealed body, so neither the gate nor the
-            # queue can order it before decryption (and where that decryption happens is #70's
-            # open decision). Left unhandled rather than guessed at.
+            # queue can order it before decryption. Decision 0003 puts the decryption here, at
+            # admission — this branch is where that step goes, and until it exists a sealed item is
+            # left at the hub rather than guessed at (#70, #83).
             log.warning("no form 1 message in an item from %s; leaving it at the hub", sender)
             return "unhandled", None
 

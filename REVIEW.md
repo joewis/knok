@@ -8,7 +8,7 @@ argue that the code is correct — that is the review's job.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest                       # 411 tests, ~100 s, no network, no credentials
+.venv/bin/pytest                       # 478 tests, ~110 s, no network, no credentials
 deploy/demo.sh                         # the Phase 2 exit criterion, with assertions
 ```
 
@@ -29,17 +29,19 @@ rather than loud. The file is what the claim rests on; the right-hand column is 
 | Approval is a local precondition, not a wire state | `contacts.py`, `docs/SPEC.md` §9 | Ask what a peer can infer from an acceptance, and whether `held` is ever visible off-box |
 | A decision says what the owner was shown | `contacts.py` (`decisions` table) | Rotate a key between presentation and decision; the two fingerprints must differ on a refusal and be refused outright on an approval |
 | A card is pinned under the name its body signs | `contacts.py::load_cards` | Misfile a valid card under another agent's name; it must not grant that name |
-| A sealed body is opened by the receiving bridge | `docs/decisions/0003-...md`, `envelope.py::unseal` | Check the RFC 9180 A.2 vectors in both directions; wrong key, wrong aad and tampered ciphertext must be refusals, never exceptions |
-| A retry never mints a new id | `cli.py::send --retry-of`, `retry.py` | Retry a failed send and compare `messageId` and `contextId` on the wire |
+| A sealed body's plaintext is pinned, and `aad`/`info` are empty | `docs/decisions/0003-...md`, `envelope.py::seal`, `hpke.py` | Seal a body that is not the JCS-encoded `Message`, or open one with a non-empty `aad`; both must be refusals, never a silently wider contract. Check the RFC 9180 A.2 vectors in both directions |
+| A retry is a new message, not a replay | `cli.py::send --retry-of`, `retry.py` | Retry a failed send: `messageId` must differ from the original, `contextId` and `seq` must not, and `retryOf` must name the original. Then replay the *old* envelope — the tombstone must refuse it |
 | A retry budget is enforced by a durable reservation | `retry.py` | Make the ledger unwritable; the retry must not be performed |
 
 ## What is deliberately incomplete
 
 Not defects, and each is named where it is left out:
 
-- **Sealed mail cannot travel yet.** The boundary is decided (0003) and the primitives are in
-  (`hpke.py`, `envelope.seal`/`unseal`), but nothing mints a sealed message, the hub refuses form 2
-  at deposit, and the queue still rejects it. What §6 still owes is issue **#83**.
+- **Sealed mail cannot be received yet.** The boundary is decided (0003), the bytes are pinned
+  (`#83`), and the hub now verifies and stores a form 2 envelope. What is missing is the bridge's
+  unseal step: the queue refuses a sealed body because its `contextId` is inside the ciphertext and
+  ordering needs it in the clear, so a bridge leaves a sealed item at the hub. Nothing mints a
+  sealed message until that slice lands.
 - **The public hub is not built.** `docs/PHASE3.md` is the plan; registration, the VPS and the
   abuse runbook are Phase 3.
 - **Presence push is deferred to Phase 4.** Presence is pull-on-demand only.
@@ -52,8 +54,9 @@ Not defects, and each is named where it is left out:
 
 - `docs/SPEC.md` — the design, and the normative claims this code is answerable to.
 - `docs/HUB.md` — the hub's own contract: what it stores, what it can read, what it must not.
-- `docs/decisions/0001-0004` — the four decisions that are not obvious from the code: two authors,
-  registry key records, the sealed decryption boundary, and what "pinned" means.
+- `docs/decisions/0001-0005` — the five decisions that are not obvious from the code: two authors,
+  registry key records, the sealed decryption boundary, what "pinned" means, and why a deposit from
+  a key that is not valid now is refused.
 - `docs/TESTING.md` — the testing phase this repository is in, and the security review's inputs.
 - `docs/WORKING.md` — how the authors work, including what a review has to contain to count.
 - `docs/review-briefs/` — the repository cut into nine reviewable areas, one file each, with the
