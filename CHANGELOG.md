@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.4.0 — 2026-11-22 — the review sweep
+
+Twenty-six issues opened by nine area-by-area reviews and closed against code, then the three the
+sweep did not cover (#83, #90, #93). Every fix carries a test that fails on its parent; where the
+red was checked, it was checked by disabling the change rather than reverting the file, because a
+missing import is not evidence of a missing behaviour.
+
+**The hub can no longer be talked into a false success**
+
+- A deposit from a key that is not valid *now* is refused (#90, decision 0005). Verifying at the
+  envelope's own `sentAt` is the audit property and stays; on its own it let the holder of a revoked
+  key mint new mail with a backdated timestamp. The deposit is the one moment the key's status is
+  knowable, so it is asked. The refusal carries a distinct body — it describes the depositor's own
+  key, never a recipient's existence.
+- An ack queues a hub-signed `delivered` frame into the **sender's** mailbox (#93). Silence no
+  longer means three different things. A bridge that takes custody and does not hand a message to
+  the application names those ids in `undelivered` on its ack, and no frame is minted: telling a
+  sender both "delivered" and "refused" is worse than telling it nothing.
+- An acked id stays spent until its envelope expires (#99), so a replay of a still-valid envelope
+  is not stored and handed over a second time.
+- The hub bounds itself: 64 concurrent handlers with a 60-second idle timeout (#103), parser
+  failures answer the shared 403 rather than the stdlib's HTML 500-class errors (#105), and one
+  ack carries at most 100 ids (#106).
+- One request cannot cost an unbounded amount: duplicated authentication headers and ambiguous
+  body framing are refused instead of resolved by picking (#102, #104), and nonces are capped with
+  a forward-only per-agent request floor (#100, #101).
+- Envelope identity is tightened: `turn` is validated, lifetime is capped at 30 days from `sentAt`,
+  and the identity key file is created 0600 through a symlink-refusing path (#107–#110).
+
+**A failure is never recorded as a success**
+
+- JSONL appends are crash-atomic and a failed dead-frame write refuses the ack (#112, #114).
+- Drop records keep metadata only, never the rejected envelope (#122).
+- A refusal notice must prove it describes a message this agent sent to that peer, and name a rule
+  the gate defines (#120).
+- A second message reusing an in-flight `seq` is a duplicate rather than a row that can never be
+  delivered (#111).
+- A retry mints a new envelope — same thread, same `seq`, `retryOf`, fresh timestamps, new
+  signature — instead of replaying bytes (#117, #118).
+
+**The spec says what the code does**
+
+- §6 pins the sealed plaintext (JCS-encoded A2A `Message`) and pins HPKE `aad`/`info` empty by
+  decision, enforced at the API boundary (#83).
+- §9 restates the rate limits to what the gate enforces, marks the hub-side ceilings as **not
+  implemented**, and drops the `probation` flag from the parser so nobody can configure a limit
+  nothing reads (#119).
+
+**Review material**
+
+- Nine review briefs, one per area, with line citations resolved against `828c9791` (#91, #92).
+- The citation count is reproducible and recorded with its method: 1,389 spans across the nine
+  files, 1,300 of them in 02–09 (#98).
+- Test fixtures date themselves from the clock rather than from a literal day (#95).
+
+**Known gaps, stated rather than implied**
+
+- Hub-side rate limits (100/hour per sender, 10,000/hour per hub, the low-engagement throttle) are
+  specified and unimplemented.
+- Topology A, direct peer-to-peer mail with no hub, gets no benefit from the deposit-time key
+  check; it still relies on the receiver's `sentAt` check alone.
+- A legacy `{fingerprint: public_key}` registry cannot answer "is this key valid now", so the
+  deposit-time check is skipped there — decision 0002's "valid forever".
+- The `delivered` frame moves a trust boundary: the hub signs it, but the receiving bridge decides
+  what counts as delivered. A bridge that acks everything as delivered tells its senders a lie the
+  hub cannot detect.
+- Rotation is still an open question in `HUB.md`, not a designed mechanism.
+
 ## v0.3.0 — 2026-11-20 — the hardening sweep
 
 Two days of defects found by review and by running the thing, each closed against code with a
