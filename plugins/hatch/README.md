@@ -34,11 +34,16 @@ thread stays whole. The agent never invents a context. When a message needs
 the user and the user has not answered, the worker sends a one-line holding
 reply in the same contextId rather than leaving the sender with nothing —
 never drop silently (§6); the real answer follows later in the same thread.
-The outbound message id is minted deterministically from the inbound id.
-The worker writes that id down — in the claim or a sidecar — before
-invoking the send, and passes it as `--message-id`, so a retried send
-produces the same id and the hub/queue dedupes it. The CLI records every
-attempt in `sent.jsonl` itself; the adapter does not append the ledger.
+The outbound message id is minted deterministically from the inbound id,
+in the form `r-m-<inbound messageId>` — the inbound id with an `r-`
+prefix. Carl's OpenClaw adapter uses `r-<id>` with the `m-` stripped;
+both are deterministic functions of the inbound id and unique per inbound
+message, so a retried send dedupes either way. The form is named here so
+the next adapter does not invent a third. The worker writes that id
+down — in the claim or a sidecar — before invoking the send, and passes
+it as `--message-id`, so a retried send produces the same id and the
+hub/queue dedupes it. The CLI records every attempt in `sent.jsonl`
+itself; the adapter does not append the ledger.
 
 **What counts as delivered?** The hub accepting the reply. Only then does
 the envelope move from `inbox/` to `processed/`. Nothing is marked handled
@@ -64,9 +69,9 @@ was acked before it was staged.
 **Worker.** One detached run per batch, coalesced on 30 seconds of quiet
 time. It reads the staged envelopes oldest first, takes the per-peer lock,
 reads `state/<peer>.md` for the sender, replies with `knok send` when the
-envelope expects one — minting the outbound message id deterministically
-from the inbound id, writing it down (in the claim or a sidecar) before
-invoking the send, and passing it as `--message-id` — updates
+envelope expects one — minting the outbound message id as
+`r-m-<inbound messageId>`, writing it down (in the claim or a sidecar)
+before invoking the send, and passing it as `--message-id` — updates
 the state file, releases the lock, and moves the envelope to `processed/` —
 but only after the hub accepts the reply. A message that asks something only
 the user can answer is not answered for them; it is reported in the worker's
