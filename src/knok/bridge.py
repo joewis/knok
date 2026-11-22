@@ -749,9 +749,11 @@ class Bridge:
         except HubError as exc:
             log.warning("fetch failed: %s", exc)
             return {"fetched": 0, "queued": 0, "duplicate": 0, "late": 0, "refused": 0,
+                    "conflict": 0,
                     "notices": 0, "unhandled": 1, "dropped": 0}
 
         counts = {"fetched": 0, "queued": 0, "duplicate": 0, "late": 0, "refused": 0,
+                  "conflict": 0,
                   "notices": 0, "unhandled": 0, "dropped": 0}
         handled: list[str] = []
         undelivered: list[str] = []
@@ -788,7 +790,7 @@ class Bridge:
                 continue
             counts[outcome] += 1
             handled.append(message_id)
-            if outcome in {"refused", "dropped"} and isinstance(message_id, str):
+            if outcome in {"refused", "dropped", "conflict"} and isinstance(message_id, str):
                 # Custody was taken but the application never saw it. The hub still has to stop
                 # offering it, so it is acked — but it must not produce a delivered frame to the
                 # sender, which already gets the refusal or the drop record (#93).
@@ -803,6 +805,7 @@ class Bridge:
             # The counts describe what the hub was told, and it was told nothing: every item on
             # this page is still its problem, whatever this bridge did with it locally.
             counts = {"fetched": counts["fetched"], "queued": 0, "duplicate": 0, "late": 0,
+                      "conflict": 0,
                       "refused": 0, "notices": 0, "unhandled": len(ledger), "dropped": 0}
             handled = []
             undelivered = []
@@ -952,10 +955,15 @@ class Bridge:
             log.error("queue refused or failed on %s from %s: %s", safe_log_text(message_id),
                       safe_log_text(sender), safe_log_text(exc))
             return "unhandled", None
-        # ``put`` answers three ways and the difference is mail: ``accepted`` stored it, ``late``
-        # stored it out of order, ``duplicate`` stored *nothing* and the envelope is dropped. The
-        # hub is acked on all three, so flattening this to "queued" is how messages were fetched,
-        # acknowledged and never seen while the poll log said they had arrived (#79).
+        # ``put`` answers four ways and the difference is mail: ``accepted`` stored it, ``late``
+        # stored it out of order, ``duplicate`` stored nothing because this exact message was
+        # already here, and ``conflict`` stored nothing because a *different* message already
+        # used that seq. The hub is acked on all four, so flattening this to "queued" is how
+        # messages were fetched, acknowledged and never seen while the poll log said they had
+        # arrived (#79). A conflict is the one answer the sender must hear about, or its
+        # follow-up vanishes exactly as it did in #142.
+        if result == "conflict":
+            self._refuse_conflict(item, message_id)
         return ("queued" if result == "accepted" else result), message_id
 
     def _handle_frame(self, frame: dict[str, Any]) -> tuple[str, str | None]:
@@ -1020,6 +1028,33 @@ class Bridge:
         if decision.rule == "blocked":
             return
         self._send_refusal_notice(sender, message_id, context, decision.rule, moment)
+
+    def _refuse_conflict(self, item: dict[str, Any], message_id: str) -> None:
+        """Record and report a message that reused a seq another message already took (#142).
+
+        Nothing was stored, and the hub copy is acked, so without this the message is lost with a
+        success on every side: the sender saw 202, the hub saw an ack, and the agent sees nothing.
+        The rule is the same one the gate uses for its own refusals, so the sender's retry policy
+        reads it with no new vocabulary.
+        """
+        sender = item.get("from")
+        if not isinstance(sender, str):
+            return
+        message = item.get("message") or {}
+        context = message.get("contextId")
+        moment = datetime.now(timezone.utc)
+        # Bounded like every peer-visible string (MAX_RULE_LENGTH): the receiver of this notice
+        # validates it as a protocol id, and a longer rule is dropped as malformed.
+        rule = "sequence collision"
+        self._append_line(
+            "refused.jsonl",
+            {"at": iso(moment), "messageId": message_id, "contextId": context,
+             "from": sender, "rule": "sequence collision"},
+            level="error",
+        )
+        log.error("refused %s from %s: %s", safe_log_text(message_id),
+                  safe_log_text(sender), rule)
+        self._send_refusal_notice(sender, message_id, context, rule, moment)
 
     def _send_refusal_notice(
         self, sender: str, message_id: str, context: str | None, rule: str, moment: datetime

@@ -81,17 +81,21 @@ def test_dedupe_survives_restart(tmp_path, envelope_factory):
         assert q.get(T0) is None
 
 
-def test_lower_seq_dropped_as_duplicate(queue, envelope_factory):
+def test_lower_seq_from_another_message_is_a_conflict(queue, envelope_factory):
+    """A spent seq taken by a *different* message is a sender error, not a re-send (#142).
+
+    Answering ``duplicate`` here is silent by design for a retry, so a follow-up sent at a seq
+    that was already used vanished with a success at both ends.
+    """
     for seq in (0, 1):
         queue.put(
             _env(envelope_factory, seq=seq, message={"messageId": f"m-{seq}"}), T0
         )
     queue.ack("m-0")
     queue.ack("m-1")
-    # seq 0 is below the last delivered: dropped, not an error.
     assert queue.put(
         _env(envelope_factory, seq=0, message={"messageId": "m-late"}), T0
-    ) == "duplicate"
+    ) == "conflict"
     assert queue.get(T0) is None
 
 
@@ -365,28 +369,34 @@ def test_late_arrival_after_release_is_delivered_with_a_late_notice(
 
 
 def test_a_late_arrival_is_not_reported_as_a_duplicate(queue, envelope_factory):
-    """A delivered seq is still a duplicate; only a released gap makes an arrival late."""
+    """Only a released gap makes an arrival late; a spent seq is a conflict (#142).
+
+    The name of the test is the rule: a message the queue never skipped cannot be late, and
+    because this one is not a retry of the delivered message either, it is refused by name.
+    """
     queue.put(_env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0)
     assert queue.get(T0)["seq"] == 0
     queue.ack("m-0", T0)
-    # Never skipped by a release: this is a re-send, not a late arrival.
     assert queue.put(
         _env(envelope_factory, seq=0, message={"messageId": "m-again"}), T0
-    ) == "duplicate"
+    ) == "conflict"
     assert queue.get(T0) is None
 
 
-def test_a_second_message_reusing_an_in_flight_seq_is_a_duplicate(
+def test_a_second_message_reusing_an_in_flight_seq_is_a_conflict(
     queue, envelope_factory
 ):
-    """Two ids competing for one seq while the first is still queued: the second is a
-    duplicate, not a second row stranded by the first's ack (issue #111)."""
+    """Two ids competing for one seq while the first is still queued (#111, #142).
+
+    The second is not stored — a row at a spent seq could never be delivered — and it is
+    refused by name rather than answered as a duplicate, because it is a different message.
+    """
     assert queue.put(
         _env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0
     ) == "accepted"
     assert queue.put(
         _env(envelope_factory, seq=0, message={"messageId": "m-1"}), T0
-    ) == "duplicate"
+    ) == "conflict"
     assert queue.depth() == 1
     assert queue.get(T0)["message"]["messageId"] == "m-0"
     assert queue.ack("m-0", T0) is True
@@ -394,20 +404,17 @@ def test_a_second_message_reusing_an_in_flight_seq_is_a_duplicate(
     # The refused id stays in ``seen``: a re-offer is still a duplicate.
     assert queue.put(
         _env(envelope_factory, seq=0, message={"messageId": "m-1"}), T0
-    ) == "duplicate"
+    ) == "conflict"
 
 
-def test_a_second_message_reusing_a_held_seq_is_a_duplicate(
-    queue, envelope_factory
-):
-    """The same competition one seq ahead: a second id at a held future seq is a
-    duplicate too (issue #111)."""
+def test_a_second_message_reusing_a_held_seq_is_a_conflict(queue, envelope_factory):
+    """The same competition one seq ahead: a second id at a held future seq (#111, #142)."""
     assert queue.put(
         _env(envelope_factory, seq=1, message={"messageId": "m-1"}), T0
     ) == "accepted"
     assert queue.put(
         _env(envelope_factory, seq=1, message={"messageId": "m-1b"}), T0
-    ) == "duplicate"
+    ) == "conflict"
     assert queue.depth() == 1
     queue.put(_env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0)
     assert queue.get(T0)["seq"] == 0
@@ -612,3 +619,19 @@ def test_usage_reports_count_and_bytes(queue, envelope_factory):
     )
     assert queue.usage() == {"messages": 2, "bytes": expected}
     assert queue.depth() == 2
+
+
+def test_a_named_retry_at_a_spent_seq_is_still_a_silent_duplicate(queue, envelope_factory):
+    """A retry keeps the original's seq (SPEC §8), so it must not be refused as a collision.
+
+    The retry says so in ``metadata.retryOf``; that claim is what separates "the same position
+    in this thread, sent again" from "a second message arriving at a position that is taken".
+    """
+    assert queue.put(
+        _env(envelope_factory, seq=0, message={"messageId": "m-0"}), T0
+    ) == "accepted"
+    assert queue.get(T0)["seq"] == 0
+    queue.ack("m-0", T0)
+    retry = _env(envelope_factory, seq=0, message={"messageId": "m-retry"})
+    retry["message"]["metadata"] = {"retryOf": "m-0"}
+    assert queue.put(retry, T0) == "duplicate"

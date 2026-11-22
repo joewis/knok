@@ -387,3 +387,49 @@ def test_a_delivered_message_reaches_the_sender_as_a_frame(deployment):
     assert carl.queue.get() is None
     # And the sender acked it away, so it does not come back.
     assert carl.client.fetch()["messages"] == []
+
+
+def test_a_message_at_a_spent_seq_is_refused_and_the_sender_is_told(deployment):
+    """#142: the follow-up that vanished. A second message at a used seq is refused by name.
+
+    The queue used to answer ``duplicate`` — the silent answer reserved for a retry — so the
+    bridge acked it, the hub deleted its copy and minted a ``delivered`` frame, and the sender
+    believed a question had been asked that never reached the agent. Nothing about the wire
+    changed: only the answer, and the notice that goes with it.
+    """
+    hub, bridges, root = deployment
+    carl, muse = bridges["carl"], bridges["muse"]
+    context = "c-spent-seq-142"
+
+    rewrite(root, "muse", block=[], allow=[carl.identity.agent_id])
+    apply_policy(muse, policy_path(root, "muse"))
+
+    _, first = send(carl, muse.identity.agent_id, "first", context=context,
+                    message_id="m-142-first", seq=0)
+    record_attempt(root, "carl", first)
+    assert muse.poll_once()["queued"] == 1
+    delivered = muse.queue.get()
+    muse.queue.ack(delivered["message"]["messageId"])
+
+    # The follow-up, at the seq the first one already spent.
+    _, follow = send(carl, muse.identity.agent_id, "follow-up question", context=context,
+                     message_id="m-142-second", seq=0)
+    record_attempt(root, "carl", follow)
+
+    counts = muse.poll_once()
+    assert counts["conflict"] == 1, "a different message at a spent seq is a conflict"
+    assert counts["duplicate"] == 0, "and not the silent answer a retry gets"
+    assert counts["queued"] == 0, "nothing reached the application"
+    assert muse.queue.get() is None
+
+    # The sender is told, in the same vocabulary as a gate refusal.
+    carl.poll_once()
+    refused = [n for n in notices_of(root, "carl") if n["kind"] == "refused"]
+    assert len(refused) == 1
+    notice = refused[0]
+    assert notice["messageId"] == "m-142-second"
+    assert notice["rule"].startswith("sequence collision")
+
+    # And the hub claimed no delivery: the ack named the id as undelivered, so no frame was
+    # minted into the sender's mailbox (#93).
+    assert carl.client.fetch()["messages"] == []

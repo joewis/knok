@@ -94,13 +94,14 @@ def test_a_delivered_message_is_recorded_before_the_hub_may_forget_it(deployment
     assert muse.client.fetch()["messages"] == [], "the acked message must be gone from the hub"
 
 
-def test_a_message_the_queue_will_not_store_is_recorded_as_a_duplicate(deployment):
+def test_a_message_the_queue_will_not_store_is_recorded_as_a_conflict(deployment):
     """#79 in one test: sent, accepted by the hub, acked, never in the inbox — now with a record.
 
-    Both sends carry ``seq`` 0, because that is what the sender mints for a second message in an
-    existing context. The queue has already delivered ``seq`` 0 for that stream, so the second is
-    answered ``duplicate`` and stored nowhere. Before the ledger, the only trace was a ``seen`` row
-    with no message beside it; the count said ``queued`` and the hub deleted its copy.
+    Both sends carry ``seq`` 0. The queue has already delivered ``seq`` 0 for that stream, so the
+    second is a different message at a spent seq and is answered ``conflict`` (#142): stored
+    nowhere, refused by name, and the sender is sent a notice. Before the ledger, the only trace
+    was a ``seen`` row with no message beside it; the count said ``queued`` and the hub deleted
+    its copy.
     """
     hub, bridges, root = deployment
     carl, muse = bridges["carl"], bridges["muse"]
@@ -115,16 +116,18 @@ def test_a_message_the_queue_will_not_store_is_recorded_as_a_duplicate(deploymen
     counts = muse.poll_once()
 
     assert counts["fetched"] == 1
-    assert counts["duplicate"] == 1, "the queue refused to store it and the poll must say so"
+    assert counts["conflict"] == 1, "the queue refused to store it and the poll must say so"
     assert counts["queued"] == 0, "reporting this as queued is the defect #79 could not see"
     assert muse.queue.get() is None, "nothing may reach the application"
     assert muse.client.fetch()["messages"] == [], "the hub dropped it on the strength of our ack"
 
     lost = [row for row in rows(muse) if row["messageId"] == "m-second"]
     assert lost, "a message the hub no longer holds must have a row"
-    assert lost[-1]["outcome"] == "duplicate"
+    assert lost[-1]["outcome"] == "conflict"
     assert lost[-1]["contextId"] == "c-thread" and lost[-1]["seq"] == 0
-    assert muse.queue.seen("m-second") is True, "the id is in seen with no message — the #79 shape"
+    # A conflict is *not* written to ``seen``: a retry of a message we refused must be able to
+    # arrive again once the sender has corrected its seq, and an id in ``seen`` would silence it.
+    assert muse.queue.seen("m-second") is False
 
 
 def test_an_item_left_at_the_hub_says_so_and_is_not_acked(deployment):

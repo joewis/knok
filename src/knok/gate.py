@@ -54,7 +54,14 @@ class Receipt:
 #: The refusal rules a gate may name (#50), and the only rules a refusal notice may carry
 #: (#120): a notice naming any other rule is not a gate answer, so the receiver drops it
 #: instead of recording it.
-REFUSAL_RULES = frozenset({"blocked", "policy", "limits", "thread", "malformed"})
+#: The rules a refusal notice may carry. A receiver refuses a notice naming anything else, so a
+#: sender's retry policy never has to act on a word it does not know. ``sequence collision`` is
+#: not a gate decision: it is the queue refusing a second message at a seq another message took
+#: (#142), and it is in the same vocabulary because the sender's response — do not retry this
+#: id, fix the thread position — is the same kind of instruction.
+REFUSAL_RULES = frozenset(
+    {"blocked", "policy", "limits", "thread", "malformed", "sequence collision"}
+)
 
 
 @dataclass(frozen=True)
