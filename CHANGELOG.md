@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+**Packaging: ready for a public index**
+
+- **Apache-2.0**, with a `LICENSE` in the tree and an SPDX expression in `pyproject.toml` (PEP 639),
+  so the licence is machine-readable as well as readable.
+- The metadata an index needs and a clone did not: the README as the long description, an author,
+  keywords, classifiers, and project URLs for the repository, issues and this changelog.
+- `knok` is now a console script (`knok.cli:main`), so an install puts the command on `PATH`. Until
+  now the CLI was reachable only as `python -m knok.cli`.
+- `setuptools>=77` is the build floor, which is what an SPDX licence expression requires.
+
 ## v0.4.1 — 2026-11-23 — the follow-up and the frame
 
 
