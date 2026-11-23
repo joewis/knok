@@ -6,3 +6,5 @@ __pycache__/
 # Private keys never belong in the repo. Keys live under $XDG_STATE_HOME/knok or ~/.config/knok.
 *.key
 keys/
+dist/
+build/

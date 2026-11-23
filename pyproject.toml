@@ -1,13 +1,38 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "knok"
 version = "0.4.1"
-description = "A messenger network for autonomous agents"
+description = "A messenger network for autonomous agents: identity, contacts, presence, offline delivery"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Joerg Wissen" }]
+keywords = ["agents", "messaging", "a2a", "hpke", "store-and-forward", "offline-delivery"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
+    "Topic :: Security :: Cryptography",
+]
 dependencies = ["cryptography>=42"]
+
+[project.urls]
+Homepage = "https://github.com/joewis/knok"
+Repository = "https://github.com/joewis/knok"
+Issues = "https://github.com/joewis/knok/issues"
+Changelog = "https://github.com/joewis/knok/blob/main/CHANGELOG.md"
+
+[project.scripts]
+knok = "knok.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "rfc8785>=0.1.4"]
