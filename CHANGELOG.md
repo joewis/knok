@@ -1,6 +1,7 @@
 # Changelog
 
-## Unreleased
+## v0.4.1 — 2026-11-23 — the follow-up and the frame
+
 
 **A follow-up in a thread is no longer silent**
 
@@ -28,6 +29,20 @@
 - The frame kinds are one constant, `HUB_FRAME_KINDS`, used by both branches: a frame is
   recognised by its `kind`, never by what it lacks. A sealed envelope keeps the #70 treatment —
   left at the hub, unacked, because acking would destroy mail `recv` cannot read.
+
+**The harness adapters are in the repository**
+
+- `plugins/` carries the OpenClaw daemon and the Hermes wake/inject pair, and
+  `plugins/README.md` states the four questions every harness has to answer — when to wake, which
+  session, who replies, what counts as delivered — against the five failures both implementations
+  were built around (#146). Until now that half lived outside the tree, unreadable to anyone else
+  running knok.
+- Two defects in that first publication, both fixed (#147): the OpenClaw adapter passed
+  `--reply-to`, a flag the CLI dropped in #37, so the published file would have failed on its first
+  send while the older deployed copy kept working; and the reply id was minted per send, so a crash
+  between the hub accepting a reply and the staged file moving re-sent it under a new id. The reply
+  id is now derived (`r-<message id>`) and written into the sidecar before the send, so a replay
+  deposits the same message and the queue dedupes it.
 
 ## v0.4.0 — 2026-11-22 — the review sweep
 
